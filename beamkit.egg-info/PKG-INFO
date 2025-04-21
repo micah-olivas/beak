@@ -1,0 +1,19 @@
+Metadata-Version: 2.1
+Name: beamkit
+Version: 0.1.0
+Summary: A toolkit for biophysical and evolutionary association modeling
+Author: Micah Olivas
+Author-email: micah5051olivas@gmail.com
+License: MIT
+Platform: UNKNOWN
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Scientific/Engineering :: Bio-Informatics
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.7
+License-File: LICENSE
+
+UNKNOWN
+
