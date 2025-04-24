@@ -1,3 +1,3 @@
-### BEAMkit
+### BEAK
 <img style="float: right;" src="icon.png">
-**B**iophysical and **E**volutionary **A**ssociation **M**odeling tool**kit**.
+**B**iophysical and **E**volutionary **A**ssociation **K**it.
