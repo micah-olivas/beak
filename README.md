@@ -1,6 +1,6 @@
 <div style="display: flex; align-items: center;">
-    <h3 style="margin: 0;">BEAK</h3>
-    <img src="icon.png" alt="BEAK icon" height="80" style="margin-left: 24px;">
+    <img src="icon.png" alt="Array Print" align="right" height=200pt/>
+    <h1 style="margin: 0;">BEAK</h3>
 </div>
 
 **B**iophysical and **E**volutionary **A**ssociation **K**it.
