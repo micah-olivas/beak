@@ -1,6 +1,5 @@
 <div style="display: flex; align-items: center;">
-    <h1 style="margin: 0;">BEAK</h1>
-    <img src="icon.png" alt="BEAK icon" height="140" style="margin-left: 24px;">
+     <img src="icon.png" alt="BEAK icon" align="right" height=200pt/>
+     <h1 style="margin: 0;">BEAK</h3>
 </div>
-
-**B**iophysical and **E**volutionary **A**ssociation **K**it.
+Biophysical and Evolutionary Association Kit.
