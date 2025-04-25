@@ -1,7 +1,0 @@
-LICENSE
-setup.py
-beamkit.egg-info/PKG-INFO
-beamkit.egg-info/SOURCES.txt
-beamkit.egg-info/dependency_links.txt
-beamkit.egg-info/requires.txt
-beamkit.egg-info/top_level.txt
