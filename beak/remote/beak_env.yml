@@ -1,0 +1,8 @@
+name: beak
+channels:
+    - conda-forge
+    - defaults
+dependencies:
+    - esm
+    - numpy
+    - pandas
