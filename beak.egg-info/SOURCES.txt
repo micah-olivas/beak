@@ -1,7 +1,0 @@
-LICENSE
-setup.py
-beak.egg-info/PKG-INFO
-beak.egg-info/SOURCES.txt
-beak.egg-info/dependency_links.txt
-beak.egg-info/requires.txt
-beak.egg-info/top_level.txt
