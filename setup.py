@@ -7,7 +7,8 @@ setup(
     author="Micah Olivas",
     author_email="micah5051olivas@gmail.com",
     license="MIT",
-    packages=find_packages(exclude=["tests*", "examples*", "docs*"]),
+    packages=find_packages(where="src", exclude=["tests*", "examples*", "docs*"]),
+    package_dir={"": "src"},
     install_requires=[
         "numpy",
         "scipy",
