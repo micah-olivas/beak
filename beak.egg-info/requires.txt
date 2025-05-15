@@ -6,3 +6,4 @@ matplotlib
 biopython
 ipython
 ipykernel
+seqlogo
