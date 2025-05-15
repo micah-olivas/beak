@@ -133,9 +133,11 @@ def alignment_to_pssm(alignment, freq=False):
     Returns:
         pd.DataFrame: position-specific scoring matrix
     """
+    print(utils.conservation(alignment))
     # Amino acid order (including gap)
     amino_acids = ["A", "R", "N", "D", "C", "Q", \
-                   "E", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V", "-"]
+                   "E", "G", "H", "I", "L", "K", "M", \
+                    "F", "P", "S", "T", "W", "Y", "V", "-"]
     data = []
     for i in range(alignment.get_alignment_length()):
         row = []
@@ -149,8 +151,13 @@ def alignment_to_pssm(alignment, freq=False):
                 count = count / len(alignment)
             row.append(count)
         data.append(row)
+        
     # Index: positions, Columns: amino acids
     pssm_df = pd.DataFrame(data, columns=amino_acids)
+
+    # Compute conservation
+    conservation = utils.conservation(alignment)
+    pssm_df['cons_i'] = conservation
     return pssm_df
 
 def single_sequence_aln_frequencies(query_seq, pssm, check_positions=False, consensus_seq=None):
@@ -231,7 +238,9 @@ def pssms_by_taxon(seq_tax_df, rank):
     # Group by superkingdom and get all aligned sequences as lists
     rank_grouped_seqs = seq_tax_df.groupby(rank)['Aligned_sequence'].apply(list)
 
-    print(f"Found {len(rank_grouped_seqs)} {rank}s")
+    print(f"Found {len(rank_grouped_seqs)} values of {rank}:")
+    for sk, seqs in rank_grouped_seqs.items():
+        print(f"  {sk}: {len(seqs)} sequences")
 
     pssms_tax_dict = {}
 
