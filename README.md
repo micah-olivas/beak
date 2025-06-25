@@ -1,4 +1,4 @@
-<div style="display: flex; align-items: center;">
+<div style="display: flex; align-items: top;">
      <img src="misc/icon-transparent.png" alt="BEAK icon" align="right" height=200pt/>
      <h1 style="margin: 0;">BEAK</h3>
 </div>
