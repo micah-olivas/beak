@@ -7,16 +7,18 @@ import holoviews as hv
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
-def plot_seq_length_hist(aln, aligned_length):
+def plot_seq_length_hist(aln, ref_length=None):
     seq_lengths = [len(str(record.seq).replace('.', '').replace('-', '')) for record in aln]
     plt.figure(figsize=(4,3))
     plt.hist(seq_lengths, bins=30, color='skyblue', edgecolor='black')
-    plt.axvline(aligned_length, color='red', linestyle='dashed', linewidth=2, label=f'Aligned Length: {aligned_length}')
-    plt.xlabel('Sequence Length (ungapped)')
+
+    if ref_length != None:
+        plt.axvline(ref_length, color='red', linestyle='dashed', linewidth=2, label=f'Aligned Length: {ref_length}')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+
+    plt.xlabel('Sequence Length')
     plt.ylabel('Count')
-    plt.xlim(300, 700)
     plt.title('Sequence Length Distribution')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.show()
 
 def plot_sequence_logo(pssm, title="Sequence Logo"):
