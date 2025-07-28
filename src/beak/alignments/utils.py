@@ -40,7 +40,7 @@ def aln_to_df(aln):
     df = pd.DataFrame.from_dict(data, orient='index', columns=['sequence'])
     return df
 
-def ungap_aln(aln, gap_threshold=0.5):
+def ungap_aln(aln, ref_seq=None, gap_threshold=0.3):
     """
     Remove gapped positions from a multiple sequence alignment.
 
@@ -64,6 +64,13 @@ def ungap_aln(aln, gap_threshold=0.5):
         i for i, column in enumerate(columns)
         if column.count('-') / len(column) <= gap_threshold
     ]
+
+    if ref_seq != None:
+        keep_columns = [
+            i for i, column in enumerate(columns)
+            if (ref_seq[i] != "-")
+        ]
+
 
     # Filter sequences to retain only the columns to keep
     ungapped_records = [
@@ -133,7 +140,7 @@ def alignment_to_pssm(alignment, freq=False):
     Returns:
         pd.DataFrame: position-specific scoring matrix
     """
-    print(utils.conservation(alignment))
+
     # Amino acid order (including gap)
     amino_acids = ["A", "R", "N", "D", "C", "Q", \
                    "E", "G", "H", "I", "L", "K", "M", \
@@ -156,8 +163,7 @@ def alignment_to_pssm(alignment, freq=False):
     pssm_df = pd.DataFrame(data, columns=amino_acids)
 
     # Compute conservation
-    conservation = utils.conservation(alignment)
-    pssm_df['cons_i'] = conservation
+    pssm_df['cons_i'] = conservation(alignment)
     return pssm_df
 
 def single_sequence_aln_frequencies(query_seq, pssm, check_positions=False, consensus_seq=None):
@@ -251,7 +257,8 @@ def pssms_by_taxon(seq_tax_df, rank):
         aln = MultipleSeqAlignment(records)
         # Compute the PSSM
         pssm = alignment_to_pssm(aln, freq=True)
-        pssms_tax_dict[sk] = pssm
+        # Drop conservation column
+        pssms_tax_dict[sk] = pssm.drop(columns=['cons_i'])
 
     # Example: show the PSSM for one superkingdom
     for sk, pssm in pssms_tax_dict.items():
