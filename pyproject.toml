@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beak"
+version = "0.1.0"
+description = "A toolkit for biophysical and evolutionary association modeling"
+authors = [{name = "Micah Olivas", email = "micah5051olivas@gmail.com"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Operating System :: OS Independent"
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "biopython"
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib",
+    "seaborn",
+    "seqlogo",
+    "panel",
+    "holoviews"
+]
+remote = [
+    "cryptography",
+    "tqdm"
+]
+dev = [
+    "pytest",
+    "black",
+    "flake8"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
