@@ -47,13 +47,17 @@ from beak.remote import search, status, retrieve_results
 # Start an asynchronous search
 sequence = "ATGCGTCGA..."
 job = search(sequence, db="UniRef90")
-print(f"Started job: {job['project_id']}")
+print(f"Started job: {job['job_id']}")
+
+# Or use a custom job ID
+job = search(sequence, db="UniRef90", user_id="my_protein_search")
+print(f"Started job: {job['job_id']}")
 
 # Check job status
-status(job['project_id'])
+status(job['job_id'])
 
 # Retrieve results when complete
-results = retrieve_results(job['project_id'])
+results = retrieve_results(job['job_id'])
 print(f"TSV results: {results['results']}")
 print(f"FASTA results: {results['fasta']}")
 ```
@@ -62,8 +66,12 @@ print(f"FASTA results: {results['fasta']}")
 ```python
 from beak.remote import align
 
-# Align the FASTA results from search
+# Align the FASTA results from search (automatically reuses job_id)
 alignment = align(results['fasta'])
+print(f"Aligned sequences: {alignment['aligned_fasta']}")
+
+# Or explicitly specify job_id for better workflow integration
+alignment = align(results['fasta'], job_id=job['job_id'])
 print(f"Aligned sequences: {alignment['aligned_fasta']}")
 ```
 
@@ -73,7 +81,7 @@ print(f"Aligned sequences: {alignment['aligned_fasta']}")
 status()
 
 # Get detailed status for specific job
-status("search_1234567890_abcd1234", verbose=True)
+status("beak_zept_nuil_hydrieucks", verbose=True)
 ```
 
 ## Detailed Usage
@@ -92,19 +100,20 @@ job = search(
     verbose=True             # Show detailed progress
 )
 
-# Returns: {"project_id": "search_timestamp_uuid", "status": "running", "config": "config.json"}
+# Returns: {"job_id": "beak_zept_nuil_hydrieucks", "status": "running", "config": "config.json"}
+# or with custom ID: {"job_id": "beak_my_protein_search", "status": "running", "config": "config.json"}
 
 # 2. Monitor progress
-status(job['project_id'])
-# ✅ Search job 'search_1234567890_abcd1234' is completed
-# Use retrieve_results('search_1234567890_abcd1234') to download results
+status(job['job_id'])
+# ✅ Search job 'beak_zept_nuil_hydrieucks' is completed
+# Use retrieve_results('beak_zept_nuil_hydrieucks') to download results
 
 # 3. Retrieve results
-results = retrieve_results(job['project_id'])
+results = retrieve_results(job['job_id'])
 # Returns: {
-#   "results": "mmseqs_search_results_ID.tsv",    # Tab-separated results
-#   "fasta": "mmseqs_search_results_ID.fasta",    # FASTA sequences  
-#   "config": "search_config_ID.json"             # Search configuration
+#   "results": "beak_results/beak_zept_nuil_hydrieucks/search_results.tsv",    # Tab-separated results
+#   "fasta": "beak_results/beak_zept_nuil_hydrieucks/search_results.fasta",    # FASTA sequences  
+#   "config": "beak_results/beak_zept_nuil_hydrieucks/search_config.json"      # Search configuration
 # }
 ```
 
@@ -119,13 +128,14 @@ from beak.remote import align
 alignment = align(
     input_fasta="sequences.fasta",    # Local file path or FASTA content string
     output_fasta="aligned.fasta",     # Optional: custom output filename
-    verbose=True                      # Show detailed progress
+    verbose=True,                     # Show detailed progress
+    user_id="protein_alignment"       # Optional: custom job ID
 )
 
 # Returns: {
-#   "aligned_fasta": "sequences_aligned_ID.fasta",
+#   "aligned_fasta": "beak_results/beak_protein_alignment/aligned.fasta",
 #   "input": "File: sequences.fasta", 
-#   "project_id": "align_timestamp_uuid"
+#   "job_id": "beak_protein_alignment"
 # }
 ```
 
@@ -145,18 +155,18 @@ from beak.remote import status
 # List all jobs
 all_jobs = status()
 # 📋 Checking all beak jobs...
-#   search_1234567890_abcd1234 (search): completed ✅
-#   align_1234567890_efgh5678 (align): running 🔄
+#   beak_zept_nuil_hydrieucks (search): completed ✅
+#   beak_protein_alignment (align): running 🔄
 
 # Check specific job with details
-job_info = status("search_1234567890_abcd1234", verbose=True)
+job_info = status("beak_zept_nuil_hydrieucks", verbose=True)
 # Returns: {
-#   "project_id": "search_1234567890_abcd1234",
+#   "job_id": "beak_zept_nuil_hydrieucks",
 #   "job_type": "search",
 #   "status": "completed",
 #   "is_running": False,
 #   "is_complete": True,
-#   "remote_dir": "beak_tmp/search_1234567890_abcd1234"
+#   "remote_dir": "beak_tmp/beak_zept_nuil_hydrieucks"
 # }
 ```
 
@@ -171,10 +181,10 @@ from beak.remote import connect_remote
 session = connect_remote("your_username")
 
 # Use session methods
-job = session.search_async("ATGCGT...", db="UniRef90")
-status_info = session.check_status(job['project_id'])
-results = session.get_results(job['project_id'])
-alignment = session.align_sequences(results['fasta'])
+job = session.search_async("ATGCGT...", db="UniRef90", user_id="my_search")
+status_info = session.check_status(job['job_id'])
+results = session.get_results(job['job_id'])
+alignment = session.align_sequences(results['fasta'], job_id=job['job_id'], user_id="my_alignment")
 
 # Clean up
 session.disconnect()
@@ -192,12 +202,12 @@ authenticate("username")
 
 # 2. Search for homologous sequences
 sequence = "MKLLVLSLSLVLVAPMAAQAAEITLVPSVKLQIGDRDNRGYGEWLGINPGDFSAEVTQNTLPIIQ"
-job = search(sequence, db="UniRef90")
-print(f"🔍 Started search job: {job['project_id']}")
+job = search(sequence, db="UniRef90", user_id="homolog_search")
+print(f"🔍 Started search job: {job['job_id']}")
 
 # 3. Wait for completion (or check later)
 while True:
-    job_status = status(job['project_id'])
+    job_status = status(job['job_id'])
     if job_status['status'] == 'completed':
         break
     elif job_status['status'] == 'failed':
@@ -207,11 +217,11 @@ while True:
     time.sleep(30)
 
 # 4. Retrieve search results
-results = retrieve_results(job['project_id'])
+results = retrieve_results(job['job_id'])
 print(f"📊 Found sequences in: {results['fasta']}")
 
-# 5. Align the sequences
-alignment = align(results['fasta'])
+# 5. Align the sequences (automatically reuses same job_id)
+alignment = align(results['fasta'], job_id=job['job_id'])
 print(f"🧬 Aligned sequences saved to: {alignment['aligned_fasta']}")
 
 # 6. Check all jobs status
@@ -232,7 +242,7 @@ Each job creates configuration files for reproducibility:
 
 ```json
 {
-  "project_id": "search_1234567890_abcd1234",
+  "job_id": "beak_zept_nuil_hydrieucks",
   "timestamp": "2024-01-29T12:34:56",
   "query_sequence": "MKLLVL...",
   "database": "UniRef90",
@@ -240,7 +250,6 @@ Each job creates configuration files for reproducibility:
   "mmseqs_command": "mmseqs search",
   "settings": {
     "sensitivity": 1,
-    "max_seqs": 15000,
     "sort_results": 1
   }
 }
@@ -271,8 +280,8 @@ if alignment is None:
 
 1. **Use asynchronous workflow**: Start multiple searches, then collect results
 2. **Monitor job status**: Use `status()` to track progress without blocking
-3. **Save intermediate results**: Results are cached on the remote server
-4. **Clean up**: Old job directories can be manually removed from `~/beak_tmp/`
+3. **Organized local storage**: Results are saved in structured directories under `beak_results/`
+4. **Clean up**: Old job directories can be manually removed from `~/beak_tmp/` and `beak_results/`
 
 ## Troubleshooting
 
