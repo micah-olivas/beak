@@ -4,7 +4,7 @@
 </div>
 Beak is a toolkit for modeling biophysical and evolutionary associations in proteins. <br>
 <br>
-Beak addresses several common challenges in modeling evolutionary sequence data in the context of experimental protein biophysics and biochemistry. The first is that compiling and aligning large sequence datasets is too intensive to run on a personal laptop, making it difficult to integrate these steps in exploratory data analysis. Beak works within a local notebook environment and is designed to streamline sequence database queries and multiple sequence alignment by offloading these processes to a local server and discretely managing handoff. Beak's focus on ease-of-use in exploratory data analysis addresses a second challenge in curating sequence datasets: standardization. Search and alignment parameters are cached in a local working directory, making this information traceable and comparable between projects.
+Beak addresses several common challenges in modeling evolutionary sequence data in the context of experimental biophysics and biochemistry. The first is that compiling and aligning large sequence datasets is too intensive to run on a personal laptop, making it difficult to integrate these steps in exploratory data analysis. Beak works within a local notebook environment and is designed to streamline sequence database queries and multiple sequence alignment by offloading these processes to a local server and discretely managing handoff. Beak's focus on ease-of-use in exploratory data analysis addresses a second challenge in curating sequence datasets: standardization. Search and alignment parameters are cached for each project, making this information traceable and comparable between projects.
 
 ## Installation
 Beak needs to first be installed before use. It requires `python>=3.8`. You can install Beak using:
@@ -16,16 +16,16 @@ pip install -e .
 
 ## Usage
 
-Beak provides a powerful workflow for remote protein sequence analysis with asynchronous job management. The main functionality is divided into three core areas:
+Beak provides a workflow for remote protein sequence analysis with asynchronous job management. The main functionality is divided into three core areas:
 
-### 🔍 Remote Sequence Search
+### Remote Sequence Search
 Search protein databases using mmseqs2 on a remote server with automatic job management.
 
-### 🧬 Multiple Sequence Alignment  
-Perform Clustal Omega alignments on search results with automatic sequence cleaning.
+### Multiple Sequence Alignment  
+Perform Clustal Omega alignments on search results.
 
-### 📊 Job Status Monitoring
-Track and manage running jobs with real-time status updates.
+### Taxonomic Annotation
+Annotate large sequence datasets using mmseqs2 taxonomy.
 
 ## Quick Start
 
@@ -44,14 +44,14 @@ ssh = sopen()
 ```python
 from beak.remote import search, status, retrieve_results
 
-# Start an asynchronous search
-sequence = "ATGCGTCGA..."
+# Start an asynchronous search (generates gibberish job ID)
+sequence = "MLKRSSPSG..."
 job = search(sequence, db="UniRef90")
-print(f"Started job: {job['job_id']}")
+print(f"Started job: {job['job_id']}")  # e.g., beak_zept_nuil_hydrieucks
 
-# Or use a custom job ID
-job = search(sequence, db="UniRef90", user_id="my_protein_search")
-print(f"Started job: {job['job_id']}")
+# Use a custom job ID for easier tracking
+job = search(sequence, db="UniRef90", job_id="my_protein_search")
+print(f"Started job: {job['job_id']}")  # beak_my_protein_search
 
 # Check job status
 status(job['job_id'])
@@ -70,7 +70,11 @@ from beak.remote import align
 alignment = align(results['fasta'])
 print(f"Aligned sequences: {alignment['aligned_fasta']}")
 
-# Or explicitly specify job_id for better workflow integration
+# Use custom job_id for organized workflows
+alignment = align(results['fasta'], job_id="my_alignment_job")
+print(f"Aligned sequences: {alignment['aligned_fasta']}")
+
+# Or reuse existing job_id from search for better integration
 alignment = align(results['fasta'], job_id=job['job_id'])
 print(f"Aligned sequences: {alignment['aligned_fasta']}")
 ```
@@ -81,7 +85,7 @@ print(f"Aligned sequences: {alignment['aligned_fasta']}")
 status()
 
 # Get detailed status for specific job
-status("beak_zept_nuil_hydrieucks", verbose=True)
+status("beak_my_custom_job", verbose=True)
 ```
 
 ## Detailed Usage
@@ -97,23 +101,24 @@ from beak.remote import search, status, retrieve_results
 job = search(
     query="MKLLVLSLSLVLVAPMAAQAAEITLVPSVKLQIGDRDNRGYGEWLGINPGDFSAEVTQNTLPIIQ",
     db="UniRef90",           # Database: UniRef90, UniRef50, UniRef100, uniprot_all
+    job_id="my_protein_search",  # Custom job ID (optional)
     verbose=True             # Show detailed progress
 )
 
-# Returns: {"job_id": "beak_zept_nuil_hydrieucks", "status": "running", "config": "config.json"}
-# or with custom ID: {"job_id": "beak_my_protein_search", "status": "running", "config": "config.json"}
+# Returns: {"job_id": "beak_my_protein_search", "status": "running", "config": "config.json"}
+# Without custom job_id, would return gibberish like: {"job_id": "beak_zept_nuil_hydrieucks", "status": "running", "config": "config.json"}
 
 # 2. Monitor progress
 status(job['job_id'])
-# ✅ Search job 'beak_zept_nuil_hydrieucks' is completed
-# Use retrieve_results('beak_zept_nuil_hydrieucks') to download results
+# ✅ Search job 'beak_my_protein_search' is completed
+# Use retrieve_results('beak_my_protein_search') to download results
 
 # 3. Retrieve results
 results = retrieve_results(job['job_id'])
 # Returns: {
-#   "results": "beak_results/beak_zept_nuil_hydrieucks/search_results.tsv",    # Tab-separated results
-#   "fasta": "beak_results/beak_zept_nuil_hydrieucks/search_results.fasta",    # FASTA sequences  
-#   "config": "beak_results/beak_zept_nuil_hydrieucks/search_config.json"      # Search configuration
+#   "results": "beak_results/beak_my_protein_search/search_results.tsv",    # Tab-separated results
+#   "fasta": "beak_results/beak_my_protein_search/search_results.fasta",    # FASTA sequences  
+#   "config": "beak_results/beak_my_protein_search/search_config.json"      # Search configuration
 # }
 ```
 
@@ -139,12 +144,6 @@ alignment = align(
 # }
 ```
 
-#### Alignment Features:
-- 🧹 **Automatic sequence cleaning**: Removes empty sequences that cause alignment failures
-- 🔧 **Auto-installation**: Installs Clustal Omega via conda if not found
-- 📊 **Progress tracking**: Shows sequence counts and alignment statistics
-- ⚡ **Optimized workflow**: Single-command execution avoids SSH buffering issues
-
 ### Job Status Management
 
 Track all your search and alignment jobs:
@@ -155,18 +154,18 @@ from beak.remote import status
 # List all jobs
 all_jobs = status()
 # 📋 Checking all beak jobs...
-#   beak_zept_nuil_hydrieucks (search): completed ✅
+#   beak_my_protein_search (search): completed ✅
 #   beak_protein_alignment (align): running 🔄
 
 # Check specific job with details
-job_info = status("beak_zept_nuil_hydrieucks", verbose=True)
+job_info = status("beak_my_protein_search", verbose=True)
 # Returns: {
-#   "job_id": "beak_zept_nuil_hydrieucks",
+#   "job_id": "beak_my_protein_search",
 #   "job_type": "search",
 #   "status": "completed",
 #   "is_running": False,
 #   "is_complete": True,
-#   "remote_dir": "beak_tmp/beak_zept_nuil_hydrieucks"
+#   "remote_dir": "beak_tmp/beak_my_protein_search"
 # }
 ```
 
@@ -181,7 +180,7 @@ from beak.remote import connect_remote
 session = connect_remote("your_username")
 
 # Use session methods
-job = session.search_async("ATGCGT...", db="UniRef90", user_id="my_search")
+job = session.search_async("MLSRGKS...", db="UniRef90", user_id="my_search")
 status_info = session.check_status(job['job_id'])
 results = session.get_results(job['job_id'])
 alignment = session.align_sequences(results['fasta'], job_id=job['job_id'], user_id="my_alignment")
