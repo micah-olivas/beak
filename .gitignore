@@ -41,3 +41,7 @@ htmlcov/
 
 # misc files
 misc/
+
+# Local BEAK project results (keeps repo clean)
+my_beak_results/
+beak_results/
