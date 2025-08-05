@@ -4,8 +4,34 @@ __pycache__/
 
 # Distribution / packaging
 *.egg-info/
+*.egg/
 build/
 dist/
+*.tar.gz
+*.whl
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*CLAUDE*
+
+# Testing and coverage
+.coverage
+.pytest_cache/
+.tox/
+htmlcov/
+
+# Python cache
+*.py[cod]
+*$py.class
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
