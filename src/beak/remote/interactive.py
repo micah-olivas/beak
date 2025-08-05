@@ -9,7 +9,7 @@ from typing import Optional, Callable, Generator
 from IPython.display import display, clear_output
 import ipywidgets as widgets
 
-from .utils import sopen, ssend, make_temp_dir, scp_to_remote, scp_from_remote, USER, PASSWORD
+from .utils import sopen, ssend, make_temp_dir, scp_to_remote, scp_from_remote, USER, PASSWORD, search, status, retrieve_results, align, compute_tree
 
 
 class InteractiveRemoteSession:
@@ -267,6 +267,44 @@ class InteractiveRemoteSession:
                 print(f"Error: {str(e)}")
             raise
     
+    def search_async(self, query: str, db: str = "UniRef90", verbose: bool = False, user_id: str = None, job_id: str = None) -> dict:
+        """Start a search job asynchronously and return immediately with job info"""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to remote server")
+        
+        print("🚀 Starting asynchronous search...")
+        return search(query, db=db, sshProc=self.ssh_proc, verbose=verbose, user_id=user_id, job_id=job_id)
+    
+    def check_status(self, job_id: str = None, verbose: bool = False) -> dict:
+        """Check status of search jobs"""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to remote server")
+        
+        return status(job_id=job_id, sshProc=self.ssh_proc, verbose=verbose)
+    
+    def get_results(self, job_id: str, verbose: bool = False) -> dict:
+        """Retrieve results from a completed search job"""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to remote server")
+        
+        return retrieve_results(job_id, sshProc=self.ssh_proc, verbose=verbose)
+    
+    def align_sequences(self, input_fasta: str, output_fasta: str = None, job_id: str = None, verbose: bool = False, user_id: str = None) -> dict:
+        """Perform multiple sequence alignment using Clustal Omega"""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to remote server")
+        
+        print("🧬 Starting remote alignment...")
+        return align(input_fasta, output_fasta=output_fasta, job_id=job_id, sshProc=self.ssh_proc, verbose=verbose, user_id=user_id)
+
+    def compute_tree(self, input_source: str, tree_method: str = "ML", job_id: str = None, verbose: bool = False, user_id: str = None, debug: bool = False) -> dict:
+        """Compute a maximum likelihood phylogenetic tree using IQ-TREE2"""
+        if not self.is_connected:
+            raise RuntimeError("Not connected to remote server")
+        
+        print("🌳 Starting remote tree computation...")
+        return compute_tree(input_source, tree_method=tree_method, job_id=job_id, sshProc=self.ssh_proc, verbose=verbose, user_id=user_id, debug=debug)
+
     def disconnect(self):
         """Clean up connection"""
         self.is_connected = False
