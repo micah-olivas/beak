@@ -12,7 +12,8 @@ setup(
     install_requires=[
         "numpy",
         "scipy",
-        "biopython"
+        "biopython",
+        "gibberish @ git+https://github.com/greghaskins/gibberish.git"
     ],
     classifiers=[
         "Development Status :: 3 - Alpha",
