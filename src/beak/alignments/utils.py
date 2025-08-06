@@ -9,6 +9,8 @@ from Bio.Seq import Seq
 from Bio import pairwise2
 from Bio.SeqRecord import SeqRecord
 from Bio.Align import MultipleSeqAlignment
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 # import holoviews as hv
 # from holoviews import opts
@@ -317,3 +319,105 @@ def build_potts_model(msa, pseudocount):
                         J[i,j,a,b] = -np.log(fij[i,j,a,b] / (fi[i,a]*fi[j,b]))
                         J[j,i,b,a] = J[i,j,a,b]
     return h, J
+
+@dataclass
+class SimilarityResult:
+    """Container for sequence similarity search results.
+    
+    Attributes:
+        query_sequence (str): The query sequence used for the search
+        query_id (str): Identifier for the query sequence
+        masked_positions (Optional[List[int]]): List of positions to focus similarity on
+        similar_sequences (List[Tuple[str, str, float]]): List of (id, sequence, similarity_score) tuples
+        identity_vectors (np.ndarray): Binary matrix showing position-wise identity (n_sequences x sequence_length)
+    """
+    query_sequence: str
+    query_id: str
+    masked_positions: Optional[List[int]]
+    similar_sequences: List[Tuple[str, str, float]]
+    identity_vectors: np.ndarray
+
+def find_similar(query_sequence: str, alignment: MultipleSeqAlignment, 
+                n: int = 10, masked_positions: Optional[List[int]] = None,
+                query_id: str = "query") -> SimilarityResult:
+    """Find the most similar sequences to a query sequence within an alignment.
+    
+    Args:
+        query_sequence (str): Query sequence to find matches for
+        alignment (Bio.Align.MultipleSeqAlignment): Multiple sequence alignment to search
+        n (int): Number of top similar sequences to return (default: 10)
+        masked_positions (Optional[List[int]]): List of positions (0-indexed) to focus on for similarity.
+                                              Can also be a binary array where 1s indicate positions to use.
+                                              If None, uses all positions.
+        query_id (str): Identifier for the query sequence (default: "query")
+        
+    Returns:
+        SimilarityResult: Object containing query info, similar sequences, and identity vectors
+    """
+    # Convert alignment to list of sequences for easier processing
+    aln_sequences = [(record.id, str(record.seq)) for record in alignment]
+    
+    # Determine which positions to use for similarity calculation
+    if masked_positions is not None:
+        # Handle both list of indices and binary array formats
+        if isinstance(masked_positions, (list, tuple, np.ndarray)) and len(masked_positions) > 0:
+            # Check if it's a binary array (contains only 0s and 1s)
+            if all(x in [0, 1] for x in masked_positions) and len(masked_positions) == len(query_sequence):
+                # Convert binary array to list of indices where value is 1
+                positions_to_use = set(i for i, val in enumerate(masked_positions) if val == 1)
+            else:
+                # Assume it's a list of indices
+                positions_to_use = set(masked_positions)
+        else:
+            positions_to_use = set(masked_positions)
+    else:
+        positions_to_use = set(range(len(query_sequence)))
+    
+    # Calculate similarity scores and identity vectors
+    similarities = []
+    identity_vectors = []
+    
+    for seq_id, seq_str in aln_sequences:
+        # Ensure sequences are same length (should be true for alignment)
+        min_len = min(len(query_sequence), len(seq_str))
+        
+        # Calculate identity at each position
+        identity_vector = np.zeros(min_len, dtype=int)
+        matches = 0
+        valid_positions = 0
+        
+        for pos in range(min_len):
+            if pos in positions_to_use:
+                # Only count positions that aren't gaps in either sequence
+                if query_sequence[pos] != '-' and seq_str[pos] != '-':
+                    if query_sequence[pos] == seq_str[pos]:
+                        identity_vector[pos] = 1
+                        matches += 1
+                    valid_positions += 1
+                    
+        # Calculate similarity score as fraction of matching positions
+        similarity_score = matches / valid_positions if valid_positions > 0 else 0.0
+        
+        similarities.append((seq_id, seq_str, similarity_score))
+        identity_vectors.append(identity_vector)
+    
+    # Sort by similarity score (descending) and take top n
+    # Keep track of original indices before sorting
+    similarities_with_indices = [(i, similarities[i], identity_vectors[i]) for i in range(len(similarities))]
+    similarities_with_indices.sort(key=lambda x: x[1][2], reverse=True)
+    
+    # Take top n results
+    top_results = similarities_with_indices[:n]
+    top_similarities = [result[1] for result in top_results]
+    top_identity_vectors = np.array([result[2] for result in top_results])
+    
+    # Convert positions_to_use back to a list for storage
+    final_masked_positions = list(positions_to_use) if masked_positions is not None else None
+    
+    return SimilarityResult(
+        query_sequence=query_sequence,
+        query_id=query_id,
+        masked_positions=final_masked_positions,
+        similar_sequences=top_similarities,
+        identity_vectors=top_identity_vectors
+    )
