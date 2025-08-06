@@ -11,7 +11,7 @@ Beak addresses several common challenges in modeling evolutionary sequence data 
 Beak works within a local notebook environment and is designed to streamline sequence database queries and multiple sequence alignment by offloading these processes to a local server and discretely managing handoff. Search and alignment parameters are cached for each project, making this information traceable and comparable between projects.
 
 ## Installation
-Beak needs to first be installed before use. It requires `python>=3.8`. You can install Beak using:
+Beak installation requires `python>=3.8`. You can install Beak using:
 ```
 git clone https://github.com/micah-olivas/beak.git && cd beak
 
