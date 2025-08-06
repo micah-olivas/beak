@@ -22,6 +22,7 @@ from .utils import (
     compute_tree,
     taxonomy,
     check_remote_process,
+    list_local_projects,
     list_databases,
     projects,
     debug_projects,
