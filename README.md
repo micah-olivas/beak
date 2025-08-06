@@ -6,7 +6,7 @@ A Python toolkit for modeling protein evolutionary sequence data. <br>
 <br>
 
 ## Motivation
-Beak addresses several common challenges in modeling evolutionary sequence data in the context of experimental biophysics and biochemistry. The first is that compiling and aligning large sequence datasets is too intensive to run on a personal laptop, making it difficult to integrate these steps in exploratory data analysis. The second challenge is standardizing these steps, which can become laborious for experimentalists.
+Beak addresses several common challenges in modeling evolutionary sequence relationships in the context of experimental biophysics and biochemistry data. The first is that compiling and aligning large sequence datasets is too intensive to run on a personal laptop, making it difficult to integrate these steps in exploratory data analysis. The second challenge is standardizing these steps, which can be laborious for experimentalists.
 
 Beak works within a local notebook environment and is designed to streamline sequence database queries and multiple sequence alignment by offloading these processes to a local server and discretely managing handoff. Search and alignment parameters are cached for each project, making this information traceable and comparable between projects.
 
