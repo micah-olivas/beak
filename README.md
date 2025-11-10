@@ -17,19 +17,17 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 ### 🔗 Remote Job Orchestration
 - **Pipeline Builder**: Chain multiple analysis steps into automated workflows
 - **Smart Job Management**: Track, monitor, and retrieve results seamlessly
-- **Automatic Setup**: Auto-detects SSH keys and configures remote directories
 - **Real-time Progress**: Detailed step-by-step status tracking
 
 ### 🔍 Sequence Search & Analysis
 - **[MMseqs2](https://github.com/soedinglab/MMseqs2) Integration**: Large-scale sequence searches against major databases
-- **Database Support**: UniRef90, UniRef100, SwissProt, TrEMBL, GTDB, and more
 - **Hit Extraction**: Automatically retrieve hit sequences as FASTA files
-- **Taxonomy Assignment**: Annotate sequences with full taxonomic lineages
+- **Taxonomy Assignment**: Annotate taxonomies with MMseqs2 taxonomy
 
 ### 🧬 Alignment & Phylogenetics
 - **[Clustal Omega](http://www.clustal.org/omega/)**: Multiple sequence alignment
 - **[IQ-TREE](http://www.iqtree.org/)**: Maximum likelihood phylogenetic trees
-- **Pipeline Integration**: Seamlessly chain search → align → tree workflows
+- **Pipeline Integration**: Seamlessly chain search → filter → align → tree workflows
 
 ### 🧪 Structure & Embeddings (Coming Soon)
 - **[ColabFold](https://github.com/sokrypton/ColabFold)**: AlphaFold2 structure prediction
