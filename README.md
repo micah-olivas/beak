@@ -155,4 +155,4 @@ Contributions welcome! Please open an issue or submit a pull request.
 
 ## Contact
 
-[Your contact information]
+micah5051olivas@gmail.com
