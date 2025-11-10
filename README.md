@@ -5,7 +5,7 @@
 
 **B**iophysical and **E**volutionary **A**ssociations **K**it
 
-A Python toolkit for evolutionary sequence analysis, designed for experimental biophysicists and biochemists.
+A Python toolkit for remote bioinformatics workflows, designed for experimental biophysicists and biochemists. BEAK orchestrates computationally intensive sequence analysis tasks on remote servers while providing a seamless notebook-based interface.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
@@ -14,21 +14,31 @@ A Python toolkit for evolutionary sequence analysis, designed for experimental b
 
 ## Features
 
-### 🔍 Remote Sequence Search
-- **MMseqs2 Integration**: Submit large-scale sequence searches to remote servers directly from your notebook
-- **Database Support**: UniRef90, UniRef100, SwissProt, TrEMBL, and more
-- **Job Management**: Track, monitor, and retrieve results seamlessly
+### 🔗 Remote Job Orchestration
+- **Pipeline Builder**: Chain multiple analysis steps into automated workflows
+- **Smart Job Management**: Track, monitor, and retrieve results seamlessly
 - **Automatic Setup**: Auto-detects SSH keys and configures remote directories
+- **Real-time Progress**: Detailed step-by-step status tracking
 
-### 🧬 Taxonomy Assignment
-- Taxonomically label sequences using MMseqs2 taxonomy
-- Full lineage support for phylogenetic context
-- Integrated with major protein databases
+### 🔍 Sequence Search & Analysis
+- **[MMseqs2](https://github.com/soedinglab/MMseqs2) Integration**: Large-scale sequence searches against major databases
+- **Database Support**: UniRef90, UniRef100, SwissProt, TrEMBL, GTDB, and more
+- **Hit Extraction**: Automatically retrieve hit sequences as FASTA files
+- **Taxonomy Assignment**: Annotate sequences with full taxonomic lineages
+
+### 🧬 Alignment & Phylogenetics
+- **[Clustal Omega](http://www.clustal.org/omega/)**: Multiple sequence alignment
+- **[IQ-TREE](http://www.iqtree.org/)**: Maximum likelihood phylogenetic trees
+- **Pipeline Integration**: Seamlessly chain search → align → tree workflows
+
+### 🧪 Structure & Embeddings (Coming Soon)
+- **[ColabFold](https://github.com/sokrypton/ColabFold)**: AlphaFold2 structure prediction
+- **[ESM](https://github.com/facebookresearch/esm)** & **[ProGen](https://github.com/salesforce/progen)**: Protein language model embeddings
 
 ### 📊 Analysis Ready
 - Parse results directly into pandas DataFrames
-- Extract hit sequences as FASTA files
-- Cache search parameters for reproducibility
+- Export sequences, alignments, and trees in standard formats
+- Cache all parameters for full reproducibility
 
 ---
 
@@ -48,10 +58,43 @@ cd beak
 pip install -e .
 ```
 
-### Remote Sequence Search
+### Remote Server Setup
+
+BEAK requires SSH access to a remote server with bioinformatics tools installed.
+
+**1. Generate SSH key (if you don't have one):**
+
+```bash
+ssh-keygen -t ed25519 -C "your_email@example.com"
+```
+
+**2. Copy your public key to the remote server:**
+
+```bash
+ssh-copy-id username@your-server.edu
+```
+
+**3. Test your connection:**
+
+```bash
+ssh username@your-server.edu
+```
+
+BEAK will automatically detect your SSH key at `~/.ssh/id_ed25519` or `~/.ssh/id_rsa`. To use a custom key, specify `key_path` when initializing.
+
+**Required tools on remote server:**
+- [MMseqs2](https://github.com/soedinglab/MMseqs2) for sequence search and taxonomy
+- [Clustal Omega](http://www.clustal.org/omega/) for alignment
+- [IQ-TREE](http://www.iqtree.org/) for phylogenetics
+
+---
+
+## Usage Examples
+
+### Simple Sequence Search
 
 ```python
-from beak.new_remote import MMseqsSearch
+from beak.remote import MMseqsSearch
 
 # Initialize connection (auto-detects SSH key)
 search = MMseqsSearch(
@@ -81,10 +124,72 @@ results = search.get_results(job_id)
 hits_fasta = search.get_hit_sequences(job_id)
 ```
 
+### Automated Pipeline
+
+```python
+from beak.remote import Pipeline
+
+# Create pipeline
+pipe = Pipeline(
+    host="your-server.edu",
+    user="your_username"
+)
+
+# Define workflow
+pipe.search("query.fasta", database="uniref90", e=0.001, threads=8) \
+    .taxonomy(database="uniref90") \
+    .align(threads=4) \
+    .tree(bootstrap=1000)
+
+# View pipeline
+print(pipe)
+# Output:
+# Pipeline:
+#   Input: query.fasta
+#   Steps (4):
+#     1. search (database=uniref90, e=0.001, threads=8)
+#     2. taxonomy (database=uniref90)
+#     3. align (threads=4)
+#     4. tree (bootstrap=1000)
+
+# Execute
+job_id = pipe.execute(job_name="my_analysis")
+
+# Monitor progress
+pipe.print_detailed_status(job_id)
+# Output:
+# ============================================================
+# Pipeline: my_analysis (abc12345)
+# Status: RUNNING | Runtime: 0:05:23
+# ============================================================
+#   ✓ Step 1: search (database=uniref90, e=0.001, threads=8) [COMPLETED]
+#     └─ hits: 164
+#   ⟳ Step 2: taxonomy (database=uniref90) [RUNNING]
+#   ○ Step 3: align (threads=4) [PENDING]
+#   ○ Step 4: tree (bootstrap=1000) [PENDING]
+# ============================================================
+
+# Download results from specific steps
+search_results = pipe.get_step_results(job_id, step_number=1)
+alignment = pipe.get_step_results(job_id, step_number=3)
+```
+
+### Conditional Pipelines
+
+```python
+# Only align if we find between 10-1000 hits
+pipe.search("query.fasta", database="uniref90", e=0.001) \
+    .if_min_hits(10).then('taxonomy', database="uniref90") \
+    .if_max_hits(1000).then('align') \
+    .tree()
+
+job_id = pipe.execute()
+```
+
 ### Taxonomy Assignment
 
 ```python
-from beak.new_remote import MMseqsTaxonomy
+from beak.remote import MMseqsTaxonomy
 
 # Initialize
 taxonomy = MMseqsTaxonomy(
@@ -92,7 +197,7 @@ taxonomy = MMseqsTaxonomy(
     user="your_username"
 )
 
-# Assign taxonomy
+# Assign taxonomy with full lineages
 job_id = taxonomy.submit(
     query_file="sequences.fasta",
     database="uniref90",
@@ -101,27 +206,29 @@ job_id = taxonomy.submit(
 
 # Get taxonomic annotations
 tax_results = taxonomy.get_results(job_id)
+# Returns DataFrame with columns: query, taxid, rank, scientific_name, lineage
 ```
 
 ---
 
 ## Motivation
 
-Beak addresses common challenges in modeling evolutionary sequence relationships:
+BEAK addresses common challenges in modeling evolutionary sequence relationships:
 
 1. **Computational Resources**: Large-scale sequence searches and alignments are too intensive for personal laptops
 2. **Workflow Integration**: Difficult to integrate remote computational steps into exploratory data analysis
 3. **Reproducibility**: Parameters and workflows need to be traceable and comparable across projects
+4. **Pipeline Complexity**: Chaining multiple tools requires manual scripting and file management
 
-**Solution**: Beak works within your local notebook environment while seamlessly offloading compute-intensive tasks to remote servers. Search and alignment parameters are automatically cached, making analyses traceable and reproducible.
+**Solution**: BEAK works within your local notebook environment while seamlessly offloading compute-intensive tasks to remote servers. All job parameters are automatically cached, and pipelines can be defined declaratively, making analyses traceable, reproducible, and easy to iterate.
 
 ---
 
 ## Requirements
 
 - Python 3.8+
-- SSH access to a server with MMseqs2 installed
-- Dependencies: `fabric`, `pandas`, `biopython`
+- SSH access to a remote server with bioinformatics tools installed
+- Dependencies: `fabric`, `pandas`, `biopython`, `paramiko`
 
 ---
 
