@@ -5,23 +5,30 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "beak"
 version = "0.1.0"
-description = "A toolkit for biophysical and evolutionary association modeling"
+description = "A toolkit for evolutionary sequence analysis and remote job management"
 authors = [{name = "Micah Olivas", email = "micah5051olivas@gmail.com"}]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
     "Operating System :: OS Independent"
 ]
 dependencies = [
     "numpy",
     "scipy",
-    "biopython"
+    "biopython",
+    "pandas",
+    "fabric>=3.0",
+    "paramiko>=3.0"
 ]
 
 [project.optional-dependencies]
@@ -39,7 +46,9 @@ remote = [
 dev = [
     "pytest",
     "black",
-    "flake8"
+    "flake8",
+    "ipython",
+    "jupyter"
 ]
 
 [tool.setuptools.packages.find]
