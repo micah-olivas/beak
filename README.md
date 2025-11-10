@@ -5,7 +5,7 @@
 
 **B**iophysical and **E**volutionary **A**ssociations **K**it
 
-A Python toolkit for remote bioinformatics workflows, designed for experimental biophysicists and biochemists. BEAK orchestrates computationally intensive sequence analysis tasks on remote servers while providing a seamless notebook-based interface.
+A Python toolkit for remote bioinformatics workflows, designed for experimental biophysicists and biochemists. BEAK orchestrates computationally intensive sequence analysis tasks on a remote server while providing a seamless notebook-based interface.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
