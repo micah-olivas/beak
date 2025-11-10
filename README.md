@@ -3,7 +3,7 @@
      <h1 style="margin: 0;">BEAK</h1>
 </div>
 
-**B**iophysical **E**volutionary **A**nalysis **K**it
+**B**iophysical **E**volutionary **A**ssociations **K**it
 
 A Python toolkit for evolutionary sequence analysis, designed for experimental biophysicists and biochemists.
 
