@@ -1,6 +1,3 @@
-Here's a polished README with the new remote MMseqs2 functionality highlighted:
-
-```markdown
 <div style="display: flex; align-items: top;">
      <img src="misc/icon-transparent.png" alt="BEAK icon" align="right" height=200pt/>
      <h1 style="margin: 0;">BEAK</h1>
