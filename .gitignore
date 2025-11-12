@@ -43,3 +43,11 @@ misc/
 
 # Local BEAK project results (keeps repo clean)
 my*
+
+# Additional ignores
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+dist/
+build/
