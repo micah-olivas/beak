@@ -1,0 +1,16 @@
+{
+  "datasets": [
+    {
+        // TODO: Update metadata
+        
+      "name": "enqvist_growth_temps",
+      "description": "Optimal growth temperatures for prokaryotes",
+      "version": "1.0",
+      "source": "https://zenodo.org/records/1175609",
+      "citation": "Enqvist, M. et al. (2018). Growth temperatures of prokaryotes. Zenodo.",
+      "loader": "load_growth_temps()",
+      "size_mb": 0.5,
+      "n_organisms": 15000
+    }
+  ]
+}
