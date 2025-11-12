@@ -21,7 +21,6 @@ ENV/
 .idea/
 *.swp
 *.swo
-*CLAUDE*
 
 # Testing and coverage
 .coverage
@@ -43,5 +42,4 @@ htmlcov/
 misc/
 
 # Local BEAK project results (keeps repo clean)
-my_beak_results/
-beak_results/
+my*
