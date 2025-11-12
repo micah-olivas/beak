@@ -1,6 +1,18 @@
-import seqlogo
+import os
+import urllib
+import urllib.request
+
 import numpy as np
 import pandas as pd
+
+from Bio.PDB import alphafold_db, PDBIO, PDBParser
+
+import seqlogo
+import logomaker
+
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio import pairwise2
 
 import panel as pn
 import holoviews as hv
@@ -10,7 +22,9 @@ from matplotlib.colors import ListedColormap
 
 from .alignments.utils import SimilarityResult
 
-def plot_seq_length_hist(aln, ref_length=None):
+from Bio.Data.IUPACData import protein_letters_3to1
+
+def plot_seq_length_hist(aln, title=None, ref_length=None):
     seq_lengths = [len(str(record.seq).replace('.', '').replace('-', '')) for record in aln]
     plt.figure(figsize=(4,3))
     plt.hist(seq_lengths, bins=30, color='skyblue', edgecolor='black')
@@ -21,7 +35,13 @@ def plot_seq_length_hist(aln, ref_length=None):
 
     plt.xlabel('Sequence Length')
     plt.ylabel('Count')
-    plt.title('Sequence Length Distribution')
+
+    # Add N sequences in top left
+    plt.text(0.05, 0.95, f'N: {len(seq_lengths)}', transform=plt.gca().transAxes, fontsize=12, verticalalignment='top')
+
+    if title:
+        plt.title(title)
+
     plt.show()
 
 def plot_sequence_logo(pssm, title="Sequence Logo"):
@@ -338,3 +358,191 @@ def plot_similar(similarity_result: SimilarityResult, figsize=None):
     plt.tight_layout()
     
     return fig
+
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+import numpy as np
+import logomaker
+
+def plot_sequence_logo(PSSM, top_label=None, bottom_label=None, figsize=(12, 3), scroll=False):
+    """
+    Plot a sequence logo from a Position-Specific Scoring Matrix (PSSM).
+    
+    Parameters:
+    -----------
+    PSSM : pandas.DataFrame
+        Position-Specific Scoring Matrix with positions as rows and amino acids as columns
+    top_label : str, optional
+        Label prefix for the y-axis (will be appended with "Enrichment")
+    bottom_label : str, optional
+        Currently unused parameter
+    figsize : tuple
+        Figure size (width, height)
+    scroll : bool, optional
+        If True, enables interactive scrolling along x-axis (50-residue window)
+    
+    Returns:
+    --------
+    fig : matplotlib.figure.Figure
+        The figure object
+    ax : matplotlib.axes.Axes
+        The axes object
+    logo : logomaker.Logo
+        The logo object
+    """
+
+    # Create a copy and clean
+    PSSM = PSSM.copy()
+    for col in ['cons_i', '-']:
+        if col in PSSM.columns:
+            PSSM = PSSM.drop(col, axis=1)
+    
+    # Create the figure and axis
+    fig, ax = plt.subplots(1, 1, figsize=figsize, dpi=300)
+    
+    # Create the logo
+    logo = logomaker.Logo(
+        PSSM,
+        ax=ax,
+        color_scheme='chemistry',
+        font_name='Arial'
+    )
+
+    # Style
+    logo.style_spines(visible=False)
+    logo.style_spines(spines=['left', 'bottom'], visible=True)
+    ax.set_ylim(0, 1)
+    ax.yaxis.grid(True, alpha=0.3, linestyle='--')
+    ax.set_axisbelow(True)
+
+    # Labels
+    if top_label is not None:
+        ax.set_ylabel(f'{top_label}\nEnrichment', fontsize=12)
+    ax.set_xlabel('Position', fontsize=12)
+    y_min, y_max = ax.get_ylim()
+    yticks = np.arange(np.floor(y_min / 0.2) * 0.2, np.ceil(y_max / 0.2) * 0.2 + 0.2, 0.2)
+    ax.set_yticks(yticks)
+
+    # Scroll functionality
+    if scroll:
+        window = 50
+        max_pos = len(PSSM)
+        ax.set_xlim(0, window)
+
+        # Adjust layout for slider
+        plt.subplots_adjust(bottom=0.25)
+        ax_slider = fig.add_axes([0.2, 0.1, 0.6, 0.03])
+        slider = Slider(ax_slider, 'Position', 0, max_pos - window, valinit=0, valstep=1)
+
+        def update(val):
+            start = int(slider.val)
+            ax.set_xlim(start, start + window)
+            fig.canvas.draw_idle()
+
+        slider.on_changed(update)
+
+    plt.tight_layout()
+    return fig, ax, logo
+
+def three_to_one(resname):
+    """Convert 3-letter residue name to 1-letter code (X if unknown)."""
+    return protein_letters_3to1.get(resname.capitalize(), "X")
+
+def save_mapped_structure(input, value_dict, reference_seq, null_bfactor=0.0):
+    """
+    Map desired position-wise values to the B-factor column of a PDB file,
+    aligning the reference sequence to the PDB-derived sequence.
+
+    Parameters
+    ----------
+    input : str
+        Path to the input PDB file, PDB ID, or UniProt Accession Number.
+    value_dict : dict
+        Dict with keys as reference sequence positions (1-based) and values (float).
+    reference_seq : str
+        Reference amino acid sequence (1-letter code).
+    null_bfactor : float, optional
+        Default B-factor value for residues not in value_dict (default=0.0).
+
+    Returns
+    -------
+    str
+        Path to output PDB with mapped B-factors.
+    """
+
+    # --- Fetch structure if needed ---
+    if ".pdb" not in input:
+        if len(input) == 4:  # PDB ID
+            pdb_id = input
+            urllib.request.urlretrieve(
+                f"http://files.rcsb.org/download/{pdb_id}.pdb", f"{pdb_id}.pdb"
+            )
+            pdb_filepath = f"{pdb_id}.pdb"
+        elif os.path.isdir(input):
+            print("dir! add support for directories...") # ADD DIR SUPPORT
+            os.mkdir('mapped_structures')
+        else:  # UniProt Accession → AlphaFold
+            structures = alphafold_db.get_structural_models_for(input)
+            io = PDBIO()
+            for i, structure in enumerate(structures, start=1):
+                pdb_filepath = f"{input}_AF_model_{i}.pdb"
+                io.set_structure(structure)
+                io.save(pdb_filepath)
+                break
+    else:
+        pdb_filepath = input
+
+    # --- Extract sequence from PDB ---
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("model", pdb_filepath)
+    model = next(structure.get_models())
+    chain = next(model.get_chains())  # assume single chain
+    pdb_residues = [res for res in chain.get_residues() if res.id[0] == " "]
+    pdb_seq = "".join(three_to_one(res.get_resname()) for res in pdb_residues)
+
+    # --- Align reference sequence to PDB sequence ---
+    alignment = pairwise2.align.globalxx(reference_seq, pdb_seq)[0]
+    ref_aln, pdb_aln, score, start, end = alignment
+
+    # --- Build mapping (ref_pos → pdb_residue) ---
+    mapping = {}
+    ref_pos, pdb_pos = 0, 0
+    for r_char, p_char in zip(ref_aln, pdb_aln):
+        if r_char != "-":
+            ref_pos += 1
+        if p_char != "-":
+            pdb_pos += 1
+        if r_char != "-" and p_char != "-":
+            mapping[ref_pos] = pdb_residues[pdb_pos - 1]
+
+    # --- Modify PDB file lines ---
+    with open(pdb_filepath, "r") as pdb_file:
+        pdb_lines = pdb_file.readlines()
+
+    modified_pdb_lines = []
+    for line in pdb_lines:
+        if line.startswith("ATOM"):
+            residue_index = int(line[22:26].strip())
+
+            # set to null value first
+            b_factor = null_bfactor
+
+            # overwrite if mapping has a value
+            for ref_pos, residue in mapping.items():
+                if residue.get_id()[1] == residue_index:
+                    if ref_pos in value_dict:
+                        b_factor = value_dict[ref_pos]
+                    break
+
+            line = line[:60] + f"{b_factor:6.2f}" + line[66:]
+            modified_pdb_lines.append(line)
+        else:
+            modified_pdb_lines.append(line)
+
+    # --- Save modified file ---
+    output_filepath = f"mapped_value_{os.path.basename(pdb_filepath)}"
+    with open(output_filepath, "w") as f:
+        f.writelines(modified_pdb_lines)
+
+    print(f"Modified structure saved to {output_filepath}")
+    return output_filepath
