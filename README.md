@@ -45,12 +45,6 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 ### Installation
 
 ```bash
-pip install beak
-```
-
-Or install from source:
-
-```bash
 git clone https://github.com/yourusername/beak.git
 cd beak
 pip install -e .
