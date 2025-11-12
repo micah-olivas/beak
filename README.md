@@ -14,26 +14,26 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 
 ## Features
 
-### 🔗 Remote Job Orchestration
+### Remote Job Orchestration
 - **Pipeline Builder**: Chain multiple analysis steps into automated workflows
 - **Smart Job Management**: Track, monitor, and retrieve results seamlessly
 - **Real-time Progress**: Detailed step-by-step status tracking
 
-### 🔍 Sequence Search & Analysis
+### Sequence Search
 - **[MMseqs2](https://github.com/soedinglab/MMseqs2) Integration**: Large-scale sequence searches against major databases
 - **Hit Extraction**: Automatically retrieve hit sequences as FASTA files
 - **Taxonomy Assignment**: Annotate taxonomies with MMseqs2 taxonomy
 
-### 🧬 Alignment & Phylogenetics
+### Alignment & Phylogenetics
 - **[Clustal Omega](http://www.clustal.org/omega/)**: Multiple sequence alignment
 - **[IQ-TREE](http://www.iqtree.org/)**: Maximum likelihood phylogenetic trees
 - **Pipeline Integration**: Seamlessly chain search → filter → align → tree workflows
 
-### 🧪 Structure & Embeddings (Coming Soon)
+### Structure & Embeddings (Coming Soon)
 - **[ColabFold](https://github.com/sokrypton/ColabFold)**: AlphaFold2 structure prediction
 - **[ESM](https://github.com/facebookresearch/esm)** & **[ProGen](https://github.com/salesforce/progen)**: Protein language model embeddings
 
-### 📊 Analysis Ready
+### Analysis Ready
 - Parse results directly into pandas DataFrames
 - Export sequences, alignments, and trees in standard formats
 - Cache all parameters for full reproducibility
@@ -43,12 +43,6 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 ## Quick Start
 
 ### Installation
-
-```bash
-pip install beak
-```
-
-Or install from source:
 
 ```bash
 git clone https://github.com/yourusername/beak.git
