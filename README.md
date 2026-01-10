@@ -29,7 +29,7 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 - **[IQ-TREE](http://www.iqtree.org/)**: Maximum likelihood phylogenetic trees
 - **Pipeline Integration**: Seamlessly chain search → filter → align → tree workflows
 
-### Structure & Embeddings (Coming Soon)
+### Structure & Embeddings
 - **[ColabFold](https://github.com/sokrypton/ColabFold)**: AlphaFold2 structure prediction
 - **[ESM](https://github.com/facebookresearch/esm)** & **[ProGen](https://github.com/salesforce/progen)**: Protein language model embeddings
 
