@@ -1,9 +1,10 @@
-from pathlib import Path
+import re
 import uuid
-from datetime import datetime
-from typing import Optional, Dict
-import pandas as pd
 import time
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Dict, Union
 
 from .base import RemoteJobManager
 
@@ -54,7 +55,7 @@ class MMseqsSearch(RemoteJobManager):  # Changed from MMseqsBase
             'params': {
                 's': 8.5,  # very high sensitivity
                 'e': 10,  # very permissive e-value
-                'max_seqs': 10000,  # allow many results
+                'max_seqs': 30000,  # allow many results
                 'min_seq_id': 0.15,  # very low identity threshold
                 'c': 0.3,  # low coverage threshold
                 'cov_mode': 0,  # bidirectional coverage
@@ -128,20 +129,20 @@ class MMseqsSearch(RemoteJobManager):  # Changed from MMseqsBase
            job_name: Optional[str] = None,
            preset: Optional[str] = None,
            **mmseqs_params) -> str:
-        """
-        Submit a new MMseqs2 search job
+        """Submit a new MMseqs2 search job"""
         
-        Args:
-            query_file: Path to local FASTA file
-            database: Database alias (e.g., 'uniref90') or full path
-            job_name: Optional human-readable job name
-            preset: Search preset ('default', 'fast', 'sensitive', 'exhaustive', 'very_sensitive')
-            **mmseqs_params: MMseqs2 parameters (override preset values)
-        
-        Returns:
-            job_id: Unique job identifier
-        """
         job_id = str(uuid.uuid4())[:8]
+        
+        # CREATE LOCAL PROJECT FIRST - ADD THIS BLOCK
+        project_dir = self.create_project(
+            job_id=job_id,
+            job_type='search',
+            name=job_name,
+            query_file=query_file
+        )
+        print(f"📁 Created project: {project_dir.name}")
+        
+        # Rest of the method stays the same...
         job_name = job_name or f"search_{job_id}"
         remote_job_path = f"{self.remote_job_dir}/{job_id}"
         
@@ -192,35 +193,47 @@ class MMseqsSearch(RemoteJobManager):  # Changed from MMseqsBase
             param_str.append(f'{prefix}{param_name} {v}')
         param_str = ' '.join(param_str)
         
-        # Create job script
+        # Create job script using mmseqs search workflow (not easy-search)
+        # This preserves the resultDB for later extraction
         job_script = f"""#!/bin/bash
-set -e
+    set -e
 
-# Job metadata
-echo "Job started: $(date)" > {remote_job_path}/status.txt
-echo 'RUNNING' >> {remote_job_path}/status.txt
+    # Job metadata
+    echo "Job started: $(date)" > {remote_job_path}/status.txt
+    echo 'RUNNING' >> {remote_job_path}/status.txt
 
-# Run MMseqs2
-mmseqs easy-search \\
-{remote_query} \\
-{db_path} \\
-{remote_job_path}/results.m8 \\
-{remote_job_path}/tmp \\
-{param_str} \\
-2>&1 | tee {remote_job_path}/mmseqs.log
+    # Create query database
+    mmseqs createdb {remote_query} {remote_job_path}/queryDB --dbtype 1
 
-# Check if successful
-if [ $? -eq 0 ]; then
-    echo "Job completed: $(date)" >> {remote_job_path}/status.txt
-    echo "COMPLETED" >> {remote_job_path}/status.txt
-else
-    echo "Job failed: $(date)" >> {remote_job_path}/status.txt
-    echo "FAILED" >> {remote_job_path}/status.txt
-fi
+    # Run MMseqs2 search
+    mmseqs search \\
+    {remote_job_path}/queryDB \\
+    {db_path} \\
+    {remote_job_path}/resultDB \\
+    {remote_job_path}/tmp \\
+    {param_str} \\
+    2>&1 | tee {remote_job_path}/mmseqs.log
 
-# Cleanup tmp files
-rm -rf {remote_job_path}/tmp
-"""
+    # Convert to m8 format for easy viewing
+    mmseqs convertalis \\
+    {remote_job_path}/queryDB \\
+    {db_path} \\
+    {remote_job_path}/resultDB \\
+    {remote_job_path}/results.m8 \\
+    2>&1 | tee -a {remote_job_path}/mmseqs.log
+
+    # Check if successful
+    if [ $? -eq 0 ]; then
+        echo "Job completed: $(date)" >> {remote_job_path}/status.txt
+        echo "COMPLETED" >> {remote_job_path}/status.txt
+    else
+        echo "Job failed: $(date)" >> {remote_job_path}/status.txt
+        echo "FAILED" >> {remote_job_path}/status.txt
+    fi
+
+    # Cleanup tmp files but keep resultDB
+    rm -rf {remote_job_path}/tmp
+    """
         
         # Upload and execute job script
         script_path = f"{remote_job_path}/run.sh"
@@ -262,16 +275,238 @@ rm -rf {remote_job_path}/tmp
         print(f"  PID: {pid}")
         
         return job_id
+        
+    def _parse_mmseqs_progress(self, log_content: str) -> Dict:
+        """Parse MMseqs2 log for progress information"""
+        progress = {
+            'current_step': None,
+            'prefilter_step': None,
+            'total_prefilter_steps': None,
+            'current_operation': None,
+        }
+        
+        if not log_content or log_content == "No log file":
+            return progress
+        
+        lines = log_content.strip().split('\n')
+        
+        # Parse prefiltering step from most recent line
+        prefilter_pattern = r'Process prefiltering step (\d+) of (\d+)'
+        for line in reversed(lines):
+            match = re.search(prefilter_pattern, line)
+            if match:
+                progress['prefilter_step'] = int(match.group(1))
+                progress['total_prefilter_steps'] = int(match.group(2))
+                progress['current_step'] = 'prefilter'
+                break
+        
+        # Determine current operation
+        operations = [
+            ('Index table: counting k-mers', 'Counting k-mers'),
+            ('Index table: fill', 'Building index'),
+            ('Starting prefiltering scores', 'Computing scores'),
+            ('align', 'Aligning'),
+            ('convertalis', 'Finalizing'),
+        ]
+        
+        for line in reversed(lines[:50]):  # Check recent lines only
+            for keyword, operation in operations:
+                if keyword in line:
+                    progress['current_operation'] = operation
+                    return progress
+        
+        return progress
     
-    def wait(self, job_id: str, check_interval: int = 30, verbose: bool = True):
+    def detailed_status(self, job_id: str) -> Dict:
+        """Get detailed status with progress parsing"""
+        job_db = self._load_job_db()
+        
+        if job_id not in job_db:
+            return {'status': 'UNKNOWN', 'error': 'Job ID not found'}
+        
+        job_info = job_db[job_id]
+        remote_path = job_info['remote_path']
+        
+        # Check process
+        pid = job_info['pid']
+        ps_result = self.conn.run(f'ps -p {pid} -o pid=', warn=True, hide=True)
+        is_running = ps_result.ok
+        
+        # Read status file
+        status_result = self.conn.run(
+            f'cat {remote_path}/status.txt 2>/dev/null || echo "NO_STATUS"',
+            hide=True, warn=True
+        )
+        status_lines = status_result.stdout.strip().split('\n')
+        
+        # Determine status
+        if 'COMPLETED' in status_lines:
+            status = 'COMPLETED'
+        elif 'FAILED' in status_lines:
+            status = 'FAILED'
+        elif 'RUNNING' in status_lines or is_running:
+            status = 'RUNNING'
+        elif status_lines[0] == 'NO_STATUS':
+            status = 'SUBMITTED'
+        else:
+            status = 'UNKNOWN'
+        
+        # Calculate runtime
+        submitted_at = datetime.fromisoformat(job_info['submitted_at'])
+        runtime = str(datetime.now() - submitted_at).split('.')[0]
+        
+        # Parse progress if running
+        progress = {}
+        if status in ['RUNNING', 'SUBMITTED']:
+            log_result = self.conn.run(
+                f'tail -n 100 {remote_path}/mmseqs.log 2>/dev/null || echo "No log file"',
+                hide=True, warn=True
+            )
+            progress = self._parse_mmseqs_progress(log_result.stdout)
+        
+        # Update local DB
+        job_info['status'] = status
+        job_info['last_checked'] = datetime.now().isoformat()
+        self._save_job_db(job_db)
+        
+        return {
+            'job_id': job_id,
+            'name': job_info['name'],
+            'status': status,
+            'runtime': runtime,
+            'job_type': job_info.get('job_type', 'search'),
+            **progress
+        }
+    
+    def print_detailed_status(self, job_id: str, watch: bool = False, animation_frame: int = 0):
+        """Print formatted status with optional live updates"""
+        from itertools import cycle
+        
+        spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        
+        # Clear in watch mode (for notebooks)
+        if watch and animation_frame > 0:
+            try:
+                from IPython.display import clear_output
+                clear_output(wait=True)
+            except ImportError:
+                print('\033[2J\033[H')  # Clear terminal
+        
+        status = self.detailed_status(job_id)
+        
+        print(f"\n{'='*60}")
+        print(f"Job: {status['name']} ({status['job_id']})")
+        print(f"Status: {status['status']} | Runtime: {status['runtime']}")
+        print(f"{'='*60}")
+        
+        if status['status'] in ['RUNNING', 'SUBMITTED']:
+            # Show progress
+            if status.get('prefilter_step') and status.get('total_prefilter_steps'):
+                total = status['total_prefilter_steps']
+                current = status['prefilter_step']
+                pct = (current / total) * 100
+                
+                # Progress bar
+                bar_length = 40
+                filled = int(bar_length * current / total)
+                bar = '█' * filled + '░' * (bar_length - filled)
+                
+                icon = spinner[animation_frame % len(spinner)] if watch else '⟳'
+                print(f"\n{icon} Prefilter: Step {current}/{total} ({pct:.1f}%)")
+                print(f"  [{bar}]")
+            
+            if status.get('current_operation'):
+                print(f"\n🔄 {status['current_operation']}")
+            
+            if watch:
+                print(f"\n(Press Ctrl+C to stop watching)")
+        
+        print(f"{'='*60}\n")
+        
+        # Watch mode
+        if watch and status['status'] in ['RUNNING', 'SUBMITTED']:
+            try:
+                import time
+                time.sleep(1)
+                self.print_detailed_status(job_id, watch=True, animation_frame=animation_frame + 1)
+            except KeyboardInterrupt:
+                print("\nStopped watching.")
+    
+    def status(self, job_id: str, verbose: bool = False) -> Dict:
         """
-        Wait for job to complete with progress updates
+        Check job status
         
         Args:
             job_id: Job identifier
-            check_interval: Seconds between status checks
-            verbose: Print progress updates
+            verbose: If True, return detailed status with progress
         """
+        if verbose:
+            return self.detailed_status(job_id)
+        
+        # Simple status (keeps original behavior)
+        job_db = self._load_job_db()
+        
+        if job_id not in job_db:
+            return {'status': 'UNKNOWN', 'error': 'Job ID not found'}
+        
+        job_info = job_db[job_id]
+        remote_path = job_info['remote_path']
+        pid = job_info['pid']
+        
+        # Check process
+        ps_result = self.conn.run(f'ps -p {pid} -o pid=', warn=True, hide=True)
+        is_running = ps_result.ok
+        
+        # Read status file
+        status_result = self.conn.run(
+            f'cat {remote_path}/status.txt 2>/dev/null || echo "NO_STATUS"',
+            hide=True, warn=True
+        )
+        status_lines = status_result.stdout.strip().split('\n')
+        
+        if 'COMPLETED' in status_lines:
+            status = 'COMPLETED'
+        elif 'FAILED' in status_lines:
+            status = 'FAILED'
+        elif 'RUNNING' in status_lines or is_running:
+            status = 'RUNNING'
+        elif status_lines[0] == 'NO_STATUS':
+            status = 'SUBMITTED'
+        else:
+            status = 'UNKNOWN'
+        
+        # Calculate runtime
+        submitted_at = datetime.fromisoformat(job_info['submitted_at'])
+        runtime = str(datetime.now() - submitted_at).split('.')[0]
+        
+        # Update local DB
+        job_info['status'] = status
+        job_info['last_checked'] = datetime.now().isoformat()
+        self._save_job_db(job_db)
+        
+        return {
+            'job_id': job_id,
+            'name': job_info['name'],
+            'status': status,
+            'runtime': runtime,
+            'job_type': job_info.get('job_type', 'search')
+        }
+    
+    def wait(self, job_id: str, check_interval: int = 30, verbose: bool = True, show_progress: bool = False):
+        """
+        Wait for job completion
+        
+        Args:
+            job_id: Job identifier
+            check_interval: Seconds between checks
+            verbose: Print updates
+            show_progress: Show detailed progress (uses print_detailed_status)
+        """
+        if show_progress:
+            self.print_detailed_status(job_id, watch=True)
+            return self.status(job_id)['status']
+        
+        # Simple waiting
         if verbose:
             print(f"Waiting for job {job_id}...")
         
@@ -279,7 +514,7 @@ rm -rf {remote_job_path}/tmp
             status_info = self.status(job_id)
             
             if verbose:
-                print(f"  [{status_info['runtime']}] Status: {status_info['status']}")
+                print(f"  [{status_info['runtime']}] {status_info['status']}")
             
             if status_info['status'] in ['COMPLETED', 'FAILED', 'UNKNOWN', 'CANCELLED']:
                 break
@@ -293,48 +528,6 @@ rm -rf {remote_job_path}/tmp
                 print(f"✗ Job {status_info['status'].lower()}")
         
         return status_info['status']
-    
-    def download(self, job_id: str, local_dir: str = '.') -> Path:
-        """
-        Download job results
-        
-        Args:
-            job_id: Job identifier
-            local_dir: Local directory to save results
-        
-        Returns:
-            Path to downloaded results file
-        """
-        status_info = self.status(job_id)
-        
-        if status_info['status'] != 'COMPLETED':
-            raise ValueError(f"Job not completed (status: {status_info['status']})")
-        
-        job_db = self._load_job_db()
-        remote_path = job_db[job_id]['remote_path']
-        
-        # Create local output directory
-        local_dir = Path(local_dir)
-        local_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Download results
-        local_file = local_dir / f"{job_id}_results.m8"
-        self.conn.get(
-            remote=f"{remote_path}/results.m8",
-            local=str(local_file)
-        )
-        
-        # Also download log
-        local_log = local_dir / f"{job_id}_log.txt"
-        self.conn.get(
-            remote=f"{remote_path}/mmseqs.log",
-            local=str(local_log)
-        )
-        
-        print(f"✓ Downloaded results to {local_file}")
-        print(f"✓ Downloaded log to {local_log}")
-        
-        return local_file
     
     def list_jobs(self, status_filter: Optional[str] = None) -> pd.DataFrame:
         """
@@ -376,85 +569,138 @@ rm -rf {remote_job_path}/tmp
         
         return df
     
-    def get_results(self, job_id: str, parse: bool = True):
+    def get_results(self, 
+                job_id: str, 
+                parse: bool = True,
+                download_sequences: bool = False) -> Union[Path, pd.DataFrame, Dict]:
         """
-        Download and optionally parse results
+        Download and optionally parse job results
+        
+        Results are automatically saved to the job's project directory.
         
         Args:
             job_id: Job identifier
-            parse: If True, return parsed DataFrame
+            parse: If True, return parsed DataFrame; if False, return Path to m8 file
+            download_sequences: Also download hit sequences as FASTA
         
         Returns:
-            Path or DataFrame depending on parse parameter
+            DataFrame (if parse=True), Path (if parse=False), or Dict (if download_sequences=True)
         """
-        results_file = self.download(job_id)
+        # Check job status
+        status_info = self.status(job_id)
+        if status_info['status'] != 'COMPLETED':
+            raise ValueError(f"Job not completed (status: {status_info['status']})")
         
-        if not parse:
-            return results_file
+        # Get project directory
+        project_dir = self.get_project_dir(job_id)
+        if not project_dir:
+            # Shouldn't happen, but create if missing
+            project_dir = self.create_project(job_id, 'search')
         
-        # Parse MMseqs2 output (m8 format)
-        columns = [
-            'query', 'target', 'identity', 'alignment_length',
-            'mismatches', 'gap_openings', 'q_start', 'q_end',
-            't_start', 't_end', 'evalue', 'bit_score'
-        ]
+        job_db = self._load_job_db()
+        remote_path = job_db[job_id]['remote_path']
         
-        df = pd.read_csv(results_file, sep='\t', names=columns, comment='#')
+        # Download m8 results
+        m8_file = project_dir / "results.m8"
+        if not m8_file.exists():
+            print(f"Downloading results...")
+            self.conn.get(f"{remote_path}/results.m8", str(m8_file))
+            print(f"✓ Downloaded to {project_dir.name}/results.m8")
         
-        print(f"✓ Parsed {len(df)} alignments")
+        # Download log
+        log_file = project_dir / "job.log"
+        if not log_file.exists():
+            self.conn.get(f"{remote_path}/mmseqs.log", str(log_file))
         
-        return df
-    
+        # Download sequences if requested
+        if download_sequences:
+            fasta_file = project_dir / "hits.fasta"
+            if not fasta_file.exists():
+                print(f"Extracting hit sequences...")
+                db_path = job_db[job_id]['database_path']
+                remote_fasta = f"{remote_path}/hits.fasta"
+                
+                cmd = f"""
+set -e
+mmseqs createseqfiledb {db_path} {remote_path}/resultDB {remote_path}/fastaDB
+mmseqs result2flat {db_path} {db_path} {remote_path}/fastaDB {remote_fasta} --use-fasta-header
+rm -f {remote_path}/fastaDB*
+"""
+                result = self.conn.run(cmd, warn=True, hide=False)
+                if result.failed:
+                    raise RuntimeError("Failed to extract sequences")
+                
+                self.conn.get(remote_fasta, str(fasta_file))
+                
+                with open(fasta_file) as f:
+                    n_seqs = sum(1 for line in f if line.startswith('>'))
+                print(f"✓ Extracted {n_seqs} sequences to {project_dir.name}/hits.fasta")
+        
+        # Parse if requested
+        if parse:
+            columns = [
+                'query', 'target', 'identity', 'alignment_length',
+                'mismatches', 'gap_openings', 'q_start', 'q_end',
+                't_start', 't_end', 'evalue', 'bit_score'
+            ]
+            df = pd.read_csv(m8_file, sep='\t', names=columns, comment='#')
+            print(f"✓ Parsed {len(df)} alignments")
+            
+            if download_sequences:
+                return {'dataframe': df, 'm8': m8_file, 'fasta': fasta_file}
+            return df
+        
+        if download_sequences:
+            return {'m8': m8_file, 'fasta': fasta_file}
+        
+        return m8_file
+
+    def download(self, job_id: str, local_dir: str = '.') -> Path:
+        """
+        Download job results (m8 format)
+        
+        DEPRECATED: Use get_results(job_id, format='m8') instead
+        
+        Args:
+            job_id: Job identifier
+            local_dir: Local directory to save results
+        
+        Returns:
+            Path to downloaded results file
+        """
+        import warnings
+        warnings.warn(
+            "download() is deprecated. Use get_results(job_id, format='m8') instead",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        return self.get_results(job_id, output_dir=local_dir, format='m8', download_log=True)
+
     def get_hit_sequences(self, job_id: str, output_fasta: Optional[str] = None) -> Path:
         """
         Extract hit sequences from search results as FASTA
         
+        DEPRECATED: Use get_results(job_id, format='fasta') instead
+        
         Args:
             job_id: Job identifier
-            output_fasta: Optional output path, defaults to {job_id}_hits.fasta
+            output_fasta: Optional output path
         
         Returns:
             Path to FASTA file with hit sequences
         """
-        job_db = self._load_job_db()
-        if job_id not in job_db:
-            raise ValueError(f"Job {job_id} not found")
+        import warnings
+        warnings.warn(
+            "get_hit_sequences() is deprecated. Use get_results(job_id, format='fasta') instead",
+            DeprecationWarning,
+            stacklevel=2
+        )
         
-        remote_path = job_db[job_id]['remote_path']
-        db_path = job_db[job_id]['database_path']
-        remote_output = f"{remote_path}/hits.fasta"
-        
-        # Use mmseqs result2profile to extract sequences directly from m8
-        # This is much faster than grep on large lookup files
-        cmd = f"""
-        # Convert m8 to mmseqs result format and extract target sequences
-        # Create a query DB (needed for result2profile)
-        mmseqs createdb {remote_path}/query.fasta {remote_path}/queryDB
-        
-        # Convert blast-tab (m8) to mmseqs result database
-        mmseqs convertalis {remote_path}/queryDB {db_path} {remote_path}/results.m8 {remote_path}/resultDB --format-mode 4
-        
-        # Extract unique target sequences
-        mmseqs result2profile {remote_path}/queryDB {db_path} {remote_path}/resultDB {remote_path}/profileDB
-        mmseqs profile2seq {remote_path}/profileDB {remote_path}/hitDB
-        
-        # Or simpler: just use result2flat to get unique hits
-        mmseqs result2flat {remote_path}/queryDB {db_path} {remote_path}/resultDB {remote_output} --use-fasta-header
-        
-        # Cleanup
-        rm -f {remote_path}/queryDB* {remote_path}/resultDB* {remote_path}/profileDB* {remote_path}/hitDB*
-        """
-        
-        result = self.conn.run(cmd, warn=True)
-        
-        if result.failed:
-            raise RuntimeError(f"Failed to extract sequences")
-        
-        output_fasta = output_fasta or f"{job_id}_hits.fasta"
-        self.conn.get(remote_output, output_fasta)
-        
-        with open(output_fasta) as f:
-            n_seqs = sum(1 for line in f if line.startswith('>'))
-        
-        print(f"✓ Extracted {n_seqs} hit sequences to {output_fasta}")
-        return Path(output_fasta)
+        if output_fasta:
+            output_dir = Path(output_fasta).parent
+            fasta_file = self.get_results(job_id, output_dir=str(output_dir), format='fasta')
+            # Rename to requested name
+            Path(fasta_file).rename(output_fasta)
+            return Path(output_fasta)
+        else:
+            return self.get_results(job_id, format='fasta')

@@ -1,5 +1,6 @@
 import time
 import sys
+import shutil
 from itertools import cycle
 
 from pathlib import Path
@@ -99,18 +100,10 @@ class Pipeline(RemoteJobManager):
         # Check if process is running
         pid = job_db[job_id]['pid']
         ps_result = self.conn.run(f'ps -p {pid}', warn=True, hide=False)
-        # print(f"\nProcess check (PID {pid}):")
-        # print(ps_result.stdout)
         
-        # Check status file
-        # print("\nStatus file contents:")
         status = self.conn.run(f'cat {remote_path}/status.txt 2>&1', warn=True, hide=False)
-        # print(status.stdout)
-        
-        # Check what files exist
-        # print(f"\nFiles in {remote_path}:")
+    
         files = self.conn.run(f'ls -la {remote_path}/', warn=True, hide=False)
-        # print(files.stdout)
         
         # Check pipeline script output
         # print("\nPipeline output (last 50 lines):")
@@ -332,9 +325,23 @@ class Pipeline(RemoteJobManager):
         else:
             db_path = f"{self.DB_BASE_PATH}/{database}"
         
+        # Handle preset - expand to actual parameters
+        params_to_use = step.params.copy()
+        
+        if 'preset' in params_to_use:
+            preset_name = params_to_use.pop('preset')
+            
+            # Get preset parameters
+            if preset_name in MMseqsSearch.PRESETS:
+                preset_params = MMseqsSearch.PRESETS[preset_name]['params'].copy()
+                # Merge with any user-provided params (user params override preset)
+                for k, v in preset_params.items():
+                    if k not in params_to_use:
+                        params_to_use[k] = v
+        
         # Format parameters
         param_str = []
-        for k, v in step.params.items():
+        for k, v in params_to_use.items():
             if k == 'database':
                 continue
             param_name = k.replace("_", "-")
@@ -343,25 +350,34 @@ class Pipeline(RemoteJobManager):
         param_str = ' '.join(param_str)
         
         return [
-            f"mmseqs easy-search \\",
-            f"  {remote_path}/{input_file} \\",
+            "# Create query database",
+            f"mmseqs createdb {remote_path}/{input_file} {step_dir}/queryDB --dbtype 1",
+            "",
+            "# Run MMseqs2 search",
+            f"mmseqs search \\",
+            f"  {step_dir}/queryDB \\",
             f"  {db_path} \\",
-            f"  {step_dir}/results.m8 \\",
+            f"  {step_dir}/resultDB \\",
             f"  {step_dir}/tmp \\",
             f"  {param_str}",
             "",
+            "# Convert to m8 format",
+            f"mmseqs convertalis \\",
+            f"  {step_dir}/queryDB \\",
+            f"  {db_path} \\",
+            f"  {step_dir}/resultDB \\",
+            f"  {step_dir}/results.m8",
+            "",
             "# Extract hit sequences",
-            f"cut -f2 {step_dir}/results.m8 | sort -u > {step_dir}/acc_list.txt",
-            f"CONTEXT[hit_count]=$(wc -l < {step_dir}/acc_list.txt)",
+            f"mmseqs createseqfiledb {db_path} {step_dir}/resultDB {step_dir}/seqDB",
+            f"mmseqs result2flat {db_path} {db_path} {step_dir}/seqDB {step_dir}/{output_name}.fasta --use-fasta-header",
+            "",
+            "# Count hits",
+            f"CONTEXT[hit_count]=$(grep -c '^>' {step_dir}/{output_name}.fasta || echo 0)",
             f"echo \"Found ${{CONTEXT[hit_count]}} hits\"",
-            f"if [ -f {db_path}.lookup ]; then",
-            f"  grep -Ff {step_dir}/acc_list.txt {db_path}.lookup | cut -f1 > {step_dir}/id_list.txt",
-            f"else",
-            f"  cp {step_dir}/acc_list.txt {step_dir}/id_list.txt",
-            f"fi",
-            f"mmseqs createsubdb {step_dir}/id_list.txt {db_path} {step_dir}/hitDB",
-            f"mmseqs convert2fasta {step_dir}/hitDB {step_dir}/{output_name}.fasta",
-            f"rm -rf {step_dir}/tmp {step_dir}/hitDB* {step_dir}/acc_list.txt {step_dir}/id_list.txt"
+            "",
+            "# Cleanup",
+            f"rm -rf {step_dir}/tmp {step_dir}/queryDB* {step_dir}/resultDB* {step_dir}/seqDB*"
         ]
     
     def _generate_filter_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
@@ -443,7 +459,21 @@ class Pipeline(RemoteJobManager):
         input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
         
         return [
-            f"clustalo -i {input_fasta} -o {step_dir}/alignment.{output_format} {' '.join(params)}"
+            "# Check if seqkit is available, otherwise use awk",
+            f"if command -v seqkit &> /dev/null; then",
+            f"  # Filter using seqkit (removes sequences with length 0)",
+            f"  seqkit seq -m 1 {input_fasta} > {step_dir}/filtered_input.fasta",
+            f"else",
+            f"  # Filter using awk",
+            f"  awk '/^>/ {{if (seq) print header \"\\n\" seq; header=$0; seq=\"\"; next}} {{seq=seq $0}} END {{if (seq) print header \"\\n\" seq}}' {input_fasta} | \\",
+            f"    awk 'BEGIN {{RS=\">\"; ORS=\"\"}} NR>1 {{split($0,a,\"\\n\"); seq=\"\"; for(i=2;i<=length(a);i++) seq=seq a[i]; if (length(seq)>0) print \">\" $0}}' > {step_dir}/filtered_input.fasta",
+            f"fi",
+            "",
+            "# Count sequences",
+            f"echo \"Sequences for alignment: $(grep -c '^>' {step_dir}/filtered_input.fasta || echo 0)\"",
+            "",
+            "# Run Clustal Omega alignment",
+            f"clustalo -i {step_dir}/filtered_input.fasta -o {step_dir}/alignment.{output_format} {' '.join(params)}"
         ]
     
     def _generate_tree_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
@@ -461,32 +491,59 @@ class Pipeline(RemoteJobManager):
         ]
     
     def _generate_embeddings_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
-        """Generate embedding commands - placeholder"""
+        """Generate embedding commands using Docker service"""
+        model = step.params.get('model', 'esm2')
+        input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
+        
+        # Ensure Docker service is running (done once at pipeline start)
+        # Commands will use docker compose exec
+        
         return [
-            f"# Embeddings step - to be implemented",
-            f"echo 'Embeddings placeholder' > {step_dir}/{output_name}.pt"
+            f"# Generate embeddings using Docker service",
+            f"cd {self.remote_job_dir}/docker",
+            f"docker compose exec -T embeddings python -m beak.remote.embeddings generate \\",
+            f"  --input {input_fasta} \\",
+            f"  --output {step_dir}/{output_name}.pt \\",
+            f"  --model {model}"
         ]
     
     def execute(self, job_name: Optional[str] = None) -> str:
-        """
-        Execute the pipeline on the remote server
+        """Execute the pipeline on the remote server"""
         
-        Args:
-            job_name: Optional name for this pipeline job
-        
-        Returns:
-            job_id: Unique job identifier
-        """
         if not self.steps:
             raise ValueError("Pipeline has no steps. Add steps before executing.")
         
         if not self.initial_input:
             raise ValueError("No input file specified. Use .search(query_file=...) to set input.")
         
+        # Check if pipeline needs Docker
+        needs_docker = any(step.step_type == 'embeddings' for step in self.steps)
+        if needs_docker:
+            print("Setting up Docker service for embeddings...")
+            self._ensure_docker_service('embeddings')
+        
         job_id = str(uuid.uuid4())[:8]
+        
+        # CREATE LOCAL PROJECT - ADD THIS BLOCK
+        project_dir = self.create_project(
+            job_id=job_id,
+            job_type='pipeline',
+            name=job_name,
+            query_file=self.initial_input
+        )
+        
+        # Create step subdirectories in project
+        for i, step in enumerate(self.steps, 1):
+            step_dir = project_dir / f"{i:02d}_{step.step_type}"
+            step_dir.mkdir(exist_ok=True)
+        
+        print(f"📁 Created pipeline: {project_dir.name}")
+        print(f"   Steps: {' → '.join(s.step_type for s in self.steps)}")
+        
+        # Set remote job directory details
         job_name = job_name or f"pipeline_{job_id}"
         remote_job_path = f"{self.remote_job_dir}/{job_id}"
-        
+
         # Create remote job directory
         self.conn.run(f'mkdir -p {remote_job_path}', hide=True)
         print(f"Created remote directory: {remote_job_path}")
@@ -498,13 +555,6 @@ class Pipeline(RemoteJobManager):
         
         # Generate pipeline script
         pipeline_script = self._generate_pipeline_script(job_id, remote_job_path)
-
-        ## DEBUG: Print the generated script
-        # print("=" * 60)
-        # print("GENERATED SCRIPT:")
-        # print("=" * 60)
-        # print(pipeline_script)
-        # print("=" * 60)
         
         # Upload and execute pipeline script
         script_path = f"{remote_job_path}/pipeline.sh"
@@ -525,9 +575,7 @@ class Pipeline(RemoteJobManager):
         self.conn.run(f'echo {pid} > {remote_job_path}/pid.txt', hide=True)
 
         # After executing, check the actual script on server
-        result = self.conn.run(f'cat {remote_job_path}/pipeline.sh', hide=False)
-        # print("\nACTUAL SCRIPT ON SERVER:")
-        # print(result.stdout)
+        result = self.conn.run(f'cat {remote_job_path}/pipeline.sh', hide=True)
         
         # Update local job database
         job_db = self._load_job_db()
@@ -762,3 +810,200 @@ class Pipeline(RemoteJobManager):
                     print(f"\n✓ Job {status['overall_status'].lower()}. Stopped watching.")
             except KeyboardInterrupt:
                 print("\n\nStopped watching.")
+
+    def get_results(self, job_id: str, steps: Optional[List[int]] = None) -> Path:
+        """
+        Download pipeline results to local project directory
+        
+        Args:
+            job_id: Job identifier
+            steps: Optional list of step numbers to download (default: all)
+        
+        Returns:
+            Path to project directory
+        """
+        # Check job status
+        status_info = self.status(job_id)
+        if status_info['status'] not in ['COMPLETED', 'RUNNING']:
+            raise ValueError(f"Job not ready (status: {status_info['status']})")
+        
+        # Get project directory
+        project_dir = self.get_project_dir(job_id)
+        if not project_dir:
+            # Shouldn't happen, but create if missing
+            project_dir = self.create_project(job_id, 'pipeline')
+        
+        job_db = self._load_job_db()
+        job_info = job_db[job_id]
+        remote_path = job_info['remote_path']
+        
+        print(f"Downloading results to: {project_dir.name}")
+        
+        # Determine which steps to download
+        steps_to_download = steps or range(1, len(job_info['steps']) + 1)
+        
+        # Download each step's results
+        for i in steps_to_download:
+            if i < 1 or i > len(job_info['steps']):
+                print(f"Warning: Step {i} doesn't exist, skipping")
+                continue
+            
+            step_info = job_info['steps'][i - 1]
+            step_type = step_info['type']
+            local_step_dir = project_dir / f"{i:02d}_{step_type}"
+            remote_step_dir = f"{remote_path}/{i:02d}_{step_type}"
+            
+            # Check if step has completed
+            check = self.conn.run(
+                f'[ -d {remote_step_dir} ] && echo "EXISTS" || echo "NOT_FOUND"',
+                hide=True, warn=True
+            )
+            
+            if check.stdout.strip() == "NOT_FOUND":
+                print(f"  ⊗ Step {i} ({step_type}): not started yet")
+                continue
+            
+            # Map step types to files to download
+            files_to_download = {
+                'search': ['results.m8', f"{i:02d}_{step_type}_output.fasta"],
+                'filter': ['filtered.fasta', 'filter.py'],
+                'taxonomy': ['taxonomy.tsv'],
+                'align': ['alignment.fasta', 'alignment.phy'],
+                'tree': ['tree.nwk', 'tree.treefile'],
+                'embeddings': ['embeddings.pt']
+            }
+            
+            files = files_to_download.get(step_type, [])
+            downloaded_count = 0
+            
+            for filename in files:
+                remote_file = f"{remote_step_dir}/{filename}"
+                local_file = local_step_dir / filename
+                
+                # Skip if already downloaded
+                if local_file.exists():
+                    continue
+                
+                # Check if file exists on remote
+                check = self.conn.run(
+                    f'[ -f {remote_file} ] && echo "EXISTS" || echo "NOT_FOUND"',
+                    hide=True, warn=True
+                )
+                
+                if check.stdout.strip() == "EXISTS":
+                    self.conn.get(remote_file, str(local_file))
+                    downloaded_count += 1
+            
+            if downloaded_count > 0:
+                print(f"  ✓ Step {i} ({step_type}): {downloaded_count} file(s)")
+            else:
+                print(f"  ○ Step {i} ({step_type}): up to date")
+        
+        # Also download pipeline logs
+        log_file = project_dir / "pipeline.log"
+        if not log_file.exists():
+            self.conn.get(f"{remote_path}/nohup.out", str(log_file))
+            print(f"  ✓ Pipeline log")
+        
+        print(f"\n✓ Project: {project_dir}")
+        return project_dir
+    
+    def get_step_results(self, job_id: str, step_number: int) -> Path:
+        """
+        Download results from a specific pipeline step to project directory
+        
+        Args:
+            job_id: Job identifier
+            step_number: Step number (1-indexed)
+        
+        Returns:
+            Path to step results file or directory
+        """
+        # Get project directory
+        project_dir = self.get_project_dir(job_id)
+        if not project_dir:
+            raise ValueError(f"No project found for {job_id}")
+        
+        job_db = self._load_job_db()
+        if job_id not in job_db:
+            raise ValueError(f"Job {job_id} not found")
+        
+        job_info = job_db[job_id]
+        remote_path = job_info['remote_path']
+        step_info = job_info['steps'][step_number - 1]
+        step_type = step_info['type']
+        
+        remote_step_dir = f"{remote_path}/{step_number:02d}_{step_type}"
+        local_step_dir = project_dir / f"{step_number:02d}_{step_type}"
+        local_step_dir.mkdir(exist_ok=True)
+        
+        # Determine output files
+        output_files = {
+            'search': ['results.m8', f"{step_number:02d}_{step_type}_output.fasta"],
+            'taxonomy': ['taxonomy.tsv'],
+            'filter': ['filtered.fasta'],
+            'align': ['alignment.fasta'],
+            'tree': ['tree.nwk'],
+            'embeddings': ['embeddings.pt']
+        }
+        
+        files = output_files.get(step_type, ['output'])
+        
+        downloaded = []
+        for filename in files:
+            remote_file = f"{remote_step_dir}/{filename}"
+            local_file = local_step_dir / filename
+            
+            check = self.conn.run(
+                f'[ -f {remote_file} ] && echo "EXISTS" || echo "NOT_FOUND"',
+                hide=True, warn=True
+            )
+            
+            if check.stdout.strip() == "EXISTS":
+                self.conn.get(remote_file, str(local_file))
+                downloaded.append(local_file)
+        
+        if downloaded:
+            print(f"✓ Downloaded step {step_number} ({step_type}) to {local_step_dir.name}")
+            return downloaded[0] if len(downloaded) == 1 else local_step_dir
+        else:
+            raise ValueError(f"No results found for step {step_number}")
+
+    def wait(self, job_id: str, check_interval: int = 30, verbose: bool = True, download: bool = True):
+        """
+        Wait for pipeline to complete and optionally download results
+        
+        Args:
+            job_id: Job identifier
+            check_interval: Seconds between checks
+            verbose: Print progress updates
+            download: Automatically download results when complete
+        
+        Returns:
+            Path to project directory if download=True, else status string
+        """
+        if verbose:
+            print(f"Waiting for pipeline {job_id}...")
+        
+        while True:
+            status_info = self.status(job_id)
+            
+            if verbose:
+                print(f"  [{status_info['runtime']}] {status_info['status']}")
+            
+            if status_info['status'] in ['COMPLETED', 'FAILED', 'UNKNOWN']:
+                break
+            
+            time.sleep(check_interval)
+        
+        if verbose:
+            if status_info['status'] == 'COMPLETED':
+                print(f"✓ Pipeline completed in {status_info['runtime']}")
+            else:
+                print(f"✗ Pipeline {status_info['status'].lower()}")
+        
+        if download and status_info['status'] == 'COMPLETED':
+            return self.get_results(job_id)
+        
+        return status_info['status']
+    
