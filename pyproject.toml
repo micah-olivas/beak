@@ -29,29 +29,20 @@ dependencies = [
     "pandas",
     "fabric>=3.0",
     "paramiko>=3.0"
-]
-
-[project.optional-dependencies]
-viz = [
+    "holoviews",
     "matplotlib",
-    "seaborn",
     "seqlogo",
     "logomaker",
     "panel",
-    "holoviews",
-    "ipympl>=0.9.0"
-]
-remote = [
-    "cryptography",
+    "seaborn",
     "tqdm"
-]
-dev = [
+    "ipympl>=0.9.0"
+    "cryptography",
     "pytest",
     "black",
     "flake8",
     "ipython",
     "jupyter"
-]
 
 [tool.setuptools.packages.find]
 where = ["src"]
