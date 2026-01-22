@@ -50,7 +50,7 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/beak.git
+git clone https://github.com/micah-olivas/beak.git
 cd beak
 pip install -e .
 ```
