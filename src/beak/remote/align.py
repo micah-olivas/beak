@@ -30,6 +30,16 @@ class ClustalAlign(RemoteJobManager):
         """
         job_id = str(uuid.uuid4())[:8]
         job_name = job_name or f"align_{job_id}"
+        
+        # CREATE LOCAL PROJECT FIRST
+        project_dir = self.create_project(
+            job_id=job_id,
+            job_type='align',
+            name=job_name,
+            query_file=input_file
+        )
+        print(f"📁 Created project: {project_dir.name}")
+        
         remote_job_path = f"{self.remote_job_dir}/{job_id}"
         
         # Create remote job directory
@@ -56,7 +66,7 @@ class ClustalAlign(RemoteJobManager):
         
         param_str = ' '.join(param_str)
         
-        # Create job script
+        # Create job script with awk filtering
         job_script = f"""#!/bin/bash
 set -e
 
@@ -64,19 +74,32 @@ set -e
 echo "Job started: $(date)" > {remote_job_path}/status.txt
 echo 'RUNNING' >> {remote_job_path}/status.txt
 
+# Filter out empty sequences using awk (works everywhere)
+echo "Filtering empty sequences..."
+awk '/^>/ {{if (seq) print header "\\n" seq; header=$0; seq=""; next}} {{seq=seq $0}} END {{if (seq) print header "\\n" seq}}' {remote_input} | \\
+  awk 'BEGIN {{RS=">"; ORS=""}} NR>1 {{split($0,a,"\\n"); seq=""; for(i=2;i<=length(a);i++) seq=seq a[i]; if (length(seq)>0) print ">" $0}}' > {remote_job_path}/filtered_input.fasta
+
+# Count sequences
+SEQ_COUNT=$(grep -c '^>' {remote_job_path}/filtered_input.fasta || echo 0)
+echo "Sequences for alignment: $SEQ_COUNT"
+
+if [ "$SEQ_COUNT" -eq 0 ]; then
+    echo "Error: No valid sequences found" | tee -a {remote_job_path}/clustalo.log
+    echo "FAILED" >> {remote_job_path}/status.txt
+    exit 1
+fi
+
 # Run Clustal Omega
 clustalo \\
-  -i {remote_input} \\
+  -i {remote_job_path}/filtered_input.fasta \\
   -o {remote_job_path}/alignment.{output_format} \\
   {param_str} \\
   2>&1 | tee {remote_job_path}/clustalo.log
 
 # Check if successful
 if [ $? -eq 0 ]; then
-    echo "Job completed: $(date)" >> {remote_job_path}/status.txt
     echo "COMPLETED" >> {remote_job_path}/status.txt
 else
-    echo "Job failed: $(date)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
 fi
 """
@@ -151,49 +174,6 @@ fi
         
         return status_info['status']
     
-    def download(self, job_id: str, local_dir: str = '.') -> Path:
-        """
-        Download alignment results
-        
-        Args:
-            job_id: Job identifier
-            local_dir: Local directory to save results
-        
-        Returns:
-            Path to downloaded alignment file
-        """
-        status_info = self.status(job_id)
-        
-        if status_info['status'] != 'COMPLETED':
-            raise ValueError(f"Job not completed (status: {status_info['status']})")
-        
-        job_db = self._load_job_db()
-        remote_path = job_db[job_id]['remote_path']
-        output_format = job_db[job_id]['output_format']
-        
-        # Create local output directory
-        local_dir = Path(local_dir)
-        local_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Download alignment
-        local_file = local_dir / f"{job_id}_alignment.{output_format}"
-        self.conn.get(
-            remote=f"{remote_path}/alignment.{output_format}",
-            local=str(local_file)
-        )
-        
-        # Also download log
-        local_log = local_dir / f"{job_id}_log.txt"
-        self.conn.get(
-            remote=f"{remote_path}/clustalo.log",
-            local=str(local_log)
-        )
-        
-        print(f"✓ Downloaded alignment to {local_file}")
-        print(f"✓ Downloaded log to {local_log}")
-        
-        return local_file
-    
     def list_jobs(self, status_filter: Optional[str] = None) -> pd.DataFrame:
         """
         List all alignment jobs, optionally filtered by status
@@ -238,29 +218,60 @@ fi
         """
         Download and optionally parse alignment results
         
+        Results are automatically saved to the job's project directory.
+        
         Args:
             job_id: Job identifier
-            parse: If True, return BioPython alignment object (requires output_format='fasta')
+            parse: If True, return BioPython alignment object
         
         Returns:
             Path to alignment file, or BioPython MultipleSeqAlignment if parse=True
         """
-        results_file = self.download(job_id)
+        # Check job status
+        status_info = self.status(job_id)
+        if status_info['status'] != 'COMPLETED':
+            raise ValueError(f"Job not completed (status: {status_info['status']})")
+        
+        # Get project directory
+        project_dir = self.get_project_dir(job_id)
+        if not project_dir:
+            # Shouldn't happen, but create if missing
+            project_dir = self.create_project(job_id, 'align')
+        
+        job_db = self._load_job_db()
+        job_info = job_db[job_id]
+        remote_path = job_info['remote_path']
+        output_format = job_info['output_format']
+        
+        # Download alignment to project directory
+        alignment_file = project_dir / f"alignment.{output_format}"
+        if not alignment_file.exists():
+            print(f"Downloading alignment...")
+            self.conn.get(
+                remote=f"{remote_path}/alignment.{output_format}",
+                local=str(alignment_file)
+            )
+            print(f"✓ Downloaded to {project_dir.name}/alignment.{output_format}")
+        
+        # Download log
+        log_file = project_dir / "job.log"
+        if not log_file.exists():
+            self.conn.get(
+                remote=f"{remote_path}/clustalo.log",
+                local=str(log_file)
+            )
         
         if not parse:
-            return results_file
+            return alignment_file
         
         # Parse alignment with BioPython
-        job_db = self._load_job_db()
-        output_format = job_db[job_id]['output_format']
-        
         if output_format != 'fasta':
             print(f"Warning: Parsing only supported for FASTA format, got {output_format}")
-            return results_file
+            return alignment_file
         
         from Bio import AlignIO
         
-        alignment = AlignIO.read(results_file, "fasta")
+        alignment = AlignIO.read(alignment_file, "fasta")
         
         print(f"✓ Parsed alignment: {len(alignment)} sequences, {alignment.get_alignment_length()} positions")
         
