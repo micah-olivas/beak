@@ -2,6 +2,8 @@ import os
 import urllib
 import urllib.request
 
+import matplotlib.pyplot as plt
+
 import numpy as np
 import pandas as pd
 
@@ -19,6 +21,7 @@ import holoviews as hv
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.colors import ListedColormap
+from matplotlib.widgets import Slider
 
 from .alignments.utils import SimilarityResult
 
@@ -358,11 +361,6 @@ def plot_similar(similarity_result: SimilarityResult, figsize=None):
     plt.tight_layout()
     
     return fig
-
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
-import numpy as np
-import logomaker
 
 def plot_sequence_logo(PSSM, top_label=None, bottom_label=None, figsize=(12, 3), scroll=False):
     """
