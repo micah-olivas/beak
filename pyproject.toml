@@ -36,8 +36,10 @@ viz = [
     "matplotlib",
     "seaborn",
     "seqlogo",
+    "logomaker",
     "panel",
-    "holoviews"
+    "holoviews",
+    "ipympl>=0.9.0"
 ]
 remote = [
     "cryptography",
@@ -58,4 +60,7 @@ where = ["src"]
 "" = "src"
 
 [tool.setuptools.package-data]
-"beak.datasets" = ["data/*.tsv", "data/*.json", "data/*.md"]
+beak = [
+    "remote/docker/*",
+    "datasets/data/*"
+]
