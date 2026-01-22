@@ -28,14 +28,14 @@ dependencies = [
     "biopython",
     "pandas",
     "fabric>=3.0",
-    "paramiko>=3.0"
+    "paramiko>=3.0",
     "holoviews",
     "matplotlib",
     "seqlogo",
     "logomaker",
     "panel",
     "seaborn",
-    "tqdm"
+    "tqdm",
     "ipympl>=0.9.0"
     "cryptography",
     "pytest",
