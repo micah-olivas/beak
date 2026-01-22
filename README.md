@@ -3,7 +3,7 @@
      <h1 style="margin: 0;">BEAK</h1>
 </div>
 
-**B**iophysical and **E**volutionary **A**ssociations **K**it
+**B**iophysical and **E**volutionary **A**nalysis **K**it
 
 A Python toolkit for remote bioinformatics workflows, designed for experimental biophysicists and biochemists. BEAK orchestrates computationally intensive sequence analysis tasks on a remote server while providing a seamless notebook-based interface.
 
@@ -12,7 +12,12 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 
 ---
 
-## Features
+## Local Analysis
+
+<!-- Something about object structure here -->
+
+
+## Remote Execution
 
 ### Remote Job Orchestration
 - **Pipeline Builder**: Chain multiple analysis steps into automated workflows
@@ -221,12 +226,6 @@ BEAK addresses common challenges in modeling evolutionary sequence relationships
 - Python 3.8+
 - SSH access to a remote server with bioinformatics tools installed
 - Dependencies: `fabric`, `pandas`, `biopython`, `paramiko`
-
----
-
-## Documentation
-
-[Coming soon]
 
 ---
 
