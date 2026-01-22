@@ -43,6 +43,7 @@ dependencies = [
     "flake8",
     "ipython",
     "jupyter"
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
