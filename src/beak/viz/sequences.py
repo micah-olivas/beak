@@ -4,11 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 
-try:
-    from ..alignments.utils import SimilarityResult
-except ImportError:
-    # Handle case where utils module doesn't exist yet
-    SimilarityResult = None
+SimilarityResult = None  # TODO: implement SimilarityResult in alignments module
 
 
 def plot_similar(similarity_result, figsize=None):

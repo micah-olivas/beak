@@ -1,8 +1,98 @@
 """Utility functions for local sequence analysis"""
 
+import random
+import tempfile
+import urllib.request
 import pandas as pd
+from pathlib import Path
 from typing import Optional
 from Bio.SeqUtils.ProtParam import ProteinAnalysis
+
+
+# ── Readable name generation ───────────────────────────────────
+
+_ADJECTIVES = [
+    'bold', 'bright', 'calm', 'crisp', 'deft', 'eager', 'fair', 'fleet',
+    'gentle', 'grand', 'keen', 'light', 'lucid', 'mild', 'neat', 'noble',
+    'plain', 'prime', 'proud', 'pure', 'quick', 'quiet', 'rare', 'sharp',
+    'sleek', 'smart', 'smooth', 'solid', 'stark', 'steady', 'still',
+    'stout', 'strong', 'subtle', 'sure', 'swift', 'terse', 'true',
+    'vivid', 'warm', 'wise', 'young', 'amber', 'azure', 'coral', 'dusky',
+    'fern', 'frost', 'ivory', 'jade', 'lunar', 'moss', 'opal', 'pearl',
+    'russet', 'sage', 'scarlet', 'silver', 'slate', 'tawny', 'violet',
+]
+
+_VERBS = [
+    'arcing', 'binding', 'coiling', 'docking', 'ebbing', 'folding',
+    'gliding', 'homing', 'joining', 'keying', 'lacing', 'mapping',
+    'nesting', 'orbiting', 'packing', 'racing', 'rising', 'roaming',
+    'scanning', 'seeking', 'soaring', 'sorting', 'spinning', 'staging',
+    'striding', 'surfing', 'tracing', 'turning', 'vaulting', 'wading',
+    'winding', 'arming', 'blazing', 'carving', 'crossing', 'darting',
+    'diving', 'drifting', 'fading', 'flaring', 'forging', 'grazing',
+    'hunting', 'landing', 'leaping', 'mending', 'pacing', 'probing',
+    'ranging', 'roving', 'sailing', 'scaling', 'sifting', 'sparking',
+    'steering', 'surging', 'tapping', 'threading', 'tracking', 'waking',
+]
+
+_NOUNS = [
+    'anvil', 'arch', 'basin', 'beacon', 'blade', 'bolt', 'cairn',
+    'cedar', 'cliff', 'comet', 'condor', 'crest', 'delta', 'drift',
+    'dune', 'falcon', 'fern', 'finch', 'flint', 'forge', 'frost',
+    'grove', 'gull', 'hawk', 'heath', 'heron', 'isle', 'jade',
+    'larch', 'ledge', 'linden', 'marten', 'mesa', 'mica', 'moss',
+    'newt', 'oak', 'orca', 'osprey', 'otter', 'peak', 'pine',
+    'plover', 'quartz', 'rapids', 'raven', 'reef', 'ridge', 'robin',
+    'sage', 'shoal', 'slate', 'sparrow', 'spruce', 'stone', 'swift',
+    'talon', 'tern', 'thorn', 'tide', 'vale', 'wren',
+]
+
+
+def generate_readable_name() -> str:
+    """Generate a human-readable adjective-verbing-noun tag.
+
+    Returns names like 'swift-folding-falcon' or 'calm-spinning-quartz'.
+    Combination space: ~60 x 60 x 60 = ~216,000 unique names.
+    """
+    return (
+        f"{random.choice(_ADJECTIVES)}-"
+        f"{random.choice(_VERBS)}-"
+        f"{random.choice(_NOUNS)}"
+    )
+
+
+def fetch_uniprot(accession: str, output_dir: Optional[str] = None) -> str:
+    """
+    Fetch a protein sequence from UniProt by accession ID.
+
+    Args:
+        accession: UniProt accession (e.g., 'P0DTC2')
+        output_dir: Directory to save the FASTA file. If None, uses a temp dir.
+
+    Returns:
+        Path to the downloaded FASTA file
+    """
+    url = f"https://rest.uniprot.org/uniprotkb/{accession}.fasta"
+
+    try:
+        with urllib.request.urlopen(url) as response:
+            fasta_content = response.read().decode('utf-8')
+    except urllib.error.HTTPError as e:
+        if e.code == 400 or e.code == 404:
+            raise ValueError(f"UniProt accession '{accession}' not found") from e
+        raise
+
+    if not fasta_content.startswith('>'):
+        raise ValueError(f"UniProt accession '{accession}' not found or returned invalid data")
+
+    if output_dir:
+        out_path = Path(output_dir) / f"{accession}.fasta"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = Path(tempfile.mkdtemp()) / f"{accession}.fasta"
+
+    out_path.write_text(fasta_content)
+    return str(out_path)
 
 
 def parse_uniprot_header(header: str) -> dict:
@@ -67,7 +157,7 @@ def parse_fasta_headers(
     else:
         # Simple split on first space
         df['header_id'] = df[header_col].str.split(' ').str[0]
-        df['header_description'] = df[header_col].str.split(' ', 1).str[1]
+        df['header_description'] = df[header_col].str.split(' ', n=1).str[1]
         return df
 
 

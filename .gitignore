@@ -35,6 +35,9 @@ htmlcov/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
+# Claude Code
+CLAUDE.md
+
 # macOS
 .DS_Store
 

@@ -26,6 +26,7 @@ dependencies = [
     "numpy",
     "scipy",
     "biopython",
+    "gemmi",
     "pandas",
     "fabric>=3.0",
     "paramiko>=3.0",
@@ -38,11 +39,21 @@ dependencies = [
     "tqdm",
     "ipympl>=0.9.0",
     "cryptography",
+    "click>=8.0",
+    "rich>=13.0",
+    "tomli>=1.0; python_version < '3.11'",
+]
+
+[project.scripts]
+beak = "beak.cli:main"
+
+[project.optional-dependencies]
+dev = [
     "pytest",
     "black",
     "flake8",
     "ipython",
-    "jupyter"
+    "jupyter",
 ]
 
 [tool.setuptools.packages.find]

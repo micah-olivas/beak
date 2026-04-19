@@ -144,9 +144,19 @@ def aln_to_pssm(
                            index=range(aln_length),
                            columns=list(alphabet))
 
+    # Calculate conservation score based on Shannon entropy
+    freqs = pssm_df.div(pssm_df.sum(axis=1), axis=0)
+    # Calculate entropy, avoiding log(0)
+    entropy = -(freqs * np.log2(freqs.where(freqs > 0, 1))).sum(axis=1)
+    max_entropy = np.log2(len(alphabet))
+    conservation = 1 - (entropy / max_entropy)
+    
     # Convert counts to frequencies if requested
     if as_freq:
         pssm_df = pssm_df.div(pssm_df.sum(axis=1), axis=0)
+    
+    # Add conservation column
+    pssm_df['Cons'] = conservation
 
     return pssm_df
 

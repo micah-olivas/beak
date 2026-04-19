@@ -15,11 +15,19 @@ from .base import RemoteJobManager
 class PipelineStep:
     """Represents a single step in a pipeline"""
     
-    def __init__(self, step_type: str, step_name: str, params: Dict[str, Any], condition: Optional[Callable] = None):
+    def __init__(
+        self,
+        step_type: str,
+        step_name: str,
+        params: Dict[str, Any],
+        condition: Optional[Callable] = None,
+        condition_spec: Optional[Dict[str, Any]] = None
+    ):
         self.step_type = step_type  # 'search', 'align', 'taxonomy', etc.
         self.step_name = step_name  # User-friendly name for this step
         self.params = params
         self.condition = condition  # Optional condition function
+        self.condition_spec = condition_spec or {}
         self.input_file = params.pop('input', None)  # Explicit input override
         self.output_name = params.pop('output', None)  # Explicit output name
     
@@ -33,9 +41,15 @@ class PipelineStep:
 class ConditionalBlock:
     """Handles conditional execution of pipeline steps"""
     
-    def __init__(self, pipeline: 'Pipeline', condition: Callable):
+    def __init__(
+        self,
+        pipeline: 'Pipeline',
+        condition: Callable,
+        condition_spec: Optional[Dict[str, Any]] = None
+    ):
         self.pipeline = pipeline
         self.condition = condition
+        self.condition_spec = condition_spec or {}
         self.steps = []
     
     def then(self, step_type: str, **params):
@@ -44,7 +58,8 @@ class ConditionalBlock:
             step_type=step_type,
             step_name=f"{step_type}_{len(self.pipeline.steps)}",
             params=params,
-            condition=self.condition
+            condition=self.condition,
+            condition_spec=self.condition_spec
         )
         self.pipeline.steps.append(step)
         return self.pipeline
@@ -52,9 +67,13 @@ class ConditionalBlock:
 
 class Pipeline(RemoteJobManager):
     """Pipeline orchestration for chaining bioinformatics jobs"""
-    
-    def __init__(self, host: str, user: str, key_path: Optional[str] = None, remote_job_dir: Optional[str] = None):
-        super().__init__(host, user, key_path, remote_job_dir)
+
+    JOB_TYPE = 'pipeline'
+    LOG_FILE = 'nohup.out'
+
+    def __init__(self, host: str, user: str, key_path: Optional[str] = None,
+                 remote_job_dir: Optional[str] = None, connection=None):
+        super().__init__(host, user, key_path, remote_job_dir, connection)
         self.steps: List[PipelineStep] = []
         self.initial_input = None
 
@@ -82,7 +101,12 @@ class Pipeline(RemoteJobManager):
             
             # Add condition if present
             if step.condition:
-                step_desc += " [conditional]"
+                condition_type = step.condition_spec.get('type')
+                condition_value = step.condition_spec.get('value')
+                if condition_type in {'min_hits', 'max_hits'} and condition_value is not None:
+                    step_desc += f" [conditional: {condition_type}={condition_value}]"
+                else:
+                    step_desc += " [conditional]"
             
             lines.append(step_desc)
         
@@ -178,8 +202,9 @@ class Pipeline(RemoteJobManager):
         self.steps.append(step)
         return self
     
-    def align(self, **params) -> 'Pipeline':
-        """Add Clustal Omega alignment step"""
+    def align(self, algorithm: str = 'clustalo', **params) -> 'Pipeline':
+        """Add alignment step (clustalo, mafft, or muscle)"""
+        params['algorithm'] = algorithm
         step = PipelineStep(
             step_type='align',
             step_name=f"align_{len(self.steps)}",
@@ -225,18 +250,52 @@ class Pipeline(RemoteJobManager):
         def condition(context):
             hit_count = context.get('hit_count', 0)
             return hit_count >= min_count
-        return ConditionalBlock(self, condition)
+        return ConditionalBlock(
+            self,
+            condition,
+            {'type': 'min_hits', 'value': int(min_count)}
+        )
     
     def if_max_hits(self, max_count: int) -> ConditionalBlock:
         """Execute following steps only if search has fewer than max hits"""
         def condition(context):
             hit_count = context.get('hit_count', 0)
             return hit_count <= max_count
-        return ConditionalBlock(self, condition)
+        return ConditionalBlock(
+            self,
+            condition,
+            {'type': 'max_hits', 'value': int(max_count)}
+        )
     
     def if_condition(self, condition_func: Callable) -> ConditionalBlock:
         """Execute following steps based on custom condition"""
-        return ConditionalBlock(self, condition_func)
+        return ConditionalBlock(self, condition_func, {'type': 'custom'})
+
+    def _validate_conditions(self):
+        """Validate that all conditional steps can be executed remotely."""
+        supported = {'min_hits', 'max_hits'}
+        for step in self.steps:
+            if not step.condition:
+                continue
+
+            condition_type = step.condition_spec.get('type')
+            if condition_type not in supported:
+                raise ValueError(
+                    "Custom Python conditions cannot be evaluated on the remote shell. "
+                    "Use if_min_hits(...) or if_max_hits(...) in remote pipelines."
+                )
+
+    def _condition_to_bash_guard(self, step: PipelineStep) -> str:
+        """Translate a conditional step into a bash guard."""
+        condition_type = step.condition_spec.get('type')
+        value = step.condition_spec.get('value')
+
+        if condition_type == 'min_hits':
+            return f'if [ "${{CONTEXT[hit_count]:-0}}" -ge {int(value)} ]; then'
+        if condition_type == 'max_hits':
+            return f'if [ "${{CONTEXT[hit_count]:-0}}" -le {int(value)} ]; then'
+
+        raise ValueError(f"Unsupported condition type: {condition_type}")
     
     def _generate_pipeline_script(self, job_id: str, remote_path: str) -> str:
         """Generate bash script for entire pipeline"""
@@ -264,7 +323,7 @@ class Pipeline(RemoteJobManager):
             script_parts.append(f"mkdir -p {step_dir}")
             
             if step.condition:
-                script_parts.append(f'if [ "${{CONTEXT[run_next]}}" = "true" ]; then')
+                script_parts.append(self._condition_to_bash_guard(step))
             
             if step.step_type == 'search':
                 script_parts.extend(self._generate_search_commands(
@@ -295,6 +354,26 @@ class Pipeline(RemoteJobManager):
                 ))
                 output_format = step.params.get('output_format', 'fasta')
                 previous_output = f"{step_dir}/alignment.{output_format}"
+            elif step.step_type == 'tree':
+                input_for_tree = previous_output
+                script_parts.extend(self._generate_tree_commands(
+                    step, step_dir, input_for_tree, f"{i:02d}_{step.step_type}_output", remote_path
+                ))
+                previous_output = f"{step_dir}/tree.nwk"
+            elif step.step_type == 'structure':
+                input_for_structure = search_output or previous_output
+                script_parts.extend(self._generate_structure_commands(
+                    step, step_dir, input_for_structure, f"{i:02d}_{step.step_type}_output", remote_path
+                ))
+                previous_output = f"{step_dir}/structure.pdb"
+            elif step.step_type == 'embeddings':
+                input_for_embeddings = search_output or previous_output
+                script_parts.extend(self._generate_embeddings_commands(
+                    step, step_dir, input_for_embeddings, f"{i:02d}_{step.step_type}_output", remote_path
+                ))
+                previous_output = f"{step_dir}/embeddings/mean_embeddings.pkl"
+            else:
+                raise ValueError(f"Unsupported pipeline step type: {step.step_type}")
 
             
             if step.condition:
@@ -446,54 +525,80 @@ class Pipeline(RemoteJobManager):
         ]
     
     def _generate_align_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
-        """Generate Clustal Omega alignment commands"""
-        output_format = step.params.get('output_format', 'fasta')
-        
-        # Format params (Clustal uses --key=value)
-        params = [f"--{k.replace('_', '-')}={v}" 
-                for k, v in step.params.items() if k != 'output_format']
-        
-        if output_format != 'fasta':
-            params.append(f'--outfmt={output_format}')
-        
+        """Generate alignment commands for clustalo, mafft, or muscle"""
+        from .align import _CMD_BUILDERS, ALGORITHMS
+
+        algorithm = step.params.pop('algorithm', 'clustalo')
+        output_format = step.params.pop('output_format', 'fasta')
+
+        algo_info = ALGORITHMS.get(algorithm, ALGORITHMS['clustalo'])
+        log_path = f"{step_dir}/{algo_info['log_file']}"
+        output_path = f"{step_dir}/alignment.{output_format}"
+        filtered = f"{step_dir}/filtered_input.fasta"
+
         input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
-        
+
+        align_cmd = _CMD_BUILDERS[algorithm](
+            filtered, output_path, output_format, log_path, step.params
+        )
+
         return [
-            "# Check if seqkit is available, otherwise use awk",
+            "# Filter empty sequences",
             f"if command -v seqkit &> /dev/null; then",
-            f"  # Filter using seqkit (removes sequences with length 0)",
-            f"  seqkit seq -m 1 {input_fasta} > {step_dir}/filtered_input.fasta",
+            f"  seqkit seq -m 1 {input_fasta} > {filtered}",
             f"else",
-            f"  # Filter using awk",
             f"  awk '/^>/ {{if (seq) print header \"\\n\" seq; header=$0; seq=\"\"; next}} {{seq=seq $0}} END {{if (seq) print header \"\\n\" seq}}' {input_fasta} | \\",
-            f"    awk 'BEGIN {{RS=\">\"; ORS=\"\"}} NR>1 {{split($0,a,\"\\n\"); seq=\"\"; for(i=2;i<=length(a);i++) seq=seq a[i]; if (length(seq)>0) print \">\" $0}}' > {step_dir}/filtered_input.fasta",
+            f"    awk 'BEGIN {{RS=\">\"; ORS=\"\"}} NR>1 {{split($0,a,\"\\n\"); seq=\"\"; for(i=2;i<=length(a);i++) seq=seq a[i]; if (length(seq)>0) print \">\" $0}}' > {filtered}",
             f"fi",
             "",
-            "# Count sequences",
-            f"echo \"Sequences for alignment: $(grep -c '^>' {step_dir}/filtered_input.fasta || echo 0)\"",
+            f"echo \"Sequences for alignment: $(grep -c '^>' {filtered} || echo 0)\"",
             "",
-            "# Run Clustal Omega alignment",
-            f"clustalo -i {step_dir}/filtered_input.fasta -o {step_dir}/alignment.{output_format} {' '.join(params)}"
+            f"# Run {algo_info['name']}",
+            align_cmd
         ]
     
     def _generate_tree_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
-        """Generate tree commands - placeholder"""
+        """Generate IQ-TREE commands with a safe fallback output."""
+        input_alignment = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
+
+        params = []
+        for key, value in step.params.items():
+            param_name = key.replace("_", "-")
+            prefix = "-" if len(key) == 1 else "--"
+            params.append(f"{prefix}{param_name} {value}")
+
         return [
-            f"# Tree step - to be implemented",
-            f"echo 'Tree placeholder' > {step_dir}/{output_name}.tree"
+            f"if command -v iqtree2 &> /dev/null; then",
+            f"  iqtree2 -s {input_alignment} -pre {step_dir}/tree {' '.join(params)}",
+            f"elif command -v iqtree &> /dev/null; then",
+            f"  iqtree -s {input_alignment} -pre {step_dir}/tree {' '.join(params)}",
+            f"else",
+            f"  echo '(iqtree not available)' > {step_dir}/tree.nwk",
+            f"fi",
+            f"if [ -f {step_dir}/tree.treefile ]; then cp {step_dir}/tree.treefile {step_dir}/tree.nwk; fi"
         ]
     
     def _generate_structure_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
-        """Generate structure prediction commands - placeholder"""
+        """Generate structure prediction placeholder output."""
         return [
-            f"# Structure step - to be implemented",
-            f"echo 'Structure placeholder' > {step_dir}/{output_name}.pdb"
+            f"# Structure step placeholder",
+            f"echo 'Input: {input_file}' > {step_dir}/structure_input.txt",
+            f"echo 'Structure prediction placeholder' > {step_dir}/structure.pdb"
         ]
     
     def _generate_embeddings_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
         """Generate embedding commands using Docker service"""
-        model = step.params.get('model', 'esm2')
+        model = step.params.get('model', 'esm2_t33_650M_UR50D')
         input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
+        repr_layers = step.params.get('repr_layers', [-1])
+        repr_layers_str = ' '.join(str(layer) for layer in repr_layers)
+        embedding_flags = []
+        if step.params.get('include_mean', True):
+            embedding_flags.append('--include-mean')
+        if step.params.get('include_per_tok', False):
+            embedding_flags.append('--include-per-tok')
+        flags_str = ' '.join(embedding_flags)
+        gpu_id = int(step.params.get('gpu_id', 0))
         
         # Ensure Docker service is running (done once at pipeline start)
         # Commands will use docker compose exec
@@ -501,10 +606,14 @@ class Pipeline(RemoteJobManager):
         return [
             f"# Generate embeddings using Docker service",
             f"cd {self.remote_job_dir}/docker",
-            f"docker compose exec -T embeddings python -m beak.remote.embeddings generate \\",
-            f"  --input {input_fasta} \\",
-            f"  --output {step_dir}/{output_name}.pt \\",
-            f"  --model {model}"
+            f"mkdir -p {step_dir}/embeddings",
+            f"docker compose exec -T embeddings python /app/generate_embeddings.py "
+            f"--input {input_fasta} "
+            f"--output {step_dir}/embeddings "
+            f"--model {model} "
+            f"--repr-layers {repr_layers_str} "
+            f"{flags_str} "
+            f"--gpu {gpu_id}"
         ]
     
     def execute(self, job_name: Optional[str] = None) -> str:
@@ -515,6 +624,8 @@ class Pipeline(RemoteJobManager):
         
         if not self.initial_input:
             raise ValueError("No input file specified. Use .search(query_file=...) to set input.")
+
+        self._validate_conditions()
         
         # Check if pipeline needs Docker
         needs_docker = any(step.step_type == 'embeddings' for step in self.steps)
@@ -537,20 +648,17 @@ class Pipeline(RemoteJobManager):
             step_dir = project_dir / f"{i:02d}_{step.step_type}"
             step_dir.mkdir(exist_ok=True)
         
-        print(f"📁 Created pipeline: {project_dir.name}")
-        print(f"   Steps: {' → '.join(s.step_type for s in self.steps)}")
-        
         # Set remote job directory details
-        job_name = job_name or f"pipeline_{job_id}"
+        if not job_name:
+            from ..utils import generate_readable_name
+            job_name = f"pipeline_{generate_readable_name()}"
         remote_job_path = f"{self.remote_job_dir}/{job_id}"
 
         # Create remote job directory
         self.conn.run(f'mkdir -p {remote_job_path}', hide=True)
-        print(f"Created remote directory: {remote_job_path}")
-        
+
         # Upload initial input file
         remote_input = f"{remote_job_path}/input.fasta"
-        print(f"Uploading input file...")
         self.conn.put(self.initial_input, remote_input)
         
         # Generate pipeline script
@@ -590,10 +698,9 @@ class Pipeline(RemoteJobManager):
         }
         self._save_job_db(job_db)
         
-        print(f"✓ Pipeline submitted: {job_name} (ID: {job_id})")
-        print(f"  Steps: {' → '.join(s.step_type for s in self.steps)}")
-        print(f"  PID: {pid}")
-        
+        steps_str = ' → '.join(s.step_type for s in self.steps)
+        print(f"✓ Submitted {job_name}: {steps_str} ({job_id})")
+
         return job_id
     
     def get_step_results(self, job_id: str, step_number: int) -> Path:
@@ -614,8 +721,8 @@ class Pipeline(RemoteJobManager):
             'taxonomy': 'taxonomy.tsv',
             'align': 'alignment.fasta',
             'tree': 'tree.nwk',
-            'structure': 'structures/',
-            'embeddings': 'embeddings.pt'
+            'structure': 'structure.pdb',
+            'embeddings': 'embeddings/mean_embeddings.pkl'
         }
         
         output_file = output_files.get(step_type, 'output')
@@ -668,8 +775,8 @@ class Pipeline(RemoteJobManager):
                     'filter': 'filtered.fasta',
                     'align': 'alignment.fasta',
                     'tree': 'tree.nwk',
-                    'structure': 'structures',
-                    'embeddings': 'embeddings.pt'
+                    'structure': 'structure.pdb',
+                    'embeddings': 'embeddings/mean_embeddings.pkl'
                 }
                 
                 output_file = output_files.get(step_type, 'output')
@@ -717,23 +824,46 @@ class Pipeline(RemoteJobManager):
                 'details': details
             })
         
+        # Build normalized stages for display
+        state_map = {'COMPLETED': 'done', 'RUNNING': 'active', 'PENDING': 'pending'}
+        stages = []
+        for s in step_statuses:
+            stages.append({
+                'label': f"Step {s['step']}: {s['type']}",
+                'state': state_map.get(s['status'], 'pending'),
+                'details': s.get('details'),
+            })
+
         return {
             'job_id': job_id,
             'name': job_info['name'],
+            'status': overall_status['status'],
             'overall_status': overall_status['status'],
             'runtime': overall_status['runtime'],
-            'steps': step_statuses
+            'job_type': 'pipeline',
+            'stages': stages,
+            'last_log_line': None,
+            'steps': step_statuses,
         }
 
     def print_detailed_status(self, job_id: str, watch=False, animation_frame=0):
         """
         Print a nicely formatted detailed status report
-        
+
+        .. deprecated::
+            Use ``beak status -v`` or ``beak.cli.display.print_status()`` instead.
+
         Args:
             job_id: Job ID to check
             watch: If True, refresh every 1 second. If int, refresh at that interval.
             animation_frame: Internal counter for animation (used during watch mode)
         """
+        import warnings
+        warnings.warn(
+            "print_detailed_status() is deprecated. Use 'beak status -v' or "
+            "beak.cli.display.print_status() instead.",
+            DeprecationWarning, stacklevel=2
+        )
         from IPython.display import clear_output
         
         # Animation frames for running steps
@@ -870,7 +1000,8 @@ class Pipeline(RemoteJobManager):
                 'taxonomy': ['taxonomy.tsv'],
                 'align': ['alignment.fasta', 'alignment.phy'],
                 'tree': ['tree.nwk', 'tree.treefile'],
-                'embeddings': ['embeddings.pt']
+                'structure': ['structure.pdb'],
+                'embeddings': ['embeddings/mean_embeddings.pkl', 'embeddings/per_token_embeddings.pkl']
             }
             
             files = files_to_download.get(step_type, [])
@@ -944,7 +1075,8 @@ class Pipeline(RemoteJobManager):
             'filter': ['filtered.fasta'],
             'align': ['alignment.fasta'],
             'tree': ['tree.nwk'],
-            'embeddings': ['embeddings.pt']
+            'structure': ['structure.pdb'],
+            'embeddings': ['embeddings/mean_embeddings.pkl', 'embeddings/per_token_embeddings.pkl']
         }
         
         files = output_files.get(step_type, ['output'])

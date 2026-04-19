@@ -24,10 +24,11 @@ A Python toolkit for remote bioinformatics workflows, designed for experimental 
 - **Smart Job Management**: Track, monitor, and retrieve results seamlessly
 - **Real-time Progress**: Detailed step-by-step status tracking
 
-### Sequence Search
+### Sequence Search & Annotation
 - **[MMseqs2](https://github.com/soedinglab/MMseqs2) Integration**: Large-scale sequence searches against major databases
 - **Hit Extraction**: Automatically retrieve hit sequences as FASTA files
 - **Taxonomy Assignment**: Annotate taxonomies with MMseqs2 taxonomy
+- **[HMMER](http://hmmer.org/) / Pfam**: Scan sequences for Pfam domains and retrieve UniProt proteins by domain
 
 ### Alignment & Phylogenetics
 - **[Clustal Omega](http://www.clustal.org/omega/)**: Multiple sequence alignment
@@ -83,6 +84,52 @@ BEAK will automatically detect your SSH key at `~/.ssh/id_ed25519` or `~/.ssh/id
 - [MMseqs2](https://github.com/soedinglab/MMseqs2) for sequence search and taxonomy
 - [Clustal Omega](http://www.clustal.org/omega/) for alignment
 - [IQ-TREE](http://www.iqtree.org/) for phylogenetics
+- [HMMER](http://hmmer.org/) for Pfam domain annotation (optional, needed for `beak pfam`)
+
+### Pfam Database Setup
+
+The `beak pfam` command requires the Pfam-A HMM database on your remote server. BEAK provides a setup command that handles the download, decompression, and indexing for you.
+
+**System requirements:**
+- ~5 GB disk space (compressed download is ~1.5 GB, expands + press indices)
+- [HMMER3](http://hmmer.org/) installed on the remote (`sudo apt install hmmer` or `conda install -c bioconda hmmer`)
+
+**User-space install** (no special permissions needed):
+
+```bash
+beak setup pfam
+```
+
+This downloads Pfam-A to `~/beak_databases/pfam/` on the remote server.
+
+**System-wide install** (shared across users, requires sudo on the remote):
+
+```bash
+beak setup pfam --system
+```
+
+This installs to `/srv/protein_sequence_databases/pfam/` with world-readable permissions, so all users on the server can access the same database.
+
+**Custom path:**
+
+```bash
+beak setup pfam --path /data/shared/pfam
+```
+
+**Check status or update:**
+
+```bash
+beak setup pfam --status    # Check install location, age, and HMMER version
+beak setup pfam --update    # Re-download the latest Pfam release
+```
+
+BEAK auto-detects the database by checking (in order): your config, `/srv/protein_sequence_databases/pfam/`, and `~/beak_databases/pfam/`. You can also set the path explicitly:
+
+```bash
+beak config set databases.pfam_path /your/custom/path
+```
+
+Run `beak doctor` to verify your setup — it reports tool availability, database status, and database age.
 
 ---
 
@@ -181,6 +228,43 @@ pipe.search("query.fasta", database="uniref90", e=0.001) \
     .tree()
 
 job_id = pipe.execute()
+```
+
+### Pfam Domain Annotation
+
+```bash
+# Scan a sequence for Pfam domains
+beak pfam my_sequence.fasta
+
+# Scan and fetch UniProt IDs for each domain found
+beak pfam my_sequence.fasta --uniprot
+
+# Include taxonomy info in UniProt results
+beak pfam my_sequence.fasta --uniprot --taxonomy
+
+# Include full lineage (domain to species)
+beak pfam my_sequence.fasta --uniprot --lineage
+
+# Skip the scan — look up a known Pfam ID directly
+beak pfam --pfam PF00069 --uniprot --taxonomy
+```
+
+```python
+from beak.remote import BeakSession
+
+bk = BeakSession()
+
+# Scan for Pfam domains
+hits = bk.hmmer.scan("my_sequence.fasta")
+for hit in hits:
+    print(f"{hit['pfam_id']}  {hit['pfam_name']}  E={hit['i_evalue']:.1e}")
+
+# Fetch UniProt proteins containing a domain
+from beak.api import query_uniprot_by_pfam
+
+df = query_uniprot_by_pfam("PF00069", taxonomy=True)
+print(f"{len(df)} proteins with kinase domain")
+print(df.head())
 ```
 
 ### Taxonomy Assignment
