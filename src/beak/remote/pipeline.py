@@ -223,16 +223,6 @@ class Pipeline(RemoteJobManager):
         self.steps.append(step)
         return self
     
-    def structure(self, **params) -> 'Pipeline':
-        """Add structure prediction step"""
-        step = PipelineStep(
-            step_type='structure',
-            step_name=f"structure_{len(self.steps)}",
-            params=params
-        )
-        self.steps.append(step)
-        return self
-    
     def embeddings(self, model: str = 'esm2', **params) -> 'Pipeline':
         """Add sequence embedding step"""
         step = PipelineStep(
@@ -360,12 +350,6 @@ class Pipeline(RemoteJobManager):
                     step, step_dir, input_for_tree, f"{i:02d}_{step.step_type}_output", remote_path
                 ))
                 previous_output = f"{step_dir}/tree.nwk"
-            elif step.step_type == 'structure':
-                input_for_structure = search_output or previous_output
-                script_parts.extend(self._generate_structure_commands(
-                    step, step_dir, input_for_structure, f"{i:02d}_{step.step_type}_output", remote_path
-                ))
-                previous_output = f"{step_dir}/structure.pdb"
             elif step.step_type == 'embeddings':
                 input_for_embeddings = search_output or previous_output
                 script_parts.extend(self._generate_embeddings_commands(
@@ -578,14 +562,6 @@ class Pipeline(RemoteJobManager):
             f"if [ -f {step_dir}/tree.treefile ]; then cp {step_dir}/tree.treefile {step_dir}/tree.nwk; fi"
         ]
     
-    def _generate_structure_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
-        """Generate structure prediction placeholder output."""
-        return [
-            f"# Structure step placeholder",
-            f"echo 'Input: {input_file}' > {step_dir}/structure_input.txt",
-            f"echo 'Structure prediction placeholder' > {step_dir}/structure.pdb"
-        ]
-    
     def _generate_embeddings_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
         """Generate embedding commands using Docker service"""
         model = step.params.get('model', 'esm2_t33_650M_UR50D')
@@ -721,7 +697,6 @@ class Pipeline(RemoteJobManager):
             'taxonomy': 'taxonomy.tsv',
             'align': 'alignment.fasta',
             'tree': 'tree.nwk',
-            'structure': 'structure.pdb',
             'embeddings': 'embeddings/mean_embeddings.pkl'
         }
         
@@ -775,7 +750,6 @@ class Pipeline(RemoteJobManager):
                     'filter': 'filtered.fasta',
                     'align': 'alignment.fasta',
                     'tree': 'tree.nwk',
-                    'structure': 'structure.pdb',
                     'embeddings': 'embeddings/mean_embeddings.pkl'
                 }
                 
@@ -1000,7 +974,6 @@ class Pipeline(RemoteJobManager):
                 'taxonomy': ['taxonomy.tsv'],
                 'align': ['alignment.fasta', 'alignment.phy'],
                 'tree': ['tree.nwk', 'tree.treefile'],
-                'structure': ['structure.pdb'],
                 'embeddings': ['embeddings/mean_embeddings.pkl', 'embeddings/per_token_embeddings.pkl']
             }
             
@@ -1075,7 +1048,6 @@ class Pipeline(RemoteJobManager):
             'filter': ['filtered.fasta'],
             'align': ['alignment.fasta'],
             'tree': ['tree.nwk'],
-            'structure': ['structure.pdb'],
             'embeddings': ['embeddings/mean_embeddings.pkl', 'embeddings/per_token_embeddings.pkl']
         }
         

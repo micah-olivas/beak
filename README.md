@@ -42,7 +42,6 @@ Remote pipelines are the enabler: they produce the MSAs, taxonomies, and annotat
 
 ### Structures and embeddings
 - **Structure discovery and download** via PDBe SIFTS + RCSB + [AlphaFold](https://alphafold.ebi.ac.uk/) — per-UniProt-ID, with best/all/N selection strategies.
-- **Structure prediction** via [ColabFold](https://github.com/sokrypton/ColabFold) for targets not in AlphaFold DB.
 - **Protein language model embeddings** via [ESM](https://github.com/facebookresearch/esm) and [ProGen](https://github.com/salesforce/progen).
 
 ### Job management
