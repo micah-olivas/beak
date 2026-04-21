@@ -242,7 +242,7 @@ rm -rf {remote_job_path}/tmp
             'name': job_name,
             'database': database,
             'database_path': db_path,
-            'query_file': str(query_file),
+            'input_file': str(query_file),
             'remote_path': remote_job_path,
             'submitted_at': datetime.now().isoformat(),
             'status': 'SUBMITTED',
