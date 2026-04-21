@@ -118,7 +118,7 @@ class Align(RemoteJobManager):
 
         job_id = str(uuid.uuid4())[:8]
         if not job_name:
-            from ..utils import generate_readable_name
+            from .naming import generate_readable_name
             job_name = f"align_{generate_readable_name()}"
 
         self.create_project(

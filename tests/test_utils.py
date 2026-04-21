@@ -1,13 +1,14 @@
-"""Tests for beak.utils — pure functions, no I/O."""
+"""Tests for split utility modules — pure functions, no I/O."""
 
 import pandas as pd
 import pytest
 from pathlib import Path
 
-from beak.utils import (
+from beak.sequence import (
     parse_uniprot_header, parse_fasta_headers, add_sequence_properties,
-    fetch_uniprot, generate_readable_name,
 )
+from beak.api.uniprot import fetch_uniprot
+from beak.remote.naming import generate_readable_name
 
 
 class TestParseUniprotHeader:

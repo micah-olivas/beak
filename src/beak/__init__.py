@@ -4,7 +4,8 @@ import importlib as _importlib
 
 from . import remote
 from . import datasets
-from . import utils
+from . import sequence
+from . import temperature
 from . import alignments
 
 # viz is loaded lazily to avoid pulling in heavy matplotlib/seqlogo
@@ -18,4 +19,5 @@ def __getattr__(name):
 
 __version__ = '0.1.0'
 
-__all__ = ['remote', 'datasets', 'utils', 'alignments', 'viz', 'structures']
+__all__ = ['remote', 'datasets', 'sequence', 'temperature',
+           'alignments', 'viz', 'structures']

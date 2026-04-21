@@ -136,7 +136,7 @@ class MMseqsSearch(RemoteJobManager):
         )
 
         if not job_name:
-            from ..utils import generate_readable_name
+            from .naming import generate_readable_name
             job_name = f"search_{generate_readable_name()}"
         remote_job_path = f"{self.remote_job_dir}/{job_id}"
 

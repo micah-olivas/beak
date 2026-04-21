@@ -406,7 +406,7 @@ def search(query, database, job_name, preset, uniprot):
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
     """
     if uniprot:
-        from ..utils import fetch_uniprot
+        from ..api.uniprot import fetch_uniprot
         query_file = fetch_uniprot(query)
         if job_name is None:
             job_name = f"{query}_search"
@@ -438,7 +438,7 @@ def taxonomy(query, database, job_name, no_lineage, uniprot):
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
     """
     if uniprot:
-        from ..utils import fetch_uniprot
+        from ..api.uniprot import fetch_uniprot
         query_file = fetch_uniprot(query)
         if job_name is None:
             job_name = f"{query}_taxonomy"
@@ -512,7 +512,7 @@ def _auto_name_from_pfam(query_file: str, job_type: str) -> str:
     Returns a name like 'Pkinase_search' on success, or a readable
     fallback like 'search_swift-folding-falcon' if Pfam is unavailable.
     """
-    from ..utils import generate_readable_name
+    from ..remote.naming import generate_readable_name
 
     fallback = f"{job_type}_{generate_readable_name()}"
 
@@ -550,7 +550,7 @@ def _resolve_query_to_fasta(query: str) -> str:
     # 2. UniProt accession pattern: 6-10 alphanumeric, starts with letter
     #    Matches: P0DTC2, A0A0K9RLB5, Q9Y6K9
     if re.fullmatch(r'[A-Z][A-Z0-9]{4,9}', query, re.IGNORECASE):
-        from ..utils import fetch_uniprot
+        from ..api.uniprot import fetch_uniprot
         try:
             return fetch_uniprot(query)
         except ValueError:

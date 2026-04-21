@@ -1,23 +1,60 @@
-"""UniProt REST API client for Pfam-based protein lookups.
+"""UniProt REST API client.
 
-Uses the UniProt search endpoint with cursor-based pagination.
-Follows the same HTTP pattern as beak.utils (urllib.request, no external deps).
+Pfam-based protein lookups and single-accession FASTA retrieval.
+Uses urllib.request (no external dependencies).
 """
 
 import re
 import json
 import time
+import tempfile
 import urllib.request
 import urllib.error
 import urllib.parse
 import pandas as pd
+from pathlib import Path
 from typing import Callable, List, Optional
 
 
 UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
+UNIPROT_FASTA_URL = "https://rest.uniprot.org/uniprotkb/{accession}.fasta"
 
 MAX_RETRIES = 3
 DEFAULT_PAGE_SIZE = 500
+
+
+def fetch_uniprot(accession: str, output_dir: Optional[str] = None) -> str:
+    """
+    Fetch a protein sequence from UniProt by accession ID.
+
+    Args:
+        accession: UniProt accession (e.g., 'P0DTC2')
+        output_dir: Directory to save the FASTA file. If None, uses a temp dir.
+
+    Returns:
+        Path to the downloaded FASTA file
+    """
+    url = UNIPROT_FASTA_URL.format(accession=accession)
+
+    try:
+        with urllib.request.urlopen(url) as response:
+            fasta_content = response.read().decode('utf-8')
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404):
+            raise ValueError(f"UniProt accession '{accession}' not found") from e
+        raise
+
+    if not fasta_content.startswith('>'):
+        raise ValueError(f"UniProt accession '{accession}' not found or returned invalid data")
+
+    if output_dir:
+        out_path = Path(output_dir) / f"{accession}.fasta"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_path = Path(tempfile.mkdtemp()) / f"{accession}.fasta"
+
+    out_path.write_text(fasta_content)
+    return str(out_path)
 
 
 def query_uniprot_by_pfam(
