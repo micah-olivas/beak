@@ -1,16 +1,14 @@
 {
   "datasets": [
     {
-        // TODO: Update metadata
-        
       "name": "enqvist_growth_temps",
-      "description": "Optimal growth temperatures for prokaryotes",
+      "description": "Optimal growth temperatures for ~21,500 prokaryotes and eukaryotes, with NCBI taxonomy (domain through genus).",
       "version": "1.0",
       "source": "https://zenodo.org/records/1175609",
-      "citation": "Enqvist, M. et al. (2018). Growth temperatures of prokaryotes. Zenodo.",
+      "citation": "Engqvist, M. K. M. (2018). Growth temperatures for ~21,500 microorganisms. Zenodo. https://doi.org/10.5281/zenodo.1175609",
       "loader": "load_growth_temps()",
-      "size_mb": 0.5,
-      "n_organisms": 15000
+      "size_mb": 4.7,
+      "n_organisms": 21500
     }
   ]
 }

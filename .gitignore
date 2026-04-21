@@ -47,6 +47,10 @@ misc/
 # Local BEAK project results (keeps repo clean)
 my*
 
+# Cached reference datasets (downloaded on first use via beak.datasets)
+src/beak/datasets/data/*.tsv
+src/beak/datasets/data/*.csv
+
 # Additional ignores
 __pycache__/
 *.pyc
