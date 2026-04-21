@@ -117,8 +117,8 @@ def generate_taxonomy_commands(step, step_dir, input_file, remote_path,
     from .taxonomy import MMseqsTaxonomy
 
     database = step.params.get('database', 'uniprotkb')
-    db_path = (f"{db_base_path}/{MMseqsTaxonomy.AVAILABLE_TAX_DBS[database]}"
-            if database in MMseqsTaxonomy.AVAILABLE_TAX_DBS
+    db_path = (f"{db_base_path}/{MMseqsTaxonomy.AVAILABLE_DBS[database]}"
+            if database in MMseqsTaxonomy.AVAILABLE_DBS
             else database if database.startswith('/')
             else f"{db_base_path}/{database}")
 
