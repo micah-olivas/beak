@@ -4,8 +4,11 @@ import os
 import urllib
 import urllib.request
 from Bio import pairwise2
-from Bio.PDB import alphafold_db, PDBIO, PDBParser
+from Bio.PDB import PDBParser
 from Bio.Data.IUPACData import protein_letters_3to1
+
+
+ALPHAFOLD_PDB_URL = "https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
 
 
 def three_to_one(resname):
@@ -47,13 +50,10 @@ def save_mapped_structure(input, value_dict, reference_seq, null_bfactor=0.0):
             print("dir! add support for directories...") # ADD DIR SUPPORT
             os.mkdir('mapped_structures')
         else:  # UniProt Accession → AlphaFold
-            structures = alphafold_db.get_structural_models_for(input)
-            io = PDBIO()
-            for i, structure in enumerate(structures, start=1):
-                pdb_filepath = f"{input}_AF_model_{i}.pdb"
-                io.set_structure(structure)
-                io.save(pdb_filepath)
-                break
+            pdb_filepath = f"{input}_AF.pdb"
+            urllib.request.urlretrieve(
+                ALPHAFOLD_PDB_URL.format(uniprot_id=input), pdb_filepath
+            )
     else:
         pdb_filepath = input
 
