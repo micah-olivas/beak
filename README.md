@@ -5,44 +5,50 @@
 
 **B**iophysical and **E**volutionary **A**nalysis **K**it
 
-A Python toolkit for remote bioinformatics workflows, designed for experimental biophysicists and biochemists. BEAK orchestrates computationally intensive sequence analysis tasks on a remote server while providing a seamless notebook-based interface.
+A Python toolkit for **interpreting protein experiments in evolutionary and structural context**. BEAK is built for experimental biophysicists and biochemists who want to join their biochemical measurements to conservation, taxonomy, and structural features at the residue level — and ask questions of the combined data.
+
+Remote compute (MMseqs2 searches, Clustal Omega alignments, HMMER scans over SSH) is the engine that makes the expensive parts tractable, but it's plumbing — the product is the joined data at a single protein's residues.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
 ---
 
+## What BEAK is for
+
+The central use case: one deeply-characterized protein understood in the context of its evolutionary homologs. You bring biochemical measurements (activity, stability, binding, etc.) for perturbations at many positions. BEAK surrounds each position with its evolutionary context (conservation, taxonomy, growth temperature) and structural context (pLDDT, secondary structure, burial, contacts), then gives you one table keyed on target-sequence position where you can filter, join, and plot.
+
 ## Local Analysis
 
 <!-- Something about object structure here -->
 
 
-## Remote Execution
+## Remote Compute
 
-### Remote Job Orchestration
-- **Pipeline Builder**: Chain multiple analysis steps into automated workflows
-- **Smart Job Management**: Track, monitor, and retrieve results seamlessly
-- **Real-time Progress**: Detailed step-by-step status tracking
+Remote pipelines are the enabler: they produce the MSAs, taxonomies, and annotations that local analysis consumes. Jobs run asynchronously on your server; BEAK tracks them, pulls results when they're ready, and hands them to the interpretation layer.
 
-### Sequence Search & Annotation
-- **[MMseqs2](https://github.com/soedinglab/MMseqs2) Integration**: Large-scale sequence searches against major databases
-- **Hit Extraction**: Automatically retrieve hit sequences as FASTA files
-- **Taxonomy Assignment**: Annotate taxonomies with MMseqs2 taxonomy
-- **[HMMER](http://hmmer.org/) / Pfam**: Scan sequences for Pfam domains and retrieve UniProt proteins by domain
+### Homologs for your target
+- **Sequence search** against UniRef, BFD, or any database you've prepared — via [MMseqs2](https://github.com/soedinglab/MMseqs2). Hits land as a FASTA file ready to align.
+- **Pfam-based discovery** via UniProt REST + [HMMER](http://hmmer.org/) — scan a sequence for Pfam domains, fetch all UniProt proteins sharing them.
 
-### Alignment & Phylogenetics
-- **[Clustal Omega](http://www.clustal.org/omega/)**: Multiple sequence alignment
-- **[IQ-TREE](http://www.iqtree.org/)**: Maximum likelihood phylogenetic trees
-- **Pipeline Integration**: Seamlessly chain search → filter → align → tree workflows
+### Alignments and trees
+- **Multiple sequence alignments** via [Clustal Omega](http://www.clustal.org/omega/), MAFFT, or MUSCLE — the MSA is the substrate every evolutionary feature is computed from.
+- **Maximum likelihood phylogenetic trees** via [IQ-TREE](http://www.iqtree.org/).
+- **Chained workflows** (search → filter → align → tree) as a single pipeline job.
 
-### Structure & Embeddings
-- **[ColabFold](https://github.com/sokrypton/ColabFold)**: AlphaFold2 structure prediction
-- **[ESM](https://github.com/facebookresearch/esm)** & **[ProGen](https://github.com/salesforce/progen)**: Protein language model embeddings
+### Taxonomy and annotations
+- **MMseqs2 taxonomy** for LCA-based organism assignment when UniProt doesn't have it (BFD, metagenomic).
+- **Growth-temperature annotation** (Enqvist dataset) joined by organism name — feeds comparative analyses downstream.
 
-### Analysis Ready
-- Parse results directly into pandas DataFrames
-- Export sequences, alignments, and trees in standard formats
-- Cache all parameters for full reproducibility
+### Structures and embeddings
+- **Structure discovery and download** via PDBe SIFTS + RCSB + [AlphaFold](https://alphafold.ebi.ac.uk/) — per-UniProt-ID, with best/all/N selection strategies.
+- **Structure prediction** via [ColabFold](https://github.com/sokrypton/ColabFold) for targets not in AlphaFold DB.
+- **Protein language model embeddings** via [ESM](https://github.com/facebookresearch/esm) and [ProGen](https://github.com/salesforce/progen).
+
+### Job management
+- Async submission with named jobs, local tracking of state (`~/.beak/jobs.json`).
+- Status, logs, cancellation, and result retrieval all via the CLI or Python API.
+- Every output comes back parseable into pandas — ready to join to your measurements.
 
 ---
 
