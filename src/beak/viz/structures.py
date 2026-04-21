@@ -3,9 +3,10 @@
 import os
 import urllib
 import urllib.request
-from Bio import pairwise2
 from Bio.PDB import PDBParser
 from Bio.Data.IUPACData import protein_letters_3to1
+
+from ..structures.mapping import align_sequences
 
 
 ALPHAFOLD_PDB_URL = "https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
@@ -66,8 +67,7 @@ def save_mapped_structure(input, value_dict, reference_seq, null_bfactor=0.0):
     pdb_seq = "".join(three_to_one(res.get_resname()) for res in pdb_residues)
 
     # --- Align reference sequence to PDB sequence ---
-    alignment = pairwise2.align.globalxx(reference_seq, pdb_seq)[0]
-    ref_aln, pdb_aln, score, start, end = alignment
+    ref_aln, pdb_aln = align_sequences(reference_seq, pdb_seq)
 
     # --- Build mapping (ref_pos → pdb_residue) ---
     mapping = {}

@@ -306,7 +306,7 @@ mmseqs result2flat {db_path} {db_path} {remote_path}/fastaDB {remote_fasta} --us
 rm -f {remote_path}/fastaDB*
 """
                 result = self.conn.run(cmd, warn=True, hide=False)
-                if result.failed:
+                if not result.ok:
                     raise RuntimeError("Failed to extract sequences")
 
                 self.conn.get(remote_fasta, str(fasta_file))

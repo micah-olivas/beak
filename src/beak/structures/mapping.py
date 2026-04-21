@@ -75,7 +75,7 @@ def map_target_to_structure(
         cif_path, chain_id
     )
 
-    ref_aln, struct_aln = _align_sequences(target_seq, struct_seq)
+    ref_aln, struct_aln = align_sequences(target_seq, struct_seq)
 
     # Walk alignment to build mapping (same logic as viz/structures.py:73-81)
     rows = []
@@ -141,7 +141,7 @@ def _extract_sequence_from_chain(cif_path, chain_id=None):
     return ''.join(sequence), residue_numbers, residue_names
 
 
-def _align_sequences(seq_a, seq_b):
+def align_sequences(seq_a, seq_b):
     """Global pairwise alignment of two sequences.
 
     Returns

@@ -10,7 +10,7 @@ from beak.structures.mapping import (
     map_alignment_to_target,
     map_target_to_structure,
     _extract_sequence_from_chain,
-    _align_sequences,
+    align_sequences,
 )
 
 
@@ -197,12 +197,12 @@ class TestExtractSequence:
 
 class TestAlignSequences:
     def test_identical(self):
-        a, b = _align_sequences("ACDEF", "ACDEF")
+        a, b = align_sequences("ACDEF", "ACDEF")
         assert a == "ACDEF"
         assert b == "ACDEF"
 
     def test_with_gaps(self):
-        a, b = _align_sequences("ACDEF", "AEF")
+        a, b = align_sequences("ACDEF", "AEF")
         assert '-' in a or '-' in b
         assert len(a) == len(b)
 
