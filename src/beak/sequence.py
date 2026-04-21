@@ -1,5 +1,8 @@
 """Parsing and property computation for protein sequences and FASTA records."""
 
+import warnings
+
+import numpy as np
 import pandas as pd
 from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
@@ -88,15 +91,17 @@ def add_sequence_properties(
         >>> df = pd.DataFrame({'sequence': ['MKTAYIAK', 'ACDEFGH']})
         >>> add_sequence_properties(df)
     """
+    nan_properties = pd.Series({
+        'length': 0,
+        'molecular_weight': np.nan,
+        'isoelectric_point': np.nan,
+        'aromaticity': np.nan,
+        'instability_index': np.nan,
+    })
+
     def compute_properties(seq):
         if pd.isna(seq) or len(seq) == 0:
-            return pd.Series({
-                'length': 0,
-                'molecular_weight': 0,
-                'isoelectric_point': 0,
-                'aromaticity': 0,
-                'instability_index': 0
-            })
+            return nan_properties
 
         try:
             analyzer = ProteinAnalysis(str(seq))
@@ -105,16 +110,16 @@ def add_sequence_properties(
                 'molecular_weight': analyzer.molecular_weight(),
                 'isoelectric_point': analyzer.isoelectric_point(),
                 'aromaticity': analyzer.aromaticity(),
-                'instability_index': analyzer.instability_index()
+                'instability_index': analyzer.instability_index(),
             })
-        except Exception:
-            return pd.Series({
-                'length': len(seq),
-                'molecular_weight': 0,
-                'isoelectric_point': 0,
-                'aromaticity': 0,
-                'instability_index': 0
-            })
+        except Exception as exc:
+            warnings.warn(
+                f"ProteinAnalysis failed on sequence ({type(exc).__name__}: {exc}); "
+                f"returning NaN properties.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return pd.Series({**nan_properties.to_dict(), 'length': len(seq)})
 
     properties = df[sequence_col].apply(compute_properties)
     return pd.concat([df, properties], axis=1)

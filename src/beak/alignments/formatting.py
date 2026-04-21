@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from pyparsing import Optional
 
 from Bio import AlignIO
 from Bio.Align import MultipleSeqAlignment

@@ -1,4 +1,4 @@
-"""Visualization functions for multiple sequence alignments"""
+"""Visualization functions for multiple sequence alignments."""
 
 import re
 import warnings
@@ -11,10 +11,9 @@ from matplotlib.colors import LinearSegmentedColormap
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='pkg_resources')
 warnings.filterwarnings('ignore', message='.*Bio.pairwise2 has been deprecated.*')
 
-import seqlogo
-import logomaker
-import panel as pn
-import holoviews as hv
+# Heavy optional visualization stacks (seqlogo, logomaker, panel, holoviews)
+# are imported lazily inside the functions that need them — importing this
+# module should not pay their load cost unless those plots are requested.
 
 
 def plot_seq_length_hist(aln, title=None, ref_length=None):
@@ -54,6 +53,8 @@ def plot_sequence_logo_seqlogo(pssm, title="Sequence Logo"):
         pssm (pd.DataFrame): Position-specific scoring matrix (frequencies, not counts).
         title (str): Title for the plot.
     """
+    import seqlogo
+
     # Ensure pssm columns are positions and rows are amino acids
     # seqlogo expects a pandas DataFrame with index as letters and columns as positions
     # and values as probabilities (frequencies)
@@ -121,6 +122,8 @@ def plot_sequence_logo(PSSM, top_label=None, bottom_label=None, figsize=None, in
     With motif filtering:
         >>> fig, ax, logo = plot_sequence_logo(PSSM, motif="G.VQGV", interactive=True)
     """
+    import logomaker
+
     # Create a copy and clean
     PSSM = PSSM.copy()
 
@@ -347,6 +350,8 @@ def plot_pssm_single_site_taxa_heatmap(pssms_by_tax_rank, position, aas, cmap, r
     Returns:
         hv.HeatMap: Heatmap of PSSM frequencies.
     """
+    import holoviews as hv
+
     # Build DataFrame for the selected position
     heatmap_data = []
     index = sorted(pssms_by_tax_rank.keys(), reverse=True)  # Sort taxa alphabetically (A at the top)
@@ -498,6 +503,9 @@ def interactive_pssm_heatmap(
     Returns:
         pn.Column Panel layout for interactive exploration
     """
+    import holoviews as hv
+    import panel as pn
+
     # Prepare amino acid set
     aas = set()
     for pssm in pssms_by_tax_rank.values():
