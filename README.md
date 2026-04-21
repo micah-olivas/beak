@@ -165,7 +165,8 @@ search.status(job_id)
 results = search.get_results(job_id)
 
 # Extract hit sequences
-hits_fasta = search.get_hit_sequences(job_id)
+result = search.get_results(job_id, parse=False, download_sequences=True)
+hits_fasta = result['fasta']
 ```
 
 ### Automated Pipeline

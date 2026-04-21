@@ -1,11 +1,8 @@
 """Visualization utilities for sequence analysis"""
 
-# Import all visualization functions
 from .alignments import *
 from .structures import *
-from .sequences import *
 
-# Re-export for convenient access
 from .alignments import (
     plot_seq_length_hist,
     plot_sequence_logo,
@@ -20,10 +17,6 @@ from .structures import (
     three_to_one
 )
 
-from .sequences import (
-    plot_similar
-)
-
 __all__ = [
     # Alignment visualizations
     'plot_seq_length_hist',
@@ -35,6 +28,4 @@ __all__ = [
     # Structure visualizations
     'save_mapped_structure',
     'three_to_one',
-    # Sequence visualizations
-    'plot_similar',
 ]
