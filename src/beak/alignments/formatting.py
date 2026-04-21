@@ -184,10 +184,11 @@ def aln_to_consensus(
 
     consensus_chars = []
     for pos in tqdm(pssm.index, desc="Generating consensus sequence"):
-        freqs = pssm.loc[pos]
-
-        # Exclude gaps and unknowns from consensus selection
-        freqs_no_gap = freqs#.drop(['-', 'X'], errors='ignore')
+        # Drop gaps, unknowns, and the conservation column before picking the
+        # most frequent residue — 'Cons' is a score, not a frequency.
+        freqs_no_gap = pssm.loc[pos].drop(
+            [gap_char, unknown_char, 'Cons'], errors='ignore'
+        )
 
         if len(freqs_no_gap) == 0 or freqs_no_gap.max() == 0:
             # All gaps/unknowns at this position

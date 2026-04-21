@@ -78,6 +78,33 @@ class TestAlnToConsensus:
     def test_basic_consensus(self):
         aln = _make_alignment(["AAA", "AAA", "ACA"])
         consensus = aln_to_consensus(aln)
-        # Consensus may include 'Cons' column artifacts; just check length and first char
-        assert len(consensus) >= 3
-        assert consensus[0] == 'A'
+        assert len(consensus) == 3
+        assert consensus == 'AAA'
+
+    def test_excludes_gaps_from_consensus(self):
+        # Majority gap at position 1 — consensus should NOT return '-'
+        aln = _make_alignment(["A-C", "A-C", "AAC"])
+        consensus = aln_to_consensus(aln)
+        assert len(consensus) == 3
+        assert consensus[1] == 'A'  # the only non-gap residue at that column
+
+    def test_excludes_unknowns_from_consensus(self):
+        # Majority X at position 1 — consensus should NOT return 'X'
+        aln = _make_alignment(["AXC", "AXC", "AGC"])
+        consensus = aln_to_consensus(aln)
+        assert len(consensus) == 3
+        assert consensus[1] == 'G'
+
+    def test_all_gap_column_returns_gap(self):
+        aln = _make_alignment(["A-C", "A-C", "A-C"])
+        consensus = aln_to_consensus(aln)
+        assert consensus[1] == '-'
+
+    def test_never_returns_cons_column_name(self):
+        # Highly conserved — conservation score is 1.0, which used to outrank
+        # the actual residue frequency and leak the column name into output.
+        aln = _make_alignment(["ACDE", "ACDE", "ACDE"])
+        consensus = aln_to_consensus(aln)
+        assert 'C' not in consensus or consensus == 'ACDE'
+        assert 'Cons' not in consensus
+        assert consensus == 'ACDE'
