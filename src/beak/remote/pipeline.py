@@ -324,7 +324,7 @@ class Pipeline(RemoteJobManager):
             elif step.step_type == 'filter':
                 input_for_filter = search_output or previous_output
                 script_parts.extend(self._generate_filter_commands(
-                    step, step_dir, input_for_filter, f"{i:02d}_{step.step_type}_output", remote_path
+                    step, step_dir, input_for_filter, remote_path
                 ))
                 previous_output = f"{step_dir}/filtered.fasta"
                 if search_output:  # Update search_output if we filtered search results
@@ -333,27 +333,27 @@ class Pipeline(RemoteJobManager):
                 # Taxonomy uses search output but doesn't change the sequence flow
                 input_for_tax = search_output or previous_output
                 script_parts.extend(self._generate_taxonomy_commands(
-                    step, step_dir, input_for_tax, f"{i:02d}_{step.step_type}_output", remote_path
+                    step, step_dir, input_for_tax, remote_path
                 ))
                 # Don't update previous_output - taxonomy is a side branch
             elif step.step_type == 'align':
                 # Align uses search output (sequences), not taxonomy output
                 input_for_align = search_output or previous_output
                 script_parts.extend(self._generate_align_commands(
-                    step, step_dir, input_for_align, f"{i:02d}_{step.step_type}_output", remote_path
+                    step, step_dir, input_for_align, remote_path
                 ))
                 output_format = step.params.get('output_format', 'fasta')
                 previous_output = f"{step_dir}/alignment.{output_format}"
             elif step.step_type == 'tree':
                 input_for_tree = previous_output
                 script_parts.extend(self._generate_tree_commands(
-                    step, step_dir, input_for_tree, f"{i:02d}_{step.step_type}_output", remote_path
+                    step, step_dir, input_for_tree, remote_path
                 ))
                 previous_output = f"{step_dir}/tree.nwk"
             elif step.step_type == 'embeddings':
                 input_for_embeddings = search_output or previous_output
                 script_parts.extend(self._generate_embeddings_commands(
-                    step, step_dir, input_for_embeddings, f"{i:02d}_{step.step_type}_output", remote_path
+                    step, step_dir, input_for_embeddings, remote_path
                 ))
                 previous_output = f"{step_dir}/embeddings/mean_embeddings.pkl"
             else:
@@ -443,7 +443,7 @@ class Pipeline(RemoteJobManager):
             f"rm -rf {step_dir}/tmp {step_dir}/queryDB* {step_dir}/resultDB* {step_dir}/seqDB*"
         ]
     
-    def _generate_filter_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
+    def _generate_filter_commands(self, step, step_dir, input_file, remote_path) -> List[str]:
         """Generate sequence filtering commands using Python/BioPython"""
         input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
         
@@ -485,7 +485,7 @@ class Pipeline(RemoteJobManager):
             f"CONTEXT[filtered_count]=$(grep -c '^>' {step_dir}/filtered.fasta || echo 0)"
         ]
     
-    def _generate_taxonomy_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
+    def _generate_taxonomy_commands(self, step, step_dir, input_file, remote_path) -> List[str]:
         """Generate MMseqs2 taxonomy commands"""
         from .taxonomy import MMseqsTaxonomy
         
@@ -508,7 +508,7 @@ class Pipeline(RemoteJobManager):
             f"rm -rf {step_dir}/tmp {step_dir}/queryDB* {step_dir}/taxResult*"
         ]
     
-    def _generate_align_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
+    def _generate_align_commands(self, step, step_dir, input_file, remote_path) -> List[str]:
         """Generate alignment commands for clustalo, mafft, or muscle"""
         from .align import _CMD_BUILDERS, ALGORITHMS
 
@@ -541,7 +541,7 @@ class Pipeline(RemoteJobManager):
             align_cmd
         ]
     
-    def _generate_tree_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
+    def _generate_tree_commands(self, step, step_dir, input_file, remote_path) -> List[str]:
         """Generate IQ-TREE commands with a safe fallback output."""
         input_alignment = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
 
@@ -562,7 +562,7 @@ class Pipeline(RemoteJobManager):
             f"if [ -f {step_dir}/tree.treefile ]; then cp {step_dir}/tree.treefile {step_dir}/tree.nwk; fi"
         ]
     
-    def _generate_embeddings_commands(self, step, step_dir, input_file, output_name, remote_path) -> List[str]:
+    def _generate_embeddings_commands(self, step, step_dir, input_file, remote_path) -> List[str]:
         """Generate embedding commands using Docker service"""
         model = step.params.get('model', 'esm2_t33_650M_UR50D')
         input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
