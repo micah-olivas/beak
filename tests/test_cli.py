@@ -67,7 +67,6 @@ class TestCLIHelp:
 class TestConfigCommands:
     def test_config_show_no_config(self, runner, tmp_path, monkeypatch):
         monkeypatch.setattr('beak.config.CONFIG_PATH', tmp_path / 'nonexistent.toml')
-        monkeypatch.setattr('beak.cli.commands.Path', Path)  # ensure it uses our patched version
         result = runner.invoke(main, ['config', 'show'])
         assert result.exit_code == 0
 
