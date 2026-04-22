@@ -40,7 +40,8 @@ class ESMEmbeddings(RemoteJobManager):
         },
     }
 
-    def __init__(self, host: str, user: str, key_path: Optional[str] = None,
+    def __init__(self, host: Optional[str] = None, user: Optional[str] = None,
+                 key_path: Optional[str] = None,
                  remote_job_dir: Optional[str] = None, connection=None):
         super().__init__(host, user, key_path, remote_job_dir, connection)
         self._verify_docker()
@@ -225,3 +226,36 @@ fi
         print(f"✓ Downloaded log to {local_log}")
 
         return local_dir / 'embeddings'
+
+    def get_results(self, job_id: str, parse: bool = True,
+                    kind: str = 'mean', layer=None, local_dir: str = '.'):
+        """Retrieve embedding results.
+
+        Args:
+            job_id: job to fetch.
+            parse: if True (default), return a pandas DataFrame via the
+                beak.embeddings loader; if False, return the Path to the
+                downloaded embeddings/ directory.
+            kind: 'mean' or 'per_token' — which pickle to load.
+            layer: layer selector passed through to the loader.
+            local_dir: where to unpack the results tarball.
+
+        Returns:
+            DataFrame (parse=True) or Path to embeddings/ (parse=False).
+        """
+        embeddings_dir = self.download(job_id, local_dir=local_dir)
+
+        if not parse:
+            return embeddings_dir
+
+        if kind == 'mean':
+            from ..embeddings import load_mean_embeddings
+            return load_mean_embeddings(
+                embeddings_dir / 'mean_embeddings.pkl', layer=layer
+            )
+        if kind == 'per_token':
+            from ..embeddings import load_per_token_embeddings
+            return load_per_token_embeddings(
+                embeddings_dir / 'per_token_embeddings.pkl', layer=layer
+            )
+        raise ValueError(f"Unknown kind '{kind}'. Use 'mean' or 'per_token'.")

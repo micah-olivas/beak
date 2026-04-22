@@ -7,6 +7,7 @@ from . import datasets
 from . import sequence
 from . import temperature
 from . import alignments
+from . import embeddings
 
 # viz is loaded lazily to avoid pulling in heavy matplotlib/seqlogo
 # dependencies when only using CLI or remote functionality
@@ -20,4 +21,4 @@ def __getattr__(name):
 __version__ = '0.1.0'
 
 __all__ = ['remote', 'datasets', 'sequence', 'temperature',
-           'alignments', 'viz', 'structures']
+           'alignments', 'embeddings', 'viz', 'structures']

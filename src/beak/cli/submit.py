@@ -89,3 +89,70 @@ def align(input_file, job_name, algorithm, output_format):
     if output_format:
         kwargs['output_format'] = output_format
     mgr.submit(input_file, job_name=job_name, **kwargs)
+
+
+@main.command()
+@click.argument('input_file', type=click.Path(exists=True))
+@click.option('--model', '-m', default='esm2_t33_650M_UR50D',
+              help='ESM model ID (default: esm2_t33_650M_UR50D; see --list-models)')
+@click.option('--name', 'job_name', default=None, help='Job name')
+@click.option('--layer', 'repr_layers', default='-1',
+              help='Comma-separated representation layers to extract (default: -1)')
+@click.option('--per-tok', 'include_per_tok', is_flag=True,
+              help='Also save per-token embeddings (large files)')
+@click.option('--no-mean', is_flag=True,
+              help='Skip mean-pooled embeddings (only makes sense with --per-tok)')
+@click.option('--gpu', 'gpu_id', default=0, help='GPU device ID on the remote')
+@click.option('--list-models', is_flag=True,
+              help='List available ESM models and exit')
+def embeddings(input_file, model, job_name, repr_layers,
+               include_per_tok, no_mean, gpu_id, list_models):
+    """Submit an ESM embedding-generation job.
+
+    INPUT_FILE is a local FASTA file. Results come back as pickles under
+    ~/.beak/... ; load them with `beak.embeddings.load_mean_embeddings()`
+    or via `mgr.get_results(job_id)`.
+
+    Examples:
+
+        beak embeddings library.fasta -m esm2_t12_35M_UR50D
+
+        beak embeddings library.fasta --per-tok --no-mean
+
+        beak embeddings library.fasta --layer 30,33 --per-tok
+
+        beak embeddings --list-models
+    """
+    from ..remote.embeddings import ESMEmbeddings
+
+    if list_models:
+        click.echo(ESMEmbeddings.list_models().to_string(index=False))
+        return
+
+    try:
+        layers = [int(x.strip()) for x in repr_layers.split(',')]
+    except ValueError:
+        raise click.BadParameter(
+            f"--layer must be a comma-separated list of ints, got {repr_layers!r}",
+            param_hint="'--layer'",
+        )
+
+    include_mean = not no_mean
+    if not include_mean and not include_per_tok:
+        raise click.UsageError(
+            "Nothing to output: --no-mean requires --per-tok."
+        )
+
+    if job_name is None:
+        job_name = auto_name_from_pfam(input_file, 'embeddings')
+
+    mgr = get_manager(job_type='embeddings')
+    mgr.submit(
+        input_file,
+        model=model,
+        job_name=job_name,
+        repr_layers=layers,
+        include_mean=include_mean,
+        include_per_tok=include_per_tok,
+        gpu_id=gpu_id,
+    )
