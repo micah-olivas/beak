@@ -887,15 +887,13 @@ class RemoteJobManager:
 
         self._upload_docker_files(docker_dir)
 
-        with self.conn.cd(docker_dir):
-            check = self.conn.run(
-                f'{compose} ps --services --filter status=running | grep {service_name}',
-                hide=True, warn=True,
-            )
-
-        if check.ok and service_name in check.stdout:
-            return  # already running with current source (shared or own)
-
+        # Always run `up -d --build`. Docker layer caching makes this near-
+        # free when nothing changed (a few seconds of compose overhead), and
+        # it's the only way changes to the uploaded source files actually
+        # land in the running container — COPY instructions only re-execute
+        # when the build runs. A previous short-circuit skipped the rebuild
+        # when the service was already running, which meant source-level
+        # bug fixes silently failed to deploy.
         where = "shared" if is_shared else "per-user"
         print(f"Starting Docker service '{service_name}' ({where}, build if needed)...")
         with self.conn.cd(docker_dir):
