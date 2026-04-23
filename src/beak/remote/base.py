@@ -418,6 +418,43 @@ class RemoteJobManager:
 
     # ── Status checking ─────────────────────────────────────────────
 
+    # Seconds after submission with no status.txt and no live PID before we
+    # assume the submission script died before it could write anything.
+    _LAUNCH_GRACE_SECONDS = 60
+
+    def _infer_status(self, job_info: Dict, is_running: bool,
+                      status_lines: list) -> str:
+        """Classify a job based on remote state.
+
+        Handles the ambiguous "no status.txt yet" case: within a short grace
+        window right after submission it's a genuine SUBMITTED (script
+        staging); past that, if the PID is dead too, the submission script
+        died before writing any status and we surface it as FAILED rather
+        than leave it stuck as SUBMITTED forever.
+        """
+        if 'COMPLETED' in status_lines:
+            return 'COMPLETED'
+        if 'FAILED' in status_lines:
+            return 'FAILED'
+        if 'RUNNING' in status_lines or is_running:
+            return 'RUNNING'
+
+        if status_lines and status_lines[0] == 'NO_STATUS':
+            submitted_at_str = job_info.get('submitted_at')
+            if submitted_at_str:
+                try:
+                    submitted_at = datetime.fromisoformat(submitted_at_str)
+                    age = (datetime.now() - submitted_at).total_seconds()
+                    if age > self._LAUNCH_GRACE_SECONDS:
+                        # PID dead + no status file + past grace window ⇒
+                        # the launch script itself crashed.
+                        return 'FAILED'
+                except ValueError:
+                    pass
+            return 'SUBMITTED'
+
+        return 'UNKNOWN'
+
     def status(self, job_id: str, verbose: bool = False) -> Dict:
         """
         Check job status
@@ -449,16 +486,7 @@ class RemoteJobManager:
         )
         status_lines = status_result.stdout.strip().split('\n')
 
-        if 'COMPLETED' in status_lines:
-            status = 'COMPLETED'
-        elif 'FAILED' in status_lines:
-            status = 'FAILED'
-        elif 'RUNNING' in status_lines or is_running:
-            status = 'RUNNING'
-        elif status_lines[0] == 'NO_STATUS':
-            status = 'SUBMITTED'
-        else:
-            status = 'UNKNOWN'
+        status = self._infer_status(job_info, is_running, status_lines)
 
         # Calculate runtime
         submitted_at = datetime.fromisoformat(job_info['submitted_at'])
@@ -499,16 +527,7 @@ class RemoteJobManager:
         )
         status_lines = status_result.stdout.strip().split('\n')
 
-        if 'COMPLETED' in status_lines:
-            status = 'COMPLETED'
-        elif 'FAILED' in status_lines:
-            status = 'FAILED'
-        elif 'RUNNING' in status_lines or is_running:
-            status = 'RUNNING'
-        elif status_lines[0] == 'NO_STATUS':
-            status = 'SUBMITTED'
-        else:
-            status = 'UNKNOWN'
+        status = self._infer_status(job_info, is_running, status_lines)
 
         # Calculate runtime
         submitted_at = datetime.fromisoformat(job_info['submitted_at'])

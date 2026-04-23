@@ -14,10 +14,16 @@ from ._common import get_manager
               help='Filter by job type')
 @click.option('--status', 'status_filter', default=None,
               help='Filter by status (RUNNING, COMPLETED, FAILED, etc.)')
-@click.option('--refresh', is_flag=True,
-              help='Connect to remote server to refresh job statuses')
-def jobs(job_type, status_filter, refresh):
-    """List all jobs"""
+@click.option('--no-refresh', is_flag=True,
+              help='Skip the automatic remote refresh of non-terminal jobs')
+def jobs(job_type, status_filter, no_refresh):
+    """List all jobs.
+
+    By default, connects to the remote server once to refresh the status of
+    any SUBMITTED or RUNNING jobs. Terminal states (COMPLETED, FAILED,
+    CANCELLED) are read from the local cache without network calls. Pass
+    --no-refresh to skip the refresh entirely (e.g. when offline).
+    """
     db_path = Path.home() / ".beak" / "jobs.json"
     if not db_path.exists():
         click.echo("No jobs found.")
@@ -30,23 +36,34 @@ def jobs(job_type, status_filter, refresh):
         click.echo("No jobs found.")
         return
 
-    if refresh:
-        try:
-            mgr = get_manager(job_type='search')
-            updated = 0
-            for job_id, info in job_db.items():
-                old = info.get('status', 'UNKNOWN')
-                if old in ('COMPLETED', 'FAILED', 'CANCELLED'):
-                    continue
-                result = mgr.status(job_id)
-                if result['status'] != old:
-                    updated += 1
-            with open(db_path) as f:
-                job_db = json.load(f)
-            if updated:
-                click.echo(f"Refreshed {updated} job(s)\n")
-        except Exception as e:
-            click.echo(f"Could not refresh: {e}\n")
+    refreshed_count = 0
+    refresh_error = None
+    if not no_refresh:
+        active_ids = [
+            jid for jid, info in job_db.items()
+            if info.get('status', 'UNKNOWN') not in ('COMPLETED', 'FAILED', 'CANCELLED')
+        ]
+        if active_ids:
+            try:
+                # Any RemoteJobManager subclass reads status.txt the same way,
+                # so use a lightweight one (search) to avoid ESMEmbeddings'
+                # Docker preflight on every `beak jobs` call.
+                mgr = get_manager(job_type='search')
+                for jid in active_ids:
+                    old = job_db[jid].get('status', 'UNKNOWN')
+                    result = mgr.status(jid)
+                    if result['status'] != old:
+                        refreshed_count += 1
+                # Reload job_db after status() calls updated it
+                with open(db_path) as f:
+                    job_db = json.load(f)
+            except Exception as e:
+                refresh_error = str(e)
+
+    if refreshed_count:
+        click.echo(f"Refreshed {refreshed_count} job(s)\n")
+    elif refresh_error:
+        click.echo(f"(Could not refresh: {refresh_error}; showing cached state)\n")
 
     rows = []
     for job_id, info in job_db.items():
@@ -79,6 +96,12 @@ def jobs(job_type, status_filter, refresh):
         if len(name) > name_width:
             name = name[:name_width - 1] + '…'
         click.echo(f"{r['id']:<10} {name:<{name_width}} {r['type']:<12} {r['status']:<12} {r['submitted']}")
+
+    non_terminal = [r for r in rows if r['status'] in ('SUBMITTED', 'RUNNING')]
+    if non_terminal:
+        click.echo(
+            "\nTip: `beak status <ID> --watch` for a live view of a running job."
+        )
 
 
 @main.command()

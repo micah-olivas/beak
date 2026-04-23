@@ -60,6 +60,22 @@ def render_status(info: dict) -> Group:
             close = "[/bold]" if style == "[bold]" else "[/dim]" if style == "[dim]" else ""
             parts.append(Text.from_markup(f"  {icon}  {style}{label}{close}"))
 
+    # Embedding job progress bar (structured from progress.json)
+    emb = info.get("embedding_progress")
+    if emb and emb.get("total"):
+        done = emb.get("done", 0)
+        total = emb.get("total", 0)
+        failed = emb.get("failed", 0)
+        current = emb.get("current")
+        pct = (done / total * 100) if total else 0
+        parts.append(Text(""))
+        summary = f"  [bold]{done}/{total}[/bold] sequences embedded  ·  [dim]{pct:.1f}%[/dim]"
+        if failed:
+            summary += f"  ·  [red]{failed} failed[/red]"
+        parts.append(Text.from_markup(summary))
+        if current and status == "RUNNING":
+            parts.append(Text.from_markup(f"  [dim]current: {current}[/dim]"))
+
     # Last log line
     last_line = (info.get("last_log_line") or "").strip()
     if last_line and status == "RUNNING":

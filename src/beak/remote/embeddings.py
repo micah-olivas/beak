@@ -227,6 +227,30 @@ fi
 
         return local_dir / 'embeddings'
 
+    def detailed_status(self, job_id: str) -> Dict:
+        """Base detailed status, augmented with ESM progress counters.
+
+        When the job has written a progress.json, include a
+        `embedding_progress` sub-dict with {done, total, failed, current}
+        so the watch display can show "42/1000 — current: P14621" in real
+        time without the user having to tail the remote log.
+        """
+        info = super().detailed_status(job_id)
+        if info.get('status') in ('RUNNING', 'SUBMITTED'):
+            try:
+                p = self.progress(job_id)
+            except Exception:
+                p = {'status': 'NO_PROGRESS'}
+            if p.get('status') != 'NO_PROGRESS':
+                info['embedding_progress'] = {
+                    'done': p.get('done', 0),
+                    'total': p.get('total', 0),
+                    'failed': p.get('failed', 0),
+                    'current': p.get('current'),
+                    'model': p.get('model'),
+                }
+        return info
+
     def progress(self, job_id: str) -> Dict:
         """Fetch structured progress for a running embedding job.
 
