@@ -7,12 +7,14 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
+# Install Python dependencies in a single pip call so the resolver can
+# honour the `numpy<2` pin across ALL packages at once. Previously the
+# numpy pin from requirements.txt was silently upgraded by the later
+# `pip install fair-esm biotite` step (transitive numpy>=2 dep),
+# producing "RuntimeError: Numpy is not available" when torch 2.0.1
+# (compiled against numpy 1.x) tried to call .numpy() on a tensor.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Install ESM
-RUN pip install fair-esm biotite
+RUN pip install --no-cache-dir -r requirements.txt fair-esm biotite
 
 # Copy embedding generation script
 COPY generate_embeddings.py /app/

@@ -1,5 +1,8 @@
-torch
+# NOTE: the base image pytorch/pytorch:2.0.1-cuda11.7-cudnn8-runtime ships
+# CUDA-enabled torch 2.0.1 compiled against NumPy 1.x. We must NOT reinstall
+# torch (that would clobber the CUDA build with a CPU wheel), and we must
+# pin numpy below 2.x so tensor.numpy() conversions keep working.
+numpy<2
 transformers
-numpy
 biopython
 pandas
