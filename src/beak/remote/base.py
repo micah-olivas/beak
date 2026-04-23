@@ -922,23 +922,38 @@ class RemoteJobManager:
 
     def _wait_for_container_ready(self, docker_dir: str, project_name: str,
                                   service_name: str, max_wait_s: int = 60):
-        """Poll `docker compose exec <service> true` until it succeeds."""
+        """Poll `docker compose exec <service> true` until it succeeds.
+
+        Each probe has its own 5s `timeout` so a hung Docker API doesn't
+        wedge the whole loop — we always make forward progress and either
+        succeed or surface a descriptive error pointing at `docker ps -a`
+        on the remote.
+        """
+        # Also include `docker compose ps` output on failure so the user
+        # can tell whether the container is Up / Restarting / Exited.
         with self.conn.cd(docker_dir):
             result = self.conn.run(
                 f'for i in $(seq 1 {max_wait_s // 2}); do '
-                f'  if docker compose --project-name {project_name} exec -T '
-                f'{service_name} true 2>/dev/null; then '
+                f'  if timeout 5s docker compose --project-name {project_name} '
+                f'exec -T {service_name} true 2>/dev/null; then '
                 f'    echo READY; exit 0; '
                 f'  fi; '
                 f'  sleep 2; '
-                f'done; echo TIMEOUT',
+                f'done; '
+                f'echo TIMEOUT; '
+                f'docker compose --project-name {project_name} ps 2>&1 || true',
                 hide=True, warn=True,
             )
         if 'READY' not in (result.stdout or ''):
             raise RuntimeError(
                 f"Docker service '{service_name}' started but the container "
-                f"was not ready for exec within {max_wait_s}s. Check the "
-                f"remote for stuck containers: `docker ps -a`."
+                f"was not ready for exec within {max_wait_s}s.\n"
+                f"{result.stdout.strip()}\n"
+                f"Try a clean recreate:\n"
+                f"  ssh <remote> 'cd {docker_dir} && "
+                f"docker compose --project-name {project_name} "
+                f"down --remove-orphans && "
+                f"docker compose --project-name {project_name} up -d --build'"
             )
 
     def _upload_docker_files(self, docker_dir: str):

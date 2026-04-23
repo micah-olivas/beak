@@ -17,5 +17,8 @@ RUN pip install fair-esm biotite
 # Copy embedding generation script
 COPY generate_embeddings.py /app/
 
-# Keep container running
-CMD ["python", "-c", "print('ESM Embeddings Service Ready'); import time; time.sleep(infinity)"]
+# Keep container running — `tail -f /dev/null` blocks forever without
+# the buggy `time.sleep(infinity)` (NameError crashed the container into
+# a restart loop, making `docker compose exec` always find it "started"
+# but never ready).
+CMD ["tail", "-f", "/dev/null"]
