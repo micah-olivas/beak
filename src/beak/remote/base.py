@@ -830,6 +830,60 @@ class RemoteJobManager:
         print(f"\nNohup output:")
         print(nohup.stdout)
 
+    def follow_log(self, job_id: str, interval: float = 2.0):
+        """Stream the job log live, like `tail -f` — Ctrl-C to stop.
+
+        Polls the remote log every `interval` seconds using a byte offset,
+        so new lines appear without reprinting what was already shown.
+        Exits cleanly when the job reaches a terminal state.
+        """
+        import time
+
+        job_db = self._load_job_db()
+        if job_id not in job_db:
+            print(f"Job {job_id} not found")
+            return
+
+        remote_path = job_db[job_id]['remote_path']
+        log_file = f"{remote_path}/{self.LOG_FILE}"
+
+        # Show the last 20 lines first so the user has context, then stream.
+        initial = self.conn.run(
+            f'tail -n 20 {log_file} 2>&1 || echo "(no log yet)"',
+            hide=True, warn=True,
+        )
+        print(initial.stdout, end='')
+
+        # Offset starts at the current size so subsequent polls only emit new bytes.
+        size_result = self.conn.run(
+            f'wc -c < {log_file} 2>/dev/null || echo 0',
+            hide=True, warn=True,
+        )
+        try:
+            offset = int(size_result.stdout.strip() or 0)
+        except ValueError:
+            offset = 0
+
+        try:
+            while True:
+                # Read any new bytes appended since the last offset.
+                chunk = self.conn.run(
+                    f'tail -c +{offset + 1} {log_file} 2>/dev/null',
+                    hide=True, warn=True,
+                )
+                if chunk.stdout:
+                    print(chunk.stdout, end='', flush=True)
+                    offset += len(chunk.stdout.encode('utf-8', errors='replace'))
+
+                # Stop once the job has finished.
+                info = self.status(job_id)
+                if info.get('status') in ('COMPLETED', 'FAILED', 'CANCELLED'):
+                    break
+
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n(stopped)")
+
     # ── Docker support ──────────────────────────────────────────────
 
     def _resolve_docker_dir(self) -> tuple:

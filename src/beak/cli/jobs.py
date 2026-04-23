@@ -126,10 +126,23 @@ def status(job_id, verbose, watch, interval):
 @main.command()
 @click.argument('job_id')
 @click.option('--lines', '-n', default=50, help='Number of log lines')
-def log(job_id, lines):
-    """View job log"""
+@click.option('--follow', '-f', is_flag=True,
+              help='Stream new log lines live until the job finishes (Ctrl-C to stop)')
+@click.option('--interval', default=2.0,
+              help='Poll interval in seconds (with --follow)')
+def log(job_id, lines, follow, interval):
+    """View job log.
+
+    Without --follow, prints the last N lines and a directory listing.
+    With --follow, tails the log live: shows the last 20 lines for
+    context and then streams new output as the job runs, exiting once
+    the job reaches a terminal state.
+    """
     mgr = get_manager(job_id=job_id)
-    mgr.get_log(job_id, lines=lines)
+    if follow:
+        mgr.follow_log(job_id, interval=interval)
+    else:
+        mgr.get_log(job_id, lines=lines)
 
 
 @main.command()

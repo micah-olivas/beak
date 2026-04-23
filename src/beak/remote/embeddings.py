@@ -59,6 +59,87 @@ class ESMEmbeddings(RemoteJobManager):
     def _list_jobs_extra_columns(self, info: Dict) -> Dict:
         return {'model': info.get('model', 'unknown')}
 
+    def query_gpus(self) -> List[Dict]:
+        """Return a list of {index, free_mb, total_mb, name} for each GPU.
+
+        Relies on `nvidia-smi` being on the remote PATH. If nvidia-smi
+        isn't available (or the host has no NVIDIA GPUs), returns an
+        empty list — callers should treat that as "can't tell, skip the
+        check" rather than an error.
+        """
+        result = self.conn.run(
+            'nvidia-smi --query-gpu=index,memory.free,memory.total,name '
+            '--format=csv,noheader,nounits 2>/dev/null',
+            hide=True, warn=True,
+        )
+        if not result.ok or not result.stdout.strip():
+            return []
+
+        gpus = []
+        for line in result.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 4:
+                continue
+            try:
+                gpus.append({
+                    'index': int(parts[0]),
+                    'free_mb': int(parts[1]),
+                    'total_mb': int(parts[2]),
+                    'name': parts[3],
+                })
+            except ValueError:
+                continue
+        return gpus
+
+    def _select_gpu(self, requested: int, model: str) -> int:
+        """Resolve the GPU to use, honoring `requested` (an int or 'auto').
+
+        For an integer: check that the chosen GPU has at least 2× the
+        model's advertised VRAM footprint free, and abort with a helpful
+        message if not. For 'auto': pick the GPU with the most free
+        memory, printing the choice.
+        """
+        vram_gb = self.AVAILABLE_MODELS[model]['vram_gb']
+        required_mb = int(vram_gb * 1024 * 2)  # 2× headroom for activations
+
+        gpus = self.query_gpus()
+        if not gpus:
+            # Can't see the GPUs — fall through, let CUDA produce the error.
+            return int(requested) if requested != 'auto' else 0
+
+        if requested == 'auto':
+            best = max(gpus, key=lambda g: g['free_mb'])
+            if best['free_mb'] < required_mb:
+                summary = ', '.join(
+                    f"gpu{g['index']}: {g['free_mb']} MB free" for g in gpus
+                )
+                raise RuntimeError(
+                    f"No GPU has >= {required_mb} MB free "
+                    f"(model {model} needs ~{vram_gb} GB, 2× headroom). "
+                    f"Current state: {summary}"
+                )
+            print(
+                f"Auto-selected GPU {best['index']} "
+                f"({best['free_mb']} MB free of {best['total_mb']}, {best['name']})"
+            )
+            return best['index']
+
+        idx = int(requested)
+        match = next((g for g in gpus if g['index'] == idx), None)
+        if match is None:
+            raise RuntimeError(
+                f"GPU {idx} not found on remote. Available: "
+                f"{[g['index'] for g in gpus]}"
+            )
+        if match['free_mb'] < required_mb:
+            raise RuntimeError(
+                f"GPU {idx} has only {match['free_mb']} MB free; "
+                f"model {model} needs ~{required_mb} MB (2× headroom for "
+                f"activations). Pass --gpu auto to pick the freest GPU, "
+                f"or wait for the current job to finish."
+            )
+        return idx
+
     @classmethod
     def list_models(cls) -> pd.DataFrame:
         """List available ESM models"""
@@ -81,7 +162,7 @@ class ESMEmbeddings(RemoteJobManager):
                repr_layers: List[int] = [-1],
                include_mean: bool = True,
                include_per_tok: bool = False,
-               gpu_id: int = 0) -> str:
+               gpu_id=0) -> str:
         """
         Submit ESM embedding generation job.
 
@@ -99,7 +180,11 @@ class ESMEmbeddings(RemoteJobManager):
             repr_layers: Which layers to extract ([-1] = last layer)
             include_mean: Include mean pooled embeddings
             include_per_tok: Include per-token embeddings (large files!)
-            gpu_id: GPU device ID
+            gpu_id: GPU device ID (int) or the string 'auto' to pick
+                the GPU with the most free memory. Before launch we
+                check that the selected GPU has at least 2× the model's
+                advertised VRAM footprint free; otherwise we abort with
+                a helpful message rather than silently OOMing.
 
         Returns:
             job_id: Unique job identifier
@@ -113,6 +198,10 @@ class ESMEmbeddings(RemoteJobManager):
         if model not in self.AVAILABLE_MODELS:
             available = ', '.join(self.AVAILABLE_MODELS.keys())
             raise ValueError(f"Unknown model '{model}'. Available: {available}")
+
+        # Resolve gpu_id — accepts int or 'auto'. Raises with an
+        # actionable message if the chosen GPU is too busy.
+        gpu_id = self._select_gpu(gpu_id, model)
 
         job_id = str(uuid.uuid4())[:8]
         if not job_name:

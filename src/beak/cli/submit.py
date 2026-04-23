@@ -187,7 +187,9 @@ def align(input_file, job_name, algorithm, output_format):
               help='Also save per-token embeddings (large files)')
 @click.option('--no-mean', is_flag=True,
               help='Skip mean-pooled embeddings (only makes sense with --per-tok)')
-@click.option('--gpu', 'gpu_id', default=0, help='GPU device ID on the remote')
+@click.option('--gpu', 'gpu_id', default='0',
+              help='GPU device ID on the remote (integer) or "auto" to '
+                   'pick the GPU with the most free memory')
 @click.option('--list-models', is_flag=True,
               help='List available ESM models and exit')
 def embeddings(input_file, source_job_id, model, job_name, repr_layers,
@@ -238,6 +240,19 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
             "Nothing to output: --no-mean requires --per-tok."
         )
 
+    # Parse --gpu: 'auto' stays a string (handled by the manager),
+    # anything else must be an integer index.
+    if gpu_id == 'auto':
+        resolved_gpu = 'auto'
+    else:
+        try:
+            resolved_gpu = int(gpu_id)
+        except ValueError:
+            raise click.BadParameter(
+                f"--gpu must be an integer or 'auto', got {gpu_id!r}",
+                param_hint="'--gpu'",
+            )
+
     mgr = get_manager(job_type='embeddings')
 
     if source_job_id:
@@ -251,7 +266,7 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
             repr_layers=layers,
             include_mean=include_mean,
             include_per_tok=include_per_tok,
-            gpu_id=gpu_id,
+            gpu_id=resolved_gpu,
         )
         return
 
@@ -338,8 +353,53 @@ def _resolve_source_job_fasta(job_id: str) -> str:
         # Docker run will fail with a clear FileNotFoundError.
         return f"{remote_path}/alignment.fasta"
 
+    if jtype == 'pipeline':
+        return _resolve_pipeline_fasta(info)
+
     raise click.BadParameter(
         f"Can't chain embeddings from job type '{jtype}'. "
-        f"Supported: search, align.",
+        f"Supported: search, align, pipeline.",
+        param_hint="'--from-job'",
+    )
+
+
+def _resolve_pipeline_fasta(job_info: dict) -> str:
+    """Walk a pipeline's steps in reverse and return the last FASTA it produced.
+
+    Preference order (latest first):
+      * align   -> {step_dir}/alignment.<format>
+      * filter  -> {step_dir}/filtered.fasta
+      * search  -> {step_dir}/{NN}_search_output.fasta
+
+    Step directories match the naming convention in
+    remote/pipeline.py::_generate_pipeline_script:
+        {remote_path}/{NN:02d}_{step_type}
+    where NN is the 1-based step index.
+    """
+    steps = job_info.get('steps') or []
+    remote_path = job_info.get('remote_path')
+    if not steps or not remote_path:
+        raise click.BadParameter(
+            "Pipeline job has no steps or remote_path recorded.",
+            param_hint="'--from-job'",
+        )
+
+    for i in range(len(steps), 0, -1):
+        step = steps[i - 1]
+        step_type = step.get('type')
+        step_dir = f"{remote_path}/{i:02d}_{step_type}"
+
+        if step_type == 'align':
+            fmt = (step.get('params') or {}).get('output_format', 'fasta')
+            return f"{step_dir}/alignment.{fmt}"
+        if step_type == 'filter':
+            return f"{step_dir}/filtered.fasta"
+        if step_type == 'search':
+            return f"{step_dir}/{i:02d}_search_output.fasta"
+
+    types = [s.get('type') for s in steps]
+    raise click.BadParameter(
+        f"Pipeline steps {types} produced no FASTA output that can feed "
+        f"into embeddings.",
         param_hint="'--from-job'",
     )
