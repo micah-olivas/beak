@@ -141,6 +141,17 @@ def generate_embeddings(
         model.eval()
         _log(f"Using device: {device}")
 
+        # Normalize negative layer indices to positive — ESM keys the
+        # representations dict by the exact layer numbers passed in, so
+        # `[-1]` would raise KeyError. -1 → last transformer layer,
+        # -2 → second to last, etc.
+        num_layers = model.num_layers
+        repr_layers = [
+            (num_layers + L + 1) if L < 0 else L
+            for L in repr_layers
+        ]
+        _log(f"Extracting representations from layers: {repr_layers}")
+
         batch_converter = alphabet.get_batch_converter()
 
         for i, (seq_id, seq) in enumerate(pending, start=1):
