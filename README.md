@@ -140,11 +140,16 @@ The `beak embeddings` command runs ESM models in a Docker container on the remot
 
 To share a single service across all beak users:
 
-1. **Admin setup (one time):** pick a path that beak users can write to, e.g. `/srv/beak_docker`, and make it group-writable.
+1. **Admin setup (one time):** pick (or create) a shared Unix group that all beak users belong to, then create the service directory with group-write + setgid so new files inherit the group.
    ```bash
+   # Create the group and add users (skip the first line if using an
+   # existing group like `docker` or `users`)
+   sudo groupadd beak_users
+   sudo usermod -aG beak_users <username>   # repeat per user; users must log out/in
+
    sudo mkdir -p /srv/beak_docker
    sudo chgrp beak_users /srv/beak_docker
-   sudo chmod 2775 /srv/beak_docker  # setgid so new files inherit the group
+   sudo chmod 2775 /srv/beak_docker         # 2 = setgid (new files inherit group)
    ```
 
 2. **Each user:** point beak at the shared path.
