@@ -99,6 +99,28 @@ def get_database_config() -> Dict:
     }
 
 
+def get_docker_config() -> Dict:
+    """Get Docker service configuration from config.
+
+    Returns:
+        Dict with keys:
+          service_dir:  absolute remote path to the shared Docker service
+                        directory. If set, all beak users on this remote point
+                        at the same docker-compose project and share a single
+                        running container per service. If None, each user
+                        deploys its own copy under `{remote_job_dir}/docker`.
+          project_name: docker compose project name (default: 'beak') — kept
+                        consistent across users so `docker compose` commands
+                        scope to the same service regardless of working dir.
+    """
+    config = load_config()
+    d = config.get('docker', {})
+    return {
+        'service_dir': d.get('service_dir'),
+        'project_name': d.get('project_name', 'beak'),
+    }
+
+
 def config_exists() -> bool:
     """Check if a config file exists."""
     return CONFIG_PATH.exists()

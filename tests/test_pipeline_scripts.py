@@ -166,7 +166,21 @@ class TestGenerateEmbeddingsCommands:
 
     def test_docker_compose_exec_used(self):
         cmds = "\n".join(self._run({}))
-        assert 'docker compose exec' in cmds
+        assert 'docker compose' in cmds and 'exec' in cmds
+
+    def test_project_name_is_consistent_across_users(self):
+        # All beak users must land on the same docker compose project so
+        # `exec` hits the shared service regardless of working directory.
+        cmds = "\n".join(self._run({}))
+        assert '--project-name beak' in cmds
+
+    def test_custom_docker_dir_used_when_provided(self):
+        from beak.remote.pipeline_scripts import generate_embeddings_commands
+        cmds = "\n".join(generate_embeddings_commands(
+            _step('embeddings', {}), STEP_DIR, INPUT, REMOTE_PATH,
+            '/remote', docker_dir='/srv/beak_docker', project_name='beak',
+        ))
+        assert 'cd /srv/beak_docker' in cmds
 
     def test_default_model_is_esm2(self):
         cmds = "\n".join(self._run({}))

@@ -813,71 +813,130 @@ class RemoteJobManager:
 
     # ── Docker support ──────────────────────────────────────────────
 
+    def _resolve_docker_dir(self) -> tuple:
+        """Resolve the Docker service directory and compose project name.
+
+        Reads [docker] service_dir from config if set (shared across all
+        beak users on the same remote); otherwise falls back to a
+        per-user path under remote_job_dir.
+
+        Returns:
+            (docker_dir, project_name, is_shared)
+        """
+        from ..config import get_docker_config
+
+        docker_cfg = get_docker_config()
+        shared_dir = docker_cfg['service_dir']
+        project_name = docker_cfg['project_name']
+
+        if shared_dir:
+            return shared_dir, project_name, True
+        return f"{self.remote_job_dir}/docker", project_name, False
+
     def _ensure_docker_service(self, service_name: str = "embeddings"):
-        """Ensure Docker service is deployed and running on remote"""
-        docker_dir = f"{self.remote_job_dir}/docker"
+        """Ensure the Docker service is deployed, up to date, and running.
 
-        dir_check = self.conn.run(
-            f'[ -d {docker_dir} ] && echo "EXISTS" || echo "NOT_FOUND"',
-            hide=True, warn=True
-        )
+        Always re-uploads the local Docker source files (they're tiny) and
+        runs `up -d --build` so source changes land on every submission.
+        Docker layer caching makes this near-free when nothing changed, and
+        it prevents the "remote dir exists but some file is missing / stale"
+        failure mode where the build fails but the service never redeploys.
 
-        if dir_check.stdout.strip() == "NOT_FOUND":
-            print(f"Docker service not deployed. Deploying now...")
-            self._deploy_docker_service(service_name)
-            return
+        When [docker] service_dir is configured, the service is shared across
+        all beak users on the remote — the first user triggers the build,
+        everyone else's `docker compose ps` sees it already running and
+        short-circuits to exec-only.
+        """
+        docker_dir, project_name, is_shared = self._resolve_docker_dir()
+        compose = f"docker compose --project-name {project_name}"
+
+        # Preflight: fail helpfully if a shared dir is configured but unwritable
+        if is_shared:
+            writable = self.conn.run(
+                f'mkdir -p {docker_dir} 2>/dev/null && [ -w {docker_dir} ] && echo OK || echo NO',
+                hide=True, warn=True,
+            )
+            if writable.stdout.strip() != 'OK':
+                raise PermissionError(
+                    f"Shared Docker service dir {docker_dir!r} is not writable "
+                    f"by user {self.conn.user!r}. Ask the admin to grant group "
+                    f"write access, or unset `docker.service_dir` in your config "
+                    f"to use a per-user deployment at {self.remote_job_dir}/docker."
+                )
+        else:
+            self.conn.run(f'mkdir -p {docker_dir}', hide=True)
+
+        self._upload_docker_files(docker_dir)
 
         with self.conn.cd(docker_dir):
             check = self.conn.run(
-                f'docker compose ps --services --filter status=running | grep {service_name}',
-                hide=True, warn=True
+                f'{compose} ps --services --filter status=running | grep {service_name}',
+                hide=True, warn=True,
             )
 
-        if not check.ok or service_name not in check.stdout:
-            print(f"Starting Docker service '{service_name}'...")
-            with self.conn.cd(docker_dir):
-                self.conn.run('docker compose up -d', hide=True)
-            print(f"✓ Docker service started")
+        if check.ok and service_name in check.stdout:
+            return  # already running with current source (shared or own)
 
-    def _deploy_docker_service(self, service_name: str = "embeddings"):
-        """Deploy Docker service to remote"""
-        from pkg_resources import resource_filename
+        where = "shared" if is_shared else "per-user"
+        print(f"Starting Docker service '{service_name}' ({where}, build if needed)...")
+        with self.conn.cd(docker_dir):
+            result = self.conn.run(
+                f'{compose} up -d --build',
+                hide=True, warn=True,
+            )
+        if not result.ok:
+            print("✗ Docker service failed to start. Build output:\n")
+            print(result.stdout)
+            if result.stderr.strip():
+                print("\nstderr:\n" + result.stderr)
+            raise RuntimeError(
+                f"Docker service '{service_name}' failed to start "
+                f"(exit {result.exited}). See output above."
+            )
+        print(f"✓ Docker service '{service_name}' is up")
 
-        docker_dir = f"{self.remote_job_dir}/docker"
+    def _upload_docker_files(self, docker_dir: str):
+        """Upload the Docker source bundle from the installed package to the remote.
+
+        Missing optional files (e.g., .dockerignore) are silently skipped;
+        the Dockerfile and generate_embeddings.py are required.
+        """
         self.conn.run(f'mkdir -p {docker_dir}', hide=True)
 
-        docker_files_dir = resource_filename('beak', 'remote/docker')
+        # Prefer importlib.resources (stdlib) over the deprecated pkg_resources.
+        try:
+            from importlib.resources import files as _resource_files
+            docker_files_dir = Path(str(_resource_files('beak').joinpath('remote/docker')))
+        except (ImportError, AttributeError):
+            # Python < 3.9 fallback
+            from pkg_resources import resource_filename
+            docker_files_dir = Path(resource_filename('beak', 'remote/docker'))
 
-        files_to_upload = [
-            'Dockerfile',
-            'docker-compose.yml',
-            '.dockerignore',
-            'requirements.txt',
-            'generate_embeddings.py'
-        ]
+        required = ['Dockerfile', 'docker-compose.yml', 'generate_embeddings.py']
+        optional = ['requirements.txt', '.dockerignore']
 
-        for filename in files_to_upload:
-            local_path = Path(docker_files_dir) / filename
+        for filename in required:
+            local_path = docker_files_dir / filename
+            if not local_path.exists():
+                raise FileNotFoundError(
+                    f"Required Docker source file missing from package: {local_path}"
+                )
+            self.conn.put(str(local_path), f"{docker_dir}/{filename}")
+
+        for filename in optional:
+            local_path = docker_files_dir / filename
             if local_path.exists():
                 self.conn.put(str(local_path), f"{docker_dir}/{filename}")
-                print(f"  Uploaded {filename}")
-            else:
-                print(f"  WARNING: {filename} not found at {local_path}")
 
-        with self.conn.cd(docker_dir):
-            print("  Building Docker image...")
-            self.conn.run('docker compose build', hide=False)
-
-            print("  Starting service...")
-            self.conn.run('docker compose up -d', hide=False)
-
-        print(f"✓ Docker service '{service_name}' deployed")
+    def _deploy_docker_service(self, service_name: str = "embeddings"):
+        """Alias retained for compatibility; delegates to _ensure_docker_service."""
+        self._ensure_docker_service(service_name)
 
     def _docker_exec(self, command: str, service_name: str = "embeddings"):
-        """Execute command inside Docker container"""
-        docker_dir = f"{self.remote_job_dir}/docker"
+        """Execute a command inside the Docker container for this service."""
+        docker_dir, project_name, _ = self._resolve_docker_dir()
         with self.conn.cd(docker_dir):
             return self.conn.run(
-                f'docker compose exec -T {service_name} {command}',
-                hide=True
+                f'docker compose --project-name {project_name} exec -T {service_name} {command}',
+                hide=True,
             )

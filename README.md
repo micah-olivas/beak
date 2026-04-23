@@ -134,6 +134,29 @@ BEAK auto-detects the database by checking (in order): your config, `/srv/protei
 beak config set databases.pfam_path /your/custom/path
 ```
 
+### Shared ESM Embeddings Service (optional)
+
+The `beak embeddings` command runs ESM models in a Docker container on the remote. By default each beak user deploys their own copy under `~/beak_jobs/docker/`, which means a 3 GB image pull and a per-user running container. On shared servers this is wasteful.
+
+To share a single service across all beak users:
+
+1. **Admin setup (one time):** pick a path that beak users can write to, e.g. `/srv/beak_docker`, and make it group-writable.
+   ```bash
+   sudo mkdir -p /srv/beak_docker
+   sudo chgrp beak_users /srv/beak_docker
+   sudo chmod 2775 /srv/beak_docker  # setgid so new files inherit the group
+   ```
+
+2. **Each user:** point beak at the shared path.
+   ```bash
+   beak config set docker.service_dir /srv/beak_docker
+   ```
+
+With this set, the first user to submit an embeddings job triggers the build; everyone after that sees the service already running and simply `docker compose exec`s into it. The compose project name is pinned to `beak` across users so all invocations target the same container regardless of working directory.
+
+Users must also be members of the `docker` group on the remote to interact with the daemon.
+```
+
 Run `beak doctor` to verify your setup — it reports tool availability, database status, and database age.
 
 ---

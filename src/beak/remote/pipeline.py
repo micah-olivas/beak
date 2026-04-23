@@ -363,9 +363,12 @@ class Pipeline(RemoteJobManager):
                 previous_output = f"{step_dir}/tree.nwk"
             elif step.step_type == 'embeddings':
                 input_for_embeddings = search_output or previous_output
+                docker_dir, project_name, _ = self._resolve_docker_dir()
                 script_parts.extend(generate_embeddings_commands(
                     step, step_dir, input_for_embeddings, remote_path,
-                    self.remote_job_dir
+                    self.remote_job_dir,
+                    docker_dir=docker_dir,
+                    project_name=project_name,
                 ))
                 previous_output = f"{step_dir}/embeddings/mean_embeddings.pkl"
             else:

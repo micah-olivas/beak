@@ -193,8 +193,20 @@ def generate_tree_commands(step, step_dir, input_file, remote_path) -> List[str]
 
 
 def generate_embeddings_commands(step, step_dir, input_file, remote_path,
-                                 remote_job_dir) -> List[str]:
-    """Generate embedding commands using Docker service."""
+                                 remote_job_dir,
+                                 docker_dir=None,
+                                 project_name='beak') -> List[str]:
+    """Generate embedding commands using Docker service.
+
+    docker_dir defaults to `{remote_job_dir}/docker` for backwards
+    compatibility; pass an absolute path (e.g. from Pipeline._resolve_docker_dir)
+    to target a shared service. project_name is threaded through so the
+    docker compose invocation scopes to the same project that deployed the
+    service.
+    """
+    if docker_dir is None:
+        docker_dir = f"{remote_job_dir}/docker"
+
     model = step.params.get('model', 'esm2_t33_650M_UR50D')
     input_fasta = f"{remote_path}/{input_file}" if not input_file.startswith('/') else input_file
     repr_layers = step.params.get('repr_layers', [-1])
@@ -209,9 +221,10 @@ def generate_embeddings_commands(step, step_dir, input_file, remote_path,
 
     return [
         f"# Generate embeddings using Docker service",
-        f"cd {remote_job_dir}/docker",
+        f"cd {docker_dir}",
         f"mkdir -p {step_dir}/embeddings",
-        f"docker compose exec -T embeddings python /app/generate_embeddings.py "
+        f"docker compose --project-name {project_name} exec -T embeddings "
+        f"python /app/generate_embeddings.py "
         f"--input {input_fasta} "
         f"--output {step_dir}/embeddings "
         f"--model {model} "

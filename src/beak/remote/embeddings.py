@@ -156,7 +156,7 @@ class ESMEmbeddings(RemoteJobManager):
     def _generate_job_script(self, remote_job_path, remote_input, model,
                         repr_layers, include_mean, include_per_tok, gpu_id):
         """Generate Docker execution script"""
-        docker_dir = f"{self.remote_job_dir}/docker"
+        docker_dir, project_name, _ = self._resolve_docker_dir()
         output_dir = f"{remote_job_path}/embeddings"
 
         repr_layers_str = ' '.join(map(str, repr_layers))
@@ -172,7 +172,7 @@ echo 'RUNNING' >> {remote_job_path}/status.txt
 mkdir -p {output_dir}
 
 cd {docker_dir}
-docker compose exec -T embeddings python /app/generate_embeddings.py \\
+docker compose --project-name {project_name} exec -T embeddings python /app/generate_embeddings.py \\
   --input {remote_input} \\
   --output {output_dir} \\
   --model {model} \\
@@ -226,6 +226,40 @@ fi
         print(f"✓ Downloaded log to {local_log}")
 
         return local_dir / 'embeddings'
+
+    def progress(self, job_id: str) -> Dict:
+        """Fetch structured progress for a running embedding job.
+
+        The in-container generator writes a progress.json beside the
+        embeddings output directory; this reads it back over SSH without
+        downloading the full result tarball.
+
+        Returns a dict with keys: total, done, failed, current (seq_id or
+        None), started_at, last_update, model. Returns {'status': 'NO_PROGRESS'}
+        if the job hasn't written the file yet (e.g., still staging).
+        """
+        import json
+
+        job_db = self._load_job_db()
+        if job_id not in job_db:
+            raise ValueError(f"Unknown job id: {job_id}")
+
+        remote_path = job_db[job_id]['remote_path']
+        progress_path = f"{remote_path}/embeddings/progress.json"
+
+        result = self.conn.run(
+            f'cat {progress_path} 2>/dev/null || echo __MISSING__',
+            hide=True, warn=True,
+        )
+        text = result.stdout.strip()
+        if text == '__MISSING__' or not text:
+            return {'status': 'NO_PROGRESS'}
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Partial write caught mid-flush; treat as transient
+            return {'status': 'NO_PROGRESS'}
 
     def get_results(self, job_id: str, parse: bool = True,
                     kind: str = 'mean', layer=None, local_dir: str = '.'):
