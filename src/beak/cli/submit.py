@@ -1,10 +1,91 @@
-"""Job submission commands: search, taxonomy, align."""
+"""Job submission commands: search, taxonomy, align, embeddings."""
 
 import click
 from pathlib import Path
 
 from .main import main
 from ._common import get_manager, auto_name_from_pfam
+
+
+# Known ESM2 embedding dimensions — used for upfront size estimation.
+# Unknown models (custom finetunes etc.) fall back to skipping the estimate.
+_ESM2_EMBED_DIM = {
+    'esm2_t6_8M_UR50D': 320,
+    'esm2_t12_35M_UR50D': 480,
+    'esm2_t30_150M_UR50D': 640,
+    'esm2_t33_650M_UR50D': 1280,
+}
+
+
+def _humanize_bytes(n: float) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024 or unit == 'TB':
+            return f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _fasta_stats(path) -> tuple:
+    """Scan a FASTA file without loading it into memory.
+
+    Returns (n_seqs, total_length, max_length, min_length).
+    Raises click.BadParameter if the file has no records or all seqs empty.
+    """
+    n_seqs = 0
+    total_len = 0
+    max_len = 0
+    min_len = None
+    current_len = 0
+
+    def _flush():
+        nonlocal total_len, max_len, min_len
+        if current_len == 0:
+            return
+        total_len += current_len
+        max_len = max(max_len, current_len)
+        min_len = current_len if min_len is None else min(min_len, current_len)
+
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith('>'):
+                _flush()
+                n_seqs += 1
+                current_len = 0
+            else:
+                # ignore blank lines between records
+                current_len += len(line)
+        _flush()
+
+    if n_seqs == 0:
+        raise click.BadParameter(
+            f"{path!r} has no FASTA records (no '>' headers found).",
+            param_hint="'INPUT_FILE'",
+        )
+    if total_len == 0:
+        raise click.BadParameter(
+            f"{path!r} has {n_seqs} headers but zero sequence content.",
+            param_hint="'INPUT_FILE'",
+        )
+    return n_seqs, total_len, max_len, (min_len or 0)
+
+
+def _estimate_embedding_bytes(n_seqs: int, total_len: int, model: str,
+                              n_layers: int, include_mean: bool,
+                              include_per_tok: bool) -> int:
+    """Estimate the uncompressed pickle size (pre .npz compression) in bytes.
+
+    Returns None for unknown model dimensions.
+    """
+    dim = _ESM2_EMBED_DIM.get(model)
+    if dim is None:
+        return None
+    bytes_mean = n_seqs * dim * n_layers * 4 if include_mean else 0
+    bytes_tok = total_len * dim * n_layers * 4 if include_per_tok else 0
+    return bytes_mean + bytes_tok
+
+
+# Warn + confirm threshold when output crosses this many bytes.
+_EMBEDDING_SIZE_WARN_BYTES = 5 * 1024 ** 3  # 5 GB
 
 
 @main.command()
@@ -173,6 +254,31 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
             gpu_id=gpu_id,
         )
         return
+
+    # Local-FASTA path: validate structure and show a size estimate so
+    # the user doesn't kick off a silent multi-hundred-GB job on --per-tok.
+    n_seqs, total_len, max_len, min_len = _fasta_stats(input_file)
+    avg_len = total_len // n_seqs
+    click.echo(
+        f"Input: {n_seqs:,} sequences "
+        f"(avg {avg_len} aa, min {min_len}, max {max_len})"
+    )
+
+    est_bytes = _estimate_embedding_bytes(
+        n_seqs, total_len, model, len(layers), include_mean, include_per_tok,
+    )
+    if est_bytes is not None:
+        tag = ""
+        if include_per_tok and include_mean:
+            tag = " (mean + per-token)"
+        elif include_per_tok:
+            tag = " (per-token only)"
+        click.echo(f"Estimated output size: ~{_humanize_bytes(est_bytes)}{tag}")
+        if est_bytes > _EMBEDDING_SIZE_WARN_BYTES:
+            click.confirm(
+                f"  ⚠  Output will exceed {_humanize_bytes(_EMBEDDING_SIZE_WARN_BYTES)}. Continue?",
+                abort=True, default=False,
+            )
 
     if job_name is None:
         job_name = auto_name_from_pfam(input_file, 'embeddings')

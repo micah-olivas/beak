@@ -147,6 +147,13 @@ def results(job_id, parse):
     """Download job results"""
     mgr = get_manager(job_id=job_id)
 
+    # Embeddings have a richer results story than "print the DataFrame" —
+    # they produce a pickle the user loads in Python, so show a summary
+    # and a ready-to-paste loader snippet instead of raw values.
+    if mgr.JOB_TYPE == 'embeddings':
+        _show_embeddings_results(mgr, job_id)
+        return
+
     if hasattr(mgr, 'get_results'):
         result = mgr.get_results(job_id, parse=parse)
         if parse and hasattr(result, 'shape'):
@@ -158,3 +165,49 @@ def results(job_id, parse):
         click.echo(f"✓ Results at: {result}")
     else:
         click.echo("Results download not supported for this job type.")
+
+
+def _show_embeddings_results(mgr, job_id: str):
+    """Download an embeddings job and print a human-friendly summary."""
+    embeddings_dir = mgr.download(job_id)
+
+    from ..embeddings import load_mean_embeddings, load_per_token_embeddings
+
+    info = mgr._load_job_db().get(job_id, {})
+    model = info.get('model', '?')
+    params = info.get('parameters', {}) or {}
+
+    mean_path = embeddings_dir / 'mean_embeddings.pkl'
+    tok_path = embeddings_dir / 'per_token_embeddings.pkl'
+    failed_path = embeddings_dir / 'failed.tsv'
+
+    click.echo(f"\nModel: {model}")
+    click.echo(f"Layers: {params.get('repr_layers', [])}")
+
+    if mean_path.exists():
+        df = load_mean_embeddings(mean_path)
+        click.echo(
+            f"Mean embeddings:       {df.shape[0]:,} sequences × "
+            f"{df.shape[1]:,} dimensions  →  {mean_path}"
+        )
+
+    if tok_path.exists():
+        df = load_per_token_embeddings(tok_path)
+        click.echo(
+            f"Per-token embeddings:  {len(df.index.get_level_values('seq_id').unique()):,} sequences, "
+            f"{df.shape[0]:,} total residues × "
+            f"{df.shape[1]:,} dimensions  →  {tok_path}"
+        )
+
+    if failed_path.exists():
+        n_failed = sum(1 for _ in open(failed_path))
+        if n_failed:
+            click.echo(f"Failed sequences:      {n_failed}  →  {failed_path}")
+
+    click.echo("\nLoad in Python:")
+    if mean_path.exists():
+        click.echo("  from beak.embeddings import load_mean_embeddings")
+        click.echo(f"  df = load_mean_embeddings('{mean_path}')")
+    if tok_path.exists():
+        click.echo("  from beak.embeddings import load_per_token_embeddings")
+        click.echo(f"  tok = load_per_token_embeddings('{tok_path}')")
