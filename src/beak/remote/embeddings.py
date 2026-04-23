@@ -163,8 +163,11 @@ class ESMEmbeddings(RemoteJobManager):
         mean_flag = "--include-mean" if include_mean else ""
         tok_flag = "--include-per-tok" if include_per_tok else ""
 
+        # set -o pipefail is critical: without it, `exec | tee` swallows the
+        # exec exit code (tee is always 0) and the script wrongly writes
+        # COMPLETED when the container exec actually failed.
         script = f"""#!/bin/bash
-set -e
+set -eo pipefail
 
 echo "Job started: $(date)" > {remote_job_path}/status.txt
 echo 'RUNNING' >> {remote_job_path}/status.txt
@@ -172,6 +175,26 @@ echo 'RUNNING' >> {remote_job_path}/status.txt
 mkdir -p {output_dir}
 
 cd {docker_dir}
+
+# Wait for the embeddings container to be ready for exec (avoids the
+# "procReady not received" race right after `docker compose up -d`).
+READY=false
+for attempt in $(seq 1 30); do
+    if docker compose --project-name {project_name} exec -T embeddings true 2>/dev/null; then
+        READY=true
+        break
+    fi
+    sleep 2
+done
+if [ "$READY" != "true" ]; then
+    echo "Container 'embeddings' was not ready for exec after 60s" \\
+        | tee -a {remote_job_path}/esm.log
+    echo "Job failed: $(date)" >> {remote_job_path}/status.txt
+    echo "FAILED" >> {remote_job_path}/status.txt
+    exit 1
+fi
+
+set +e
 docker compose --project-name {project_name} exec -T embeddings python /app/generate_embeddings.py \\
   --input {remote_input} \\
   --output {output_dir} \\
@@ -181,13 +204,16 @@ docker compose --project-name {project_name} exec -T embeddings python /app/gene
   {tok_flag} \\
   --gpu {gpu_id} \\
   2>&1 | tee {remote_job_path}/esm.log
+EXIT_CODE=${{PIPESTATUS[0]}}
+set -e
 
-if [ $? -eq 0 ]; then
+if [ "$EXIT_CODE" -eq 0 ]; then
     echo "Job completed: $(date)" >> {remote_job_path}/status.txt
     echo "COMPLETED" >> {remote_job_path}/status.txt
 else
-    echo "Job failed: $(date)" >> {remote_job_path}/status.txt
+    echo "Job failed: $(date) (exit $EXIT_CODE)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
+    exit $EXIT_CODE
 fi
 """
         return script

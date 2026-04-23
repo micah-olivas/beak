@@ -912,7 +912,34 @@ class RemoteJobManager:
                 f"Docker service '{service_name}' failed to start "
                 f"(exit {result.exited}). See output above."
             )
+
+        # Wait for the container to actually be ready for exec.
+        # `up -d` returns as soon as the container is *started*, but the
+        # runtime may still be booting its PID 1 — any immediate `exec` can
+        # hit "OCI runtime exec failed: procReady not received".
+        self._wait_for_container_ready(docker_dir, project_name, service_name)
         print(f"✓ Docker service '{service_name}' is up")
+
+    def _wait_for_container_ready(self, docker_dir: str, project_name: str,
+                                  service_name: str, max_wait_s: int = 60):
+        """Poll `docker compose exec <service> true` until it succeeds."""
+        with self.conn.cd(docker_dir):
+            result = self.conn.run(
+                f'for i in $(seq 1 {max_wait_s // 2}); do '
+                f'  if docker compose --project-name {project_name} exec -T '
+                f'{service_name} true 2>/dev/null; then '
+                f'    echo READY; exit 0; '
+                f'  fi; '
+                f'  sleep 2; '
+                f'done; echo TIMEOUT',
+                hide=True, warn=True,
+            )
+        if 'READY' not in (result.stdout or ''):
+            raise RuntimeError(
+                f"Docker service '{service_name}' started but the container "
+                f"was not ready for exec within {max_wait_s}s. Check the "
+                f"remote for stuck containers: `docker ps -a`."
+            )
 
     def _upload_docker_files(self, docker_dir: str):
         """Upload the Docker source bundle from the installed package to the remote.

@@ -5,7 +5,13 @@ services:
     environment:
       - CUDA_VISIBLE_DEVICES=0
     volumes:
-      - ${HOME}/beak_jobs:/jobs
+      # Mount /home so container paths match host paths exactly. The run
+      # scripts pass absolute host paths like /home/<user>/beak_jobs/<id>
+      # directly to the container; a per-user ${HOME}/beak_jobs:/jobs
+      # mount breaks both that identity (paths differ) and the shared-
+      # service case (${HOME} is whoever brought the service up, not the
+      # user exec'ing in).
+      - /home:/home
     restart: unless-stopped
     deploy:
       resources:
