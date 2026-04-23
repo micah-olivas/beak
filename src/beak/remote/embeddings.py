@@ -14,29 +14,52 @@ class ESMEmbeddings(RemoteJobManager):
     LOG_FILE = 'esm.log'
 
     AVAILABLE_MODELS = {
+        # ESM2 family (loaded via fair-esm inside the container).
         'esm2_t6_8M_UR50D': {
             'name': 'ESM2-8M',
+            'family': 'esm2',
             'params': '8M',
             'vram_gb': 0.1,
-            'description': 'Tiny model, very fast'
+            'description': 'ESM2, 6 layers, 320 dim',
         },
         'esm2_t12_35M_UR50D': {
             'name': 'ESM2-35M',
+            'family': 'esm2',
             'params': '35M',
             'vram_gb': 0.2,
-            'description': 'Small model, fast'
+            'description': 'ESM2, 12 layers, 480 dim',
         },
         'esm2_t30_150M_UR50D': {
             'name': 'ESM2-150M',
+            'family': 'esm2',
             'params': '150M',
             'vram_gb': 0.6,
-            'description': 'Medium model, good balance'
+            'description': 'ESM2, 30 layers, 640 dim',
         },
         'esm2_t33_650M_UR50D': {
             'name': 'ESM2-650M',
+            'family': 'esm2',
             'params': '650M',
             'vram_gb': 2.5,
-            'description': 'Large model (max for 1080 Ti), best quality'
+            'description': 'ESM2, 33 layers, 1280 dim',
+        },
+
+        # ESM-C family (EvolutionaryScale, loaded via transformers +
+        # trust_remote_code inside the container to sidestep the `esm`
+        # package name collision with fair-esm).
+        'esmc_300m': {
+            'name': 'ESM-C-300M',
+            'family': 'esmc',
+            'params': '300M',
+            'vram_gb': 1.5,
+            'description': 'ESM-C (2024-12), 960 dim',
+        },
+        'esmc_600m': {
+            'name': 'ESM-C-600M',
+            'family': 'esmc',
+            'params': '600M',
+            'vram_gb': 2.5,
+            'description': 'ESM-C (2024-12), 1152 dim',
         },
     }
 

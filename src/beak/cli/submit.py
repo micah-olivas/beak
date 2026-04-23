@@ -7,13 +7,18 @@ from .main import main
 from ._common import get_manager, auto_name_from_pfam
 
 
-# Known ESM2 embedding dimensions — used for upfront size estimation.
-# Unknown models (custom finetunes etc.) fall back to skipping the estimate.
+# Known embedding dimensions — used for upfront size estimation.
+# Unknown models (custom finetunes, HF paths like "org/name") fall back
+# to skipping the estimate.
 _ESM2_EMBED_DIM = {
+    # ESM2 (fair-esm)
     'esm2_t6_8M_UR50D': 320,
     'esm2_t12_35M_UR50D': 480,
     'esm2_t30_150M_UR50D': 640,
     'esm2_t33_650M_UR50D': 1280,
+    # ESM-C (EvolutionaryScale via transformers)
+    'esmc_300m': 960,
+    'esmc_600m': 1152,
 }
 
 

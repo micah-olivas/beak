@@ -3,6 +3,14 @@
 # torch (that would clobber the CUDA build with a CPU wheel), and we must
 # pin numpy below 2.x so tensor.numpy() conversions keep working.
 numpy<2
+
+# transformers drives the ESM-C path (loaded via AutoModel with
+# trust_remote_code to sidestep the top-level `esm` name collision
+# between fair-esm and EvolutionaryScale's `esm` package).
+# accelerate + sentencepiece are runtime deps for newer HF models.
 transformers
+accelerate
+sentencepiece
+
 biopython
 pandas

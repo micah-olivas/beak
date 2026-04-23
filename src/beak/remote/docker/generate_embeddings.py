@@ -82,6 +82,118 @@ def _consolidate_chunks(chunks_dir: Path, out_pickle: Path) -> int:
     return len(merged)
 
 
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+# Each backend knows how to: load a model, report its layer count, and embed
+# one sequence (returning a dict of {f"layer_N": np.ndarray(seq_len, D)}).
+# The consolidation / chunking / progress logic below is backend-agnostic.
+# ---------------------------------------------------------------------------
+
+ESM_MAX_AA = 1022  # both ESM2 and ESM-C publicly trained on up to 1024 tokens
+
+
+class Esm2Backend:
+    """Loads ESM2 via `fair-esm`'s native API (same as before)."""
+
+    name = 'esm2'
+
+    def __init__(self, model_name: str, gpu_id: int):
+        import esm as _esm
+        import torch
+
+        self.model, self.alphabet = _esm.pretrained.load_model_and_alphabet(model_name)
+        self.device = torch.device(
+            f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu'
+        )
+        self.model = self.model.to(self.device).eval()
+        self.batch_converter = self.alphabet.get_batch_converter()
+        self._torch = torch
+
+    @property
+    def num_layers(self) -> int:
+        return self.model.num_layers
+
+    def embed_one(self, seq_id: str, seq: str, repr_layers: list) -> dict:
+        _, batch_strs, batch_tokens = self.batch_converter([(seq_id, seq)])
+        batch_tokens = batch_tokens.to(self.device)
+        with self._torch.no_grad():
+            out = self.model(batch_tokens, repr_layers=repr_layers, return_contacts=False)
+
+        seq_len = len(batch_strs[0])
+        return {
+            f"layer_{L}": out["representations"][L][0, 1:seq_len + 1]
+            for L in repr_layers
+        }
+
+
+class EsmCBackend:
+    """Loads ESM-C via HuggingFace transformers + trust_remote_code.
+
+    Picking `transformers` over EvolutionaryScale's `esm` package avoids a
+    PyPI conflict with `fair-esm` (both own the top-level `esm` import),
+    so ESM2 + ESM-C can coexist in the same container.
+    """
+
+    name = 'esmc'
+
+    # Short aliases -> HF hub model IDs. Users can still pass a full
+    # "org/name" path and it will be used verbatim.
+    HF_IDS = {
+        'esmc_300m': 'EvolutionaryScale/esmc_300m_2024_12',
+        'esmc_600m': 'EvolutionaryScale/esmc_600m_2024_12',
+    }
+
+    def __init__(self, model_name: str, gpu_id: int):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        hf_id = self.HF_IDS.get(model_name, model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(hf_id, trust_remote_code=True)
+        self.device = torch.device(
+            f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu'
+        )
+        self.model = self.model.to(self.device).eval()
+        self._torch = torch
+
+    @property
+    def num_layers(self) -> int:
+        return self.model.config.num_hidden_layers
+
+    def embed_one(self, seq_id: str, seq: str, repr_layers: list) -> dict:
+        inputs = self.tokenizer(
+            seq, return_tensors='pt', add_special_tokens=True,
+        ).to(self.device)
+        with self._torch.no_grad():
+            out = self.model(**inputs, output_hidden_states=True)
+
+        # transformers returns hidden_states as a tuple of length
+        # num_layers + 1 (index 0 = initial embedding, index N = after
+        # block N). We slice off CLS/EOS to match the ESM2 convention.
+        seq_len = len(seq)
+        return {
+            f"layer_{L}": out.hidden_states[L][0, 1:seq_len + 1]
+            for L in repr_layers
+        }
+
+
+def _make_backend(model_name: str, gpu_id: int):
+    if model_name.startswith('esm2_'):
+        return Esm2Backend(model_name, gpu_id)
+    if model_name.startswith('esmc_') or '/esmc' in model_name.lower():
+        return EsmCBackend(model_name, gpu_id)
+    raise ValueError(
+        f"Unrecognized model family for {model_name!r}. "
+        f"Expected an esm2_* or esmc_* model id."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
 def generate_embeddings(
     input_fasta: str,
     output_dir: str,
@@ -91,8 +203,6 @@ def generate_embeddings(
     include_per_tok: bool,
     gpu_id: int,
 ) -> None:
-    import esm
-    import torch
     from Bio import SeqIO
 
     output_path = Path(output_dir)
@@ -131,28 +241,19 @@ def generate_embeddings(
     }
     _write_progress(progress_path, progress)
 
-    # Load model only if there's real work to do
     if pending:
         _log(f"Loading model: {model_name}")
-        model, alphabet = esm.pretrained.load_model_and_alphabet(model_name)
+        backend = _make_backend(model_name, gpu_id)
+        _log(f"Backend: {backend.name}, device: {backend.device}")
 
-        device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
-        model = model.to(device)
-        model.eval()
-        _log(f"Using device: {device}")
-
-        # Normalize negative layer indices to positive — ESM keys the
-        # representations dict by the exact layer numbers passed in, so
-        # `[-1]` would raise KeyError. -1 → last transformer layer,
-        # -2 → second to last, etc.
-        num_layers = model.num_layers
+        # Normalize negative layer indices to positive. Both backends key
+        # their hidden states by exact layer number; [-1] would KeyError.
+        num_layers = backend.num_layers
         repr_layers = [
             (num_layers + L + 1) if L < 0 else L
             for L in repr_layers
         ]
         _log(f"Extracting representations from layers: {repr_layers}")
-
-        batch_converter = alphabet.get_batch_converter()
 
         for i, (seq_id, seq) in enumerate(pending, start=1):
             progress['current'] = seq_id
@@ -162,46 +263,34 @@ def generate_embeddings(
             _log(f"[{already_done + i}/{total}] {seq_id} (len={len(seq)})")
 
             try:
-                # Preflight: ESM2 context is 1024 tokens (special tokens
-                # take 2). Fail this sequence explicitly rather than
-                # letting torch surface a cryptic OOM/shape error.
-                if len(seq) > 1022:
+                # Preflight: both families publicly trained on <=1024 tokens.
+                if len(seq) > ESM_MAX_AA:
                     raise ValueError(
-                        f"sequence length {len(seq)} exceeds ESM2 1022 aa "
+                        f"sequence length {len(seq)} exceeds {ESM_MAX_AA} aa "
                         f"context window (split the sequence or use a "
                         f"long-context model)"
                     )
 
-                _, batch_strs, batch_tokens = batch_converter([(seq_id, seq)])
-                batch_tokens = batch_tokens.to(device)
-
-                with torch.no_grad():
-                    results = model(batch_tokens, repr_layers=repr_layers,
-                                    return_contacts=False)
-
-                seq_len = len(batch_strs[0])
+                layer_reps = backend.embed_one(seq_id, seq, repr_layers)
 
                 if include_mean:
-                    mean_layers = {}
-                    for layer in repr_layers:
-                        rep = results["representations"][layer][0, 1:seq_len + 1]
-                        mean_layers[f"layer_{layer}"] = rep.mean(0).cpu().numpy()
+                    mean_layers = {
+                        k: rep.mean(0).cpu().numpy()
+                        for k, rep in layer_reps.items()
+                    }
                     _save_chunk(chunks_mean / f"{seq_id}.npz", mean_layers)
 
                 if include_per_tok:
-                    tok_layers = {}
-                    for layer in repr_layers:
-                        rep = results["representations"][layer][0, 1:seq_len + 1]
-                        tok_layers[f"layer_{layer}"] = rep.cpu().numpy()
+                    tok_layers = {
+                        k: rep.cpu().numpy()
+                        for k, rep in layer_reps.items()
+                    }
                     _save_chunk(chunks_tok / f"{seq_id}.npz", tok_layers)
 
                 progress['done'] += 1
 
-            except Exception as exc:  # noqa: BLE001 — we want to continue the batch
+            except Exception as exc:  # noqa: BLE001 — keep the batch going
                 progress['failed'] += 1
-                # Surface the most recent failure on progress.json so
-                # `beak status --watch` can show it without the user
-                # tailing failed.tsv in another window.
                 progress['last_error'] = {
                     'seq_id': seq_id,
                     'type': type(exc).__name__,
