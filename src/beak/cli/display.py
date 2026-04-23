@@ -5,9 +5,37 @@ import time
 from rich.console import Group
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 from rich.text import Text
 
 from .theme import BORDER_STYLE, STATUS_STYLES, STAGE_ICONS, get_console
+
+
+def _embedding_progress_renderable(done: int, total: int, failed: int) -> Progress:
+    """Build a static Rich Progress renderable for an embedding job.
+
+    Used inside a render_status() Group; auto_refresh=False so it doesn't
+    try to start its own Live context (the outer watch_status already has
+    one). Colors the bar red if any sequences have failed.
+    """
+    bar_style = "red" if failed else "cyan"
+    finished_style = "red" if failed else "green"
+
+    progress = Progress(
+        TextColumn("  [bold]Embedding[/bold]"),
+        BarColumn(
+            bar_width=30,
+            style=bar_style,
+            complete_style=finished_style,
+            finished_style=finished_style,
+        ),
+        MofNCompleteColumn(),
+        TextColumn("[dim]{task.percentage:>3.0f}%[/dim]"),
+        auto_refresh=False,
+        expand=False,
+    )
+    progress.add_task("embedding", total=total, completed=done)
+    return progress
 
 
 def render_status(info: dict) -> Group:
@@ -67,14 +95,18 @@ def render_status(info: dict) -> Group:
         total = emb.get("total", 0)
         failed = emb.get("failed", 0)
         current = emb.get("current")
-        pct = (done / total * 100) if total else 0
+
         parts.append(Text(""))
-        summary = f"  [bold]{done}/{total}[/bold] sequences embedded  ·  [dim]{pct:.1f}%[/dim]"
+        parts.append(_embedding_progress_renderable(done, total, failed))
+
+        # Meta line: failure count + current sequence (if running)
+        meta_bits = []
         if failed:
-            summary += f"  ·  [red]{failed} failed[/red]"
-        parts.append(Text.from_markup(summary))
+            meta_bits.append(f"[red]{failed} failed[/red]")
         if current and status == "RUNNING":
-            parts.append(Text.from_markup(f"  [dim]current: {current}[/dim]"))
+            meta_bits.append(f"current: [bold]{current}[/bold]")
+        if meta_bits:
+            parts.append(Text.from_markup("  [dim]" + "  ·  ".join(meta_bits) + "[/dim]"))
 
     # Last log line
     last_line = (info.get("last_log_line") or "").strip()

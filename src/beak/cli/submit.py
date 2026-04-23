@@ -92,7 +92,11 @@ def align(input_file, job_name, algorithm, output_format):
 
 
 @main.command()
-@click.argument('input_file', type=click.Path(exists=True))
+@click.argument('input_file', type=click.Path(exists=True), required=False)
+@click.option('--from-job', 'source_job_id', default=None,
+              help='Chain off a completed search job: use its hits.fasta as '
+                   'the input, copied directly on the remote (no local '
+                   'round-trip). Mutually exclusive with INPUT_FILE.')
 @click.option('--model', '-m', default='esm2_t33_650M_UR50D',
               help='ESM model ID (default: esm2_t33_650M_UR50D; see --list-models)')
 @click.option('--name', 'job_name', default=None, help='Job name')
@@ -105,17 +109,22 @@ def align(input_file, job_name, algorithm, output_format):
 @click.option('--gpu', 'gpu_id', default=0, help='GPU device ID on the remote')
 @click.option('--list-models', is_flag=True,
               help='List available ESM models and exit')
-def embeddings(input_file, model, job_name, repr_layers,
+def embeddings(input_file, source_job_id, model, job_name, repr_layers,
                include_per_tok, no_mean, gpu_id, list_models):
     """Submit an ESM embedding-generation job.
 
-    INPUT_FILE is a local FASTA file. Results come back as pickles under
-    ~/.beak/... ; load them with `beak.embeddings.load_mean_embeddings()`
-    or via `mgr.get_results(job_id)`.
+    INPUT_FILE is a local FASTA file. Alternatively, use --from-job to
+    feed in the hits FASTA of a completed search job without downloading
+    it to your machine.
+
+    Results come back as pickles; load them with
+    `beak.embeddings.load_mean_embeddings()` or via `mgr.get_results(job_id)`.
 
     Examples:
 
         beak embeddings library.fasta -m esm2_t12_35M_UR50D
+
+        beak embeddings --from-job <search_id> -m esm2_t12_35M_UR50D
 
         beak embeddings library.fasta --per-tok --no-mean
 
@@ -128,6 +137,11 @@ def embeddings(input_file, model, job_name, repr_layers,
     if list_models:
         click.echo(ESMEmbeddings.list_models().to_string(index=False))
         return
+
+    if bool(input_file) == bool(source_job_id):
+        raise click.UsageError(
+            "Provide exactly one of INPUT_FILE or --from-job <job_id>."
+        )
 
     try:
         layers = [int(x.strip()) for x in repr_layers.split(',')]
@@ -143,16 +157,83 @@ def embeddings(input_file, model, job_name, repr_layers,
             "Nothing to output: --no-mean requires --per-tok."
         )
 
+    mgr = get_manager(job_type='embeddings')
+
+    if source_job_id:
+        remote_input = _resolve_source_job_fasta(source_job_id)
+        if job_name is None:
+            job_name = f"embeddings_from_{source_job_id}"
+        mgr.submit(
+            remote_input=remote_input,
+            model=model,
+            job_name=job_name,
+            repr_layers=layers,
+            include_mean=include_mean,
+            include_per_tok=include_per_tok,
+            gpu_id=gpu_id,
+        )
+        return
+
     if job_name is None:
         job_name = auto_name_from_pfam(input_file, 'embeddings')
 
-    mgr = get_manager(job_type='embeddings')
     mgr.submit(
-        input_file,
+        input_file=input_file,
         model=model,
         job_name=job_name,
         repr_layers=layers,
         include_mean=include_mean,
         include_per_tok=include_per_tok,
         gpu_id=gpu_id,
+    )
+
+
+def _resolve_source_job_fasta(job_id: str) -> str:
+    """Resolve a source job's output FASTA to an absolute remote path.
+
+    Supported source job types:
+      - search: ensures hits.fasta exists on the remote (runs mmseqs
+        createseqfiledb/result2flat if needed) and returns its path.
+      - align:  returns alignment.fasta (produced in-place by the
+        alignment step).
+
+    Raises click.BadParameter with an actionable message on unsupported
+    types or missing jobs.
+    """
+    import json
+    from pathlib import Path
+
+    db_path = Path.home() / ".beak" / "jobs.json"
+    if not db_path.exists():
+        raise click.BadParameter(
+            f"No job database at {db_path}. Has anything been submitted?",
+            param_hint="'--from-job'",
+        )
+    with open(db_path) as f:
+        job_db = json.load(f)
+    if job_id not in job_db:
+        raise click.BadParameter(
+            f"Unknown job id '{job_id}' (not in {db_path}).",
+            param_hint="'--from-job'",
+        )
+
+    info = job_db[job_id]
+    jtype = info.get('job_type')
+
+    if jtype == 'search':
+        from ..remote.search import MMseqsSearch
+        src_mgr = MMseqsSearch()
+        return src_mgr.ensure_remote_hits_fasta(job_id)
+
+    if jtype == 'align':
+        remote_path = info['remote_path']
+        # Default output name for align is alignment.fasta; if the user
+        # picked a non-fasta output format this will be wrong and the
+        # Docker run will fail with a clear FileNotFoundError.
+        return f"{remote_path}/alignment.fasta"
+
+    raise click.BadParameter(
+        f"Can't chain embeddings from job type '{jtype}'. "
+        f"Supported: search, align.",
+        param_hint="'--from-job'",
     )

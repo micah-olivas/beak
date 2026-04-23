@@ -74,7 +74,8 @@ class ESMEmbeddings(RemoteJobManager):
         return pd.DataFrame(models)
 
     def submit(self,
-               input_file: str,
+               input_file: Optional[str] = None,
+               remote_input: Optional[str] = None,
                model: str = 'esm2_t33_650M_UR50D',
                job_name: Optional[str] = None,
                repr_layers: List[int] = [-1],
@@ -82,10 +83,17 @@ class ESMEmbeddings(RemoteJobManager):
                include_per_tok: bool = False,
                gpu_id: int = 0) -> str:
         """
-        Submit ESM embedding generation job
+        Submit ESM embedding generation job.
+
+        Exactly one of `input_file` or `remote_input` must be provided.
 
         Args:
-            input_file: Path to local FASTA file
+            input_file: Path to a local FASTA file; uploaded to the remote
+                job directory as input.fasta.
+            remote_input: Absolute path to a FASTA file already on the
+                remote (e.g. a previous job's hits.fasta). Copied — not
+                moved — into the new job's directory, so the source job
+                stays intact.
             model: ESM model ID (use list_models() to see options)
             job_name: Optional human-readable job name
             repr_layers: Which layers to extract ([-1] = last layer)
@@ -96,6 +104,12 @@ class ESMEmbeddings(RemoteJobManager):
         Returns:
             job_id: Unique job identifier
         """
+        if (input_file is None) == (remote_input is None):
+            raise ValueError(
+                "Pass exactly one of `input_file` (local) or `remote_input` "
+                "(already-on-remote path)."
+            )
+
         if model not in self.AVAILABLE_MODELS:
             available = ', '.join(self.AVAILABLE_MODELS.keys())
             raise ValueError(f"Unknown model '{model}'. Available: {available}")
@@ -108,8 +122,23 @@ class ESMEmbeddings(RemoteJobManager):
 
         self.conn.run(f'mkdir -p {remote_job_path}', hide=True)
 
-        remote_input = f"{remote_job_path}/input.fasta"
-        self.conn.put(input_file, remote_input)
+        job_remote_input = f"{remote_job_path}/input.fasta"
+        if input_file is not None:
+            self.conn.put(input_file, job_remote_input)
+            input_record = str(input_file)
+        else:
+            # Copy rather than move: source job dir stays intact.
+            check = self.conn.run(
+                f'[ -f {remote_input} ] && echo OK || echo MISSING',
+                hide=True, warn=True,
+            )
+            if check.stdout.strip() != 'OK':
+                raise FileNotFoundError(
+                    f"Remote FASTA not found on {self.conn.host}: {remote_input}"
+                )
+            self.conn.run(f'cp {remote_input} {job_remote_input}', hide=True)
+            input_record = f"remote:{remote_input}"
+        remote_input = job_remote_input  # used by the job script below
 
         job_script = self._generate_job_script(
             remote_job_path, remote_input, model, repr_layers,
@@ -134,7 +163,7 @@ class ESMEmbeddings(RemoteJobManager):
             'job_type': 'embeddings',
             'name': job_name,
             'model': model,
-            'input_file': str(input_file),
+            'input_file': input_record,
             'remote_path': remote_job_path,
             'submitted_at': datetime.now().isoformat(),
             'status': 'SUBMITTED',

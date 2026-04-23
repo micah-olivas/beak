@@ -256,6 +256,56 @@ rm -rf {remote_job_path}/tmp
 
         return job_id
 
+    def ensure_remote_hits_fasta(self, job_id: str) -> str:
+        """Ensure the hits FASTA exists on the remote for this search job.
+
+        Runs `mmseqs createseqfiledb` + `result2flat` if the hits FASTA
+        isn't already materialized. Returns the absolute remote path.
+
+        Used by downstream commands (e.g. `beak embeddings --from-job`)
+        that want to chain off a completed search without round-tripping
+        sequences to the client.
+        """
+        status_info = self.status(job_id)
+        if status_info['status'] != 'COMPLETED':
+            raise ValueError(
+                f"Source search job {job_id} is not COMPLETED "
+                f"(status: {status_info['status']})"
+            )
+
+        job_db = self._load_job_db()
+        remote_path = job_db[job_id]['remote_path']
+        remote_fasta = f"{remote_path}/hits.fasta"
+
+        check = self.conn.run(
+            f'[ -f {remote_fasta} ] && echo OK || echo MISSING',
+            hide=True, warn=True,
+        )
+        if check.stdout.strip() == 'OK':
+            return remote_fasta
+
+        db_path = job_db[job_id].get('database_path')
+        if not db_path:
+            raise RuntimeError(
+                f"Source search job {job_id} has no 'database_path' recorded; "
+                f"cannot rebuild hits.fasta."
+            )
+
+        print(f"Building hits.fasta for source job {job_id} on the remote...")
+        cmd = f"""
+set -e
+mmseqs createseqfiledb {db_path} {remote_path}/resultDB {remote_path}/fastaDB
+mmseqs result2flat {db_path} {db_path} {remote_path}/fastaDB {remote_fasta} --use-fasta-header
+rm -f {remote_path}/fastaDB*
+"""
+        result = self.conn.run(cmd, hide=True, warn=True)
+        if not result.ok:
+            raise RuntimeError(
+                f"Failed to build hits.fasta on remote for {job_id}:\n"
+                f"{result.stderr}"
+            )
+        return remote_fasta
+
     def get_results(self,
                 job_id: str,
                 parse: bool = True,
@@ -296,19 +346,7 @@ rm -rf {remote_job_path}/tmp
         if download_sequences:
             fasta_file = project_dir / "hits.fasta"
             if not fasta_file.exists():
-                db_path = job_db[job_id]['database_path']
-                remote_fasta = f"{remote_path}/hits.fasta"
-
-                cmd = f"""
-set -e
-mmseqs createseqfiledb {db_path} {remote_path}/resultDB {remote_path}/fastaDB
-mmseqs result2flat {db_path} {db_path} {remote_path}/fastaDB {remote_fasta} --use-fasta-header
-rm -f {remote_path}/fastaDB*
-"""
-                result = self.conn.run(cmd, warn=True, hide=False)
-                if not result.ok:
-                    raise RuntimeError("Failed to extract sequences")
-
+                remote_fasta = self.ensure_remote_hits_fasta(job_id)
                 self.conn.get(remote_fasta, str(fasta_file))
 
                 with open(fasta_file) as f:

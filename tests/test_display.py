@@ -104,3 +104,89 @@ class TestRenderStatus:
         assert "Step 1: search" in output
         assert "Step 2: taxonomy" in output
         assert "Step 3: align" in output
+
+
+class TestEmbeddingProgress:
+    def test_bar_shows_m_of_n(self):
+        info = {
+            "job_id": "emb1",
+            "name": "embeddings_run",
+            "status": "RUNNING",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 42, "total": 100, "failed": 0, "current": "P12345",
+            },
+        }
+        output = _capture(info)
+        assert "Embedding" in output
+        assert "42/100" in output   # MofNCompleteColumn
+        assert "42%" in output      # percentage column
+
+    def test_current_sequence_shown_when_running(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "RUNNING",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 1, "total": 5, "failed": 0, "current": "my_seq1",
+            },
+        }
+        output = _capture(info)
+        assert "my_seq1" in output
+        assert "current:" in output
+
+    def test_current_sequence_hidden_when_terminal(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "COMPLETED",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 5, "total": 5, "failed": 0, "current": None,
+            },
+        }
+        output = _capture(info)
+        assert "5/5" in output
+        assert "current:" not in output
+
+    def test_failure_count_rendered(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "RUNNING",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 3, "total": 10, "failed": 2, "current": "seqX",
+            },
+        }
+        output = _capture(info)
+        assert "2 failed" in output
+
+    def test_progress_block_omitted_when_total_zero(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "RUNNING",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 0, "total": 0, "failed": 0, "current": None,
+            },
+        }
+        output = _capture(info)
+        # No progress bar / m-of-n should render for total=0
+        assert "Embedding" not in output or "0/0" not in output
+
+    def test_full_progress_shows_100(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "COMPLETED",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 100, "total": 100, "failed": 0, "current": None,
+            },
+        }
+        output = _capture(info)
+        assert "100/100" in output
+        assert "100%" in output
