@@ -108,6 +108,16 @@ def render_status(info: dict) -> Group:
         if meta_bits:
             parts.append(Text.from_markup("  [dim]" + "  ·  ".join(meta_bits) + "[/dim]"))
 
+        # Most-recent per-sequence error, when we've got one. Truncated
+        # to keep the watch view tidy; failed.tsv has the full set.
+        last_err = emb.get("last_error")
+        if last_err:
+            msg = (last_err.get("message") or "")[:120]
+            parts.append(Text.from_markup(
+                f"  [red]last error[/red] ([dim]{last_err.get('seq_id', '?')}[/dim]): "
+                f"{last_err.get('type', '?')}: {msg}"
+            ))
+
     # Last log line
     last_line = (info.get("last_log_line") or "").strip()
     if last_line and status == "RUNNING":

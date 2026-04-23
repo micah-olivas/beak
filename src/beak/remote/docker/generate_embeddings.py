@@ -162,6 +162,16 @@ def generate_embeddings(
             _log(f"[{already_done + i}/{total}] {seq_id} (len={len(seq)})")
 
             try:
+                # Preflight: ESM2 context is 1024 tokens (special tokens
+                # take 2). Fail this sequence explicitly rather than
+                # letting torch surface a cryptic OOM/shape error.
+                if len(seq) > 1022:
+                    raise ValueError(
+                        f"sequence length {len(seq)} exceeds ESM2 1022 aa "
+                        f"context window (split the sequence or use a "
+                        f"long-context model)"
+                    )
+
                 _, batch_strs, batch_tokens = batch_converter([(seq_id, seq)])
                 batch_tokens = batch_tokens.to(device)
 
@@ -189,6 +199,14 @@ def generate_embeddings(
 
             except Exception as exc:  # noqa: BLE001 — we want to continue the batch
                 progress['failed'] += 1
+                # Surface the most recent failure on progress.json so
+                # `beak status --watch` can show it without the user
+                # tailing failed.tsv in another window.
+                progress['last_error'] = {
+                    'seq_id': seq_id,
+                    'type': type(exc).__name__,
+                    'message': str(exc)[:500],
+                }
                 _record_failure(failed_path, seq_id, exc)
                 _log(f"  ! failed: {type(exc).__name__}: {exc}")
                 traceback.print_exc(file=sys.stdout)

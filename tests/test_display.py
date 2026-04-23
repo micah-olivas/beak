@@ -177,6 +177,40 @@ class TestEmbeddingProgress:
         # No progress bar / m-of-n should render for total=0
         assert "Embedding" not in output or "0/0" not in output
 
+    def test_last_error_rendered_when_present(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "RUNNING",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 3, "total": 10, "failed": 1, "current": "seqX",
+                "last_error": {
+                    "seq_id": "seqBad",
+                    "type": "ValueError",
+                    "message": "sequence length 2048 exceeds ESM2 1022 aa context window",
+                },
+            },
+        }
+        output = _capture(info)
+        assert "last error" in output
+        assert "seqBad" in output
+        assert "ValueError" in output
+        assert "2048" in output
+
+    def test_last_error_omitted_when_absent(self):
+        info = {
+            "job_id": "emb1",
+            "name": "emb",
+            "status": "RUNNING",
+            "job_type": "embeddings",
+            "embedding_progress": {
+                "done": 3, "total": 10, "failed": 0, "current": "seqX",
+            },
+        }
+        output = _capture(info)
+        assert "last error" not in output
+
     def test_full_progress_shows_100(self):
         info = {
             "job_id": "emb1",

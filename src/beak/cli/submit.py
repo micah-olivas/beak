@@ -69,6 +69,24 @@ def _fasta_stats(path) -> tuple:
     return n_seqs, total_len, max_len, (min_len or 0)
 
 
+def _count_long_sequences(path, max_len: int) -> int:
+    """Count FASTA records whose sequence exceeds max_len residues."""
+    n_long = 0
+    current_len = 0
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith('>'):
+                if current_len > max_len:
+                    n_long += 1
+                current_len = 0
+            else:
+                current_len += len(line)
+        if current_len > max_len:
+            n_long += 1
+    return n_long
+
+
 def _estimate_embedding_bytes(n_seqs: int, total_len: int, model: str,
                               n_layers: int, include_mean: bool,
                               include_per_tok: bool) -> int:
@@ -261,6 +279,7 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
             job_name = f"embeddings_from_{source_job_id}"
         mgr.submit(
             remote_input=remote_input,
+            source_job_id=source_job_id,
             model=model,
             job_name=job_name,
             repr_layers=layers,
@@ -278,6 +297,20 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
         f"Input: {n_seqs:,} sequences "
         f"(avg {avg_len} aa, min {min_len}, max {max_len})"
     )
+
+    # ESM2's context window is 1024 tokens (1022 residues after the
+    # CLS/EOS tokens). Sequences longer than that will fail per-seq
+    # inside the container — the batch will keep going, but the user
+    # should know up front.
+    ESM_MAX_AA = 1022
+    if max_len > ESM_MAX_AA:
+        n_long = _count_long_sequences(input_file, ESM_MAX_AA)
+        click.echo(
+            f"  [yellow]⚠  {n_long} sequence(s) exceed ESM's "
+            f"{ESM_MAX_AA} aa limit and will fail "
+            f"per-sequence inside the container "
+            f"(see failed.tsv after the job finishes).[/yellow]"
+        )
 
     est_bytes = _estimate_embedding_bytes(
         n_seqs, total_len, model, len(layers), include_mean, include_per_tok,
@@ -348,10 +381,19 @@ def _resolve_source_job_fasta(job_id: str) -> str:
 
     if jtype == 'align':
         remote_path = info['remote_path']
-        # Default output name for align is alignment.fasta; if the user
-        # picked a non-fasta output format this will be wrong and the
-        # Docker run will fail with a clear FileNotFoundError.
-        return f"{remote_path}/alignment.fasta"
+        # Respect the output format the align job was submitted with,
+        # not a hardcoded .fasta. The submission stashes it on the
+        # job record directly; older records fall back to the default.
+        params = info.get('parameters', {}) or {}
+        fmt = info.get('output_format') or params.get('output_format', 'fasta')
+        if fmt != 'fasta':
+            raise click.BadParameter(
+                f"Source align job {job_id} has output_format={fmt!r}, which "
+                f"isn't FASTA. ESM embeddings need FASTA input. Re-run the "
+                f"alignment with --format fasta, or pass a FASTA-producing job.",
+                param_hint="'--from-job'",
+            )
+        return f"{remote_path}/alignment.{fmt}"
 
     if jtype == 'pipeline':
         return _resolve_pipeline_fasta(info)

@@ -157,6 +157,7 @@ class ESMEmbeddings(RemoteJobManager):
     def submit(self,
                input_file: Optional[str] = None,
                remote_input: Optional[str] = None,
+               source_job_id: Optional[str] = None,
                model: str = 'esm2_t33_650M_UR50D',
                job_name: Optional[str] = None,
                repr_layers: List[int] = [-1],
@@ -175,6 +176,9 @@ class ESMEmbeddings(RemoteJobManager):
                 remote (e.g. a previous job's hits.fasta). Copied — not
                 moved — into the new job's directory, so the source job
                 stays intact.
+            source_job_id: When `remote_input` came from another beak
+                job, pass its id here so the new job's record tracks
+                the lineage (jobs.json[<new_id>]['source_job_id']).
             model: ESM model ID (use list_models() to see options)
             job_name: Optional human-readable job name
             repr_layers: Which layers to extract ([-1] = last layer)
@@ -253,6 +257,7 @@ class ESMEmbeddings(RemoteJobManager):
             'name': job_name,
             'model': model,
             'input_file': input_record,
+            'source_job_id': source_job_id,
             'remote_path': remote_job_path,
             'submitted_at': datetime.now().isoformat(),
             'status': 'SUBMITTED',
@@ -392,6 +397,7 @@ fi
                     'failed': p.get('failed', 0),
                     'current': p.get('current'),
                     'model': p.get('model'),
+                    'last_error': p.get('last_error'),
                 }
         return info
 

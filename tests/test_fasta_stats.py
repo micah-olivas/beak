@@ -7,6 +7,7 @@ from beak.cli.submit import (
     _fasta_stats,
     _estimate_embedding_bytes,
     _humanize_bytes,
+    _count_long_sequences,
 )
 
 
@@ -108,6 +109,34 @@ class TestEstimateEmbeddingBytes:
             100, 10_000, 'esm2_t12_35M_UR50D', 1, False, False,
         )
         assert b == 0
+
+
+class TestCountLongSequences:
+    def test_none_too_long(self, tmp_path):
+        p = _write_fasta(tmp_path, ">a\nACDE\n>b\nFGHI\n")
+        assert _count_long_sequences(p, max_len=100) == 0
+
+    def test_detects_single_long_sequence(self, tmp_path):
+        p = _write_fasta(tmp_path,
+                         ">short\nACDE\n>long\n" + "A" * 1100 + "\n")
+        assert _count_long_sequences(p, max_len=1022) == 1
+
+    def test_detects_multiple_long_sequences(self, tmp_path):
+        p = _write_fasta(tmp_path,
+                         ">a\n" + "A" * 2000 + "\n"
+                         ">b\n" + "A" * 500 + "\n"
+                         ">c\n" + "A" * 1500 + "\n")
+        assert _count_long_sequences(p, max_len=1022) == 2
+
+    def test_boundary_exact_length_not_counted(self, tmp_path):
+        p = _write_fasta(tmp_path, ">a\n" + "A" * 1022 + "\n")
+        assert _count_long_sequences(p, max_len=1022) == 0
+
+    def test_multiline_sequence_summed_correctly(self, tmp_path):
+        # 50 + 50 + 50 = 150 > 100
+        p = _write_fasta(tmp_path,
+                         ">a\n" + "A" * 50 + "\n" + "A" * 50 + "\n" + "A" * 50 + "\n")
+        assert _count_long_sequences(p, max_len=100) == 1
 
 
 class TestHumanizeBytes:
