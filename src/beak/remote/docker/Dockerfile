@@ -16,6 +16,17 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt fair-esm biotite
 
+# EvolutionaryScale's `esm` SDK (ESM-C / ESM Cambrian) lives in its
+# own venv because it ships under the same top-level `esm` import as
+# fair-esm — installing both into the same Python silently shadows
+# whichever was installed last. Keeping fair-esm in the system Python
+# (used by the ESM2 backend) and EvolutionaryScale's package in
+# /opt/esmc-venv lets both backends coexist. `--system-site-packages`
+# inherits torch + numpy from the base image so we don't redownload
+# the CUDA build into the venv.
+RUN python -m venv --system-site-packages /opt/esmc-venv \
+    && /opt/esmc-venv/bin/pip install --no-cache-dir esm
+
 # Copy embedding generation script
 COPY generate_embeddings.py /app/
 

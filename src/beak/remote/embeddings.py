@@ -353,6 +353,14 @@ class ESMEmbeddings(RemoteJobManager):
         mean_flag = "--include-mean" if include_mean else ""
         tok_flag = "--include-per-tok" if include_per_tok else ""
 
+        # ESM-C uses EvolutionaryScale's `esm` SDK, which lives in a
+        # separate venv inside the container so it doesn't collide
+        # with fair-esm's `esm` import. Dispatch the right Python.
+        if model.startswith("esmc_") or "/esmc" in model.lower():
+            container_python = "/opt/esmc-venv/bin/python"
+        else:
+            container_python = "python"
+
         # set -o pipefail is critical: without it, `exec | tee` swallows the
         # exec exit code (tee is always 0) and the script wrongly writes
         # COMPLETED when the container exec actually failed.
@@ -385,7 +393,7 @@ if [ "$READY" != "true" ]; then
 fi
 
 set +e
-docker compose --project-name {project_name} exec -T embeddings python /app/generate_embeddings.py \\
+docker compose --project-name {project_name} exec -T embeddings {container_python} /app/generate_embeddings.py \\
   --input {remote_input} \\
   --output {output_dir} \\
   --model {model} \\

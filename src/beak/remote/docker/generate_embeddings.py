@@ -128,52 +128,82 @@ class Esm2Backend:
 
 
 class EsmCBackend:
-    """Loads ESM-C via HuggingFace transformers + trust_remote_code.
+    """Loads ESM-C via EvolutionaryScale's `esm` SDK.
 
-    Picking `transformers` over EvolutionaryScale's `esm` package avoids a
-    PyPI conflict with `fair-esm` (both own the top-level `esm` import),
-    so ESM2 + ESM-C can coexist in the same container.
+    Earlier versions of this file tried `transformers.AutoModel` with
+    `trust_remote_code=True` to dodge a PyPI name-collision with
+    fair-esm (both publish a top-level `esm` import). That path never
+    worked: the EvolutionaryScale repos on HuggingFace ship the raw
+    weights only, not transformers-compatible modeling code, so the
+    AutoModel call failed for everyone who tried it.
+
+    The supported loader is the SDK itself — installed in a separate
+    venv inside the container (`/opt/esmc-venv`) so it can coexist
+    with fair-esm in the system Python without name conflict. This
+    backend is invoked from THAT venv (see `_make_backend` dispatch in
+    `_generate_job_script`), not from the system Python.
     """
 
     name = 'esmc'
 
-    # Short aliases -> HF hub model IDs. Users can still pass a full
-    # "org/name" path and it will be used verbatim.
-    HF_IDS = {
-        'esmc_300m': 'EvolutionaryScale/esmc_300m_2024_12',
-        'esmc_600m': 'EvolutionaryScale/esmc_600m_2024_12',
+    # Short aliases -> SDK model identifiers.
+    SDK_IDS = {
+        'esmc_300m': 'esmc_300m',
+        'esmc_600m': 'esmc_600m',
     }
 
     def __init__(self, model_name: str, gpu_id: int):
         import torch
-        from transformers import AutoModel, AutoTokenizer
 
-        hf_id = self.HF_IDS.get(model_name, model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-        self.model = AutoModel.from_pretrained(hf_id, trust_remote_code=True)
+        sdk_id = self.SDK_IDS.get(model_name, model_name)
+        try:
+            from esm.models.esmc import ESMC
+            from esm.sdk.api import ESMProtein, LogitsConfig
+        except ImportError as e:
+            raise RuntimeError(
+                "ESM-C requires EvolutionaryScale's `esm` SDK. The "
+                "container should have it pre-installed at "
+                "/opt/esmc-venv; if you're running this script from "
+                "the system Python that's the bug — dispatch must "
+                "use the venv interpreter for esmc_* models. "
+                f"Original ImportError: {e}"
+            ) from e
+
         self.device = torch.device(
             f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu'
         )
-        self.model = self.model.to(self.device).eval()
+        self.model = ESMC.from_pretrained(sdk_id).to(self.device).eval()
         self._torch = torch
+        self._ESMProtein = ESMProtein
+        self._LogitsConfig = LogitsConfig
 
     @property
     def num_layers(self) -> int:
-        return self.model.config.num_hidden_layers
+        # The ESMC class exposes its transformer stack as
+        # `self.transformer.blocks` (a ModuleList). Length = block count.
+        return len(self.model.transformer.blocks)
 
     def embed_one(self, seq_id: str, seq: str, repr_layers: list) -> dict:
-        inputs = self.tokenizer(
-            seq, return_tensors='pt', add_special_tokens=True,
-        ).to(self.device)
+        protein = self._ESMProtein(sequence=seq)
+        encoded = self.model.encode(protein)
         with self._torch.no_grad():
-            out = self.model(**inputs, output_hidden_states=True)
+            out = self.model.logits(
+                encoded,
+                self._LogitsConfig(
+                    sequence=False,
+                    return_embeddings=True,
+                    return_hidden_states=True,
+                ),
+            )
 
-        # transformers returns hidden_states as a tuple of length
-        # num_layers + 1 (index 0 = initial embedding, index N = after
-        # block N). We slice off CLS/EOS to match the ESM2 convention.
+        # The SDK returns hidden_states as a tensor of shape
+        # [num_layers + 1, n_tokens, hidden_dim] (layer 0 = initial
+        # embedding, layer L = after block L). Slice off the leading
+        # CLS and trailing EOS to match the ESM2 per-residue layout.
+        hs = out.hidden_states  # [L+1, T, D]
         seq_len = len(seq)
         return {
-            f"layer_{L}": out.hidden_states[L][0, 1:seq_len + 1]
+            f"layer_{L}": hs[L, 1:seq_len + 1]
             for L in repr_layers
         }
 

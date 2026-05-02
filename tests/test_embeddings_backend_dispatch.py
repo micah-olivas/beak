@@ -76,12 +76,20 @@ class TestMakeBackend:
             gen._make_backend('', gpu_id=0)
 
 
-class TestEsmCBackendHfIdMap:
-    def test_short_aliases_defined(self):
-        assert 'esmc_300m' in gen.EsmCBackend.HF_IDS
-        assert 'esmc_600m' in gen.EsmCBackend.HF_IDS
+class TestEsmCBackendSdkIdMap:
+    """The transformers-based loader was abandoned — see ESM-C SDK
+    notes in EsmCBackend. The SDK takes short identifiers like
+    "esmc_300m" directly, so the alias map is now an identity mapping
+    by default but stays as a dict so users can override per-model."""
 
-    def test_aliases_map_to_evolutionaryscale_hub_paths(self):
-        for alias, hf_id in gen.EsmCBackend.HF_IDS.items():
-            assert hf_id.startswith('EvolutionaryScale/')
-            assert 'esmc' in hf_id.lower()
+    def test_short_aliases_defined(self):
+        assert 'esmc_300m' in gen.EsmCBackend.SDK_IDS
+        assert 'esmc_600m' in gen.EsmCBackend.SDK_IDS
+
+    def test_aliases_are_sdk_short_names(self):
+        # The EvolutionaryScale SDK loads via short names like
+        # "esmc_300m"; HuggingFace org/name paths are not supported by
+        # ESMC.from_pretrained.
+        for alias, sdk_id in gen.EsmCBackend.SDK_IDS.items():
+            assert sdk_id.startswith('esmc_')
+            assert '/' not in sdk_id
