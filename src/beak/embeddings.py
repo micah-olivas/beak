@@ -270,6 +270,41 @@ def plot_pca(
     return fig, ax, pcs
 
 
+def load_hit_taxonomy(path: Union[str, Path]) -> pd.DataFrame:
+    """Load a hits_taxonomy.tsv produced by search/convertalis.
+
+    The TSV format (written by ``mmseqs convertalis --format-output
+    target,taxid,taxname,taxlineage``) is:
+
+        target    taxid    organism    lineage
+
+    We return a DataFrame indexed by ``target`` with the parsed rank
+    columns appended: domain, kingdom, phylum, class, order, family,
+    genus, species. The index aligns with ``load_mean_embeddings`` /
+    ``load_per_token_embeddings`` output, so it can be passed directly
+    to ``plot_pca(df, color=tax['domain'])``.
+
+    Returns an empty DataFrame if the file is missing or empty (the
+    target DB didn't have taxonomy).
+    """
+    p = Path(path)
+    if not p.exists() or p.stat().st_size == 0:
+        return pd.DataFrame()
+
+    # Late import — keeps beak.embeddings importable without hitting
+    # the remote package if the user only needs the loaders.
+    from .remote.taxonomy import parse_lineage_df
+
+    df = pd.read_csv(
+        p, sep='\t',
+        names=['target', 'taxid', 'organism', 'lineage'],
+        dtype={'taxid': 'Int64'},
+    )
+    df = df.drop_duplicates(subset='target', keep='first').reset_index(drop=True)
+    df = parse_lineage_df(df)
+    return df.set_index('target')
+
+
 def load_embeddings(
     path: Union[str, Path],
     layer: Optional[Union[int, str]] = None,

@@ -237,6 +237,12 @@ class ESMEmbeddings(RemoteJobManager):
         remote_job_path = f"{self.remote_job_dir}/{job_id}"
 
         self.conn.run(f'mkdir -p {remote_job_path}', hide=True)
+        # Embeddings are written under {remote_job_path}/embeddings/ by
+        # generate_embeddings.py. Pre-create it so we can stage the
+        # inherited taxonomy TSV alongside the pickles — it'll ride back
+        # in the results tarball automatically.
+        embeddings_dir = f"{remote_job_path}/embeddings"
+        self.conn.run(f'mkdir -p {embeddings_dir}', hide=True)
 
         job_remote_input = f"{remote_job_path}/input.fasta"
         if input_file is not None:
@@ -254,6 +260,12 @@ class ESMEmbeddings(RemoteJobManager):
                 )
             self.conn.run(f'cp {remote_input} {job_remote_input}', hide=True)
             input_record = f"remote:{remote_input}"
+
+            # Carry hit taxonomy forward from the source search job so
+            # downstream plotting (e.g. PCA colored by domain) has it
+            # locally, without a second network round-trip from the user.
+            if source_job_id:
+                self._inherit_hit_taxonomy(source_job_id, embeddings_dir)
         remote_input = job_remote_input  # used by the job script below
 
         job_script = self._generate_job_script(
@@ -298,6 +310,38 @@ class ESMEmbeddings(RemoteJobManager):
         print(f"✓ Submitted {job_name} → {model_info['name']} ({job_id})")
 
         return job_id
+
+    def _inherit_hit_taxonomy(self, source_job_id: str,
+                              dest_embeddings_dir: str) -> None:
+        """Copy the source job's hits_taxonomy.tsv into this embeddings dir.
+
+        Best-effort: if the source is a search whose target DB was a
+        seqTaxDB, we attempt (and cache) the taxonomy extraction via
+        :meth:`MMseqsSearch.ensure_remote_hits_taxonomy`. Silent no-op
+        otherwise — the caller hasn't asked for it, we just set them
+        up for success if it's available.
+        """
+        job_db = self._load_job_db()
+        src = job_db.get(source_job_id)
+        if not src or src.get('job_type') != 'search':
+            return  # Only search sources carry hit taxonomy today.
+
+        try:
+            from .search import MMseqsSearch
+            src_mgr = MMseqsSearch(connection=self.conn)
+            remote_tsv = src_mgr.ensure_remote_hits_taxonomy(source_job_id)
+        except Exception as exc:  # noqa: BLE001 — taxonomy is opportunistic
+            print(f"  (couldn't inherit taxonomy from {source_job_id}: {exc})")
+            return
+
+        if not remote_tsv:
+            return
+
+        self.conn.run(
+            f'cp {remote_tsv} {dest_embeddings_dir}/hits_taxonomy.tsv',
+            hide=True, warn=True,
+        )
+        print(f"  Inherited hit taxonomy from source job {source_job_id}")
 
     def _generate_job_script(self, remote_job_path, remote_input, model,
                         repr_layers, include_mean, include_per_tok, gpu_id):

@@ -9,6 +9,16 @@
       "loader": "load_growth_temps()",
       "size_mb": 4.7,
       "n_organisms": 21500
+    },
+    {
+      "name": "metatraits",
+      "description": "~140 harmonised organism trait columns across 2.2M genomes (BacDive + BV-BRC + JGI IMG + GOLD), with NCBI/GTDB tax mapping.",
+      "version": "2026.0",
+      "source": "https://metatraits.embl.de",
+      "citation": "metaTraits, EMBL 2026. https://metatraits.embl.de",
+      "loader": "load_metatraits()",
+      "url_env": "BEAK_METATRAITS_URL",
+      "license": "CC-BY-SA"
     }
   ]
 }

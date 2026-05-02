@@ -7,6 +7,80 @@ from typing import Optional, Dict
 from .base import RemoteJobManager
 
 
+# MMseqs2 lineage rank-code → our column name.
+_LINEAGE_RANK_CODES = {
+    '-': 'unranked',
+    'd': 'superkingdom',
+    'k': 'domain',
+    'p': 'phylum',
+    'c': 'class',
+    'o': 'order',
+    'f': 'family',
+    'g': 'genus',
+    's': 'species',
+}
+_LINEAGE_RANK_COLUMNS = [
+    'domain', 'kingdom', 'phylum', 'class',
+    'order', 'family', 'genus', 'species',
+]
+
+
+def _parse_lineage_string(lineage_str):
+    """Parse a single MMseqs2 lineage string ("d_Bacteria;p_...") into a dict.
+
+    Falls back to keyword-based domain inference for strings that lack
+    the `d_` prefix (some databases only provide the raw NCBI lineage).
+    """
+    if pd.isna(lineage_str) or not lineage_str:
+        return {}
+
+    taxonomy = {}
+
+    # Lightweight domain inference first — handles lineages without a
+    # 'd_' prefix (e.g. "cellular organisms; Bacteria; ...").
+    low = lineage_str.lower()
+    if 'bacteria' in low and 'archaea' not in low:
+        taxonomy['domain'] = 'Bacteria'
+    elif 'archaea' in low:
+        taxonomy['domain'] = 'Archaea'
+    elif 'eukaryota' in low:
+        taxonomy['domain'] = 'Eukaryota'
+
+    for part in lineage_str.split(';'):
+        part = part.strip()
+        if '_' not in part:
+            continue
+        rank_code, name = part.split('_', 1)
+        if not name:
+            continue
+
+        if rank_code == 'k':
+            taxonomy.setdefault('domain', name)
+            taxonomy['kingdom'] = name
+        elif rank_code in _LINEAGE_RANK_CODES:
+            rank_name = _LINEAGE_RANK_CODES[rank_code]
+            if rank_name != 'unranked':
+                taxonomy[rank_name] = name
+
+    return taxonomy
+
+
+def parse_lineage_df(df: pd.DataFrame, lineage_col: str = 'lineage') -> pd.DataFrame:
+    """Explode a column of MMseqs2 lineage strings into structured rank columns.
+
+    Adds (or overwrites) the columns 'domain', 'kingdom', 'phylum',
+    'class', 'order', 'family', 'genus', 'species'. Missing ranks are
+    None. Input is modified in place and also returned for chaining.
+    """
+    if lineage_col not in df.columns:
+        raise KeyError(f"{lineage_col!r} column not in DataFrame")
+
+    parsed = df[lineage_col].apply(_parse_lineage_string)
+    for rank in _LINEAGE_RANK_COLUMNS:
+        df[rank] = parsed.apply(lambda d, r=rank: d.get(r))
+    return df
+
+
 class MMseqsTaxonomy(RemoteJobManager):
     """MMseqs2 taxonomy assignment for remote execution"""
 
@@ -229,65 +303,15 @@ rm -rf {remote_job_path}/tmp {remote_job_path}/queryDB* {remote_job_path}/taxono
         )
 
     def parse_taxonomy_lineage(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Parse the taxonomic lineage string into separate columns"""
+        """Parse the taxonomic lineage string into separate columns.
+
+        Thin wrapper around :func:`parse_lineage_df` retained for
+        backwards compatibility with existing callers.
+        """
         if 'lineage' not in df.columns:
             print("No lineage column found. Run with --tax-lineage 1")
             return df
-
-        def parse_lineage(lineage_str):
-            if pd.isna(lineage_str) or lineage_str == '':
-                return {}
-
-            ranks = {
-                '-': 'unranked',
-                'd': 'superkingdom',
-                'k': 'domain',
-                'p': 'phylum',
-                'c': 'class',
-                'o': 'order',
-                'f': 'family',
-                'g': 'genus',
-                's': 'species'
-            }
-
-            taxonomy = {}
-            parts = lineage_str.split(';')
-
-            full_lineage = lineage_str.lower()
-            if 'bacteria' in full_lineage and 'archaea' not in full_lineage:
-                taxonomy['domain'] = 'Bacteria'
-            elif 'archaea' in full_lineage:
-                taxonomy['domain'] = 'Archaea'
-            elif 'eukaryota' in full_lineage:
-                taxonomy['domain'] = 'Eukaryota'
-
-            for part in parts:
-                part = part.strip()
-                if '_' in part:
-                    rank_code, name = part.split('_', 1)
-
-                    if not name or name == '':
-                        continue
-
-                    if rank_code == 'k':
-                        if 'domain' not in taxonomy:
-                            taxonomy['domain'] = name
-                        taxonomy['kingdom'] = name
-                    elif rank_code in ranks:
-                        rank_name = ranks[rank_code]
-                        if rank_name != 'unranked':
-                            taxonomy[rank_name] = name
-
-            return taxonomy
-
-        lineage_data = df['lineage'].apply(parse_lineage)
-
-        rank_columns = ['domain', 'kingdom', 'phylum', 'class', 'order', 'family', 'genus', 'species']
-
-        for rank in rank_columns:
-            df[rank] = lineage_data.apply(lambda x: x.get(rank, None))
-
-        return df
+        return parse_lineage_df(df)
 
     def get_results(self, job_id: str, parse: bool = True, parse_lineage: bool = True):
         """

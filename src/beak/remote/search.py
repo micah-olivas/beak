@@ -44,10 +44,11 @@ class MMseqsSearch(RemoteJobManager):
             }
         },
         'fast': {
-            'description': 'Fast search for close homologs',
+            'description': 'Fast search for close homologs (low sensitivity, capped hits)',
             'params': {
-                's': 4.0,
-                'e': 0.001,
+                's': 2.5,           # was 4.0 — drops cluster-explore depth
+                'e': 1e-3,
+                'max_seqs': 1000,   # cap result list per query
             }
         },
         'sensitive': {
@@ -210,6 +211,20 @@ mmseqs convertalis \\
   {remote_job_path}/results.m8 \\
   2>&1 | tee -a {remote_job_path}/mmseqs.log
 
+# Also emit per-hit taxonomy when the target is a seqTaxDB. This is a
+# pure format conversion on the existing resultDB (~seconds), so it's
+# safe to always attempt; non-taxonomy DBs just log a message and skip.
+echo "Extracting hit taxonomy (best-effort)..." >> {remote_job_path}/mmseqs.log
+mmseqs convertalis \\
+  {remote_job_path}/queryDB \\
+  {db_path} \\
+  {remote_job_path}/resultDB \\
+  {remote_job_path}/hits_taxonomy.tsv \\
+  --format-output "target,taxid,taxname,taxlineage" \\
+  >> {remote_job_path}/mmseqs.log 2>&1 \\
+  || echo "(target DB has no taxonomy; skipping hits_taxonomy.tsv)" \\
+     >> {remote_job_path}/mmseqs.log
+
 if [ $? -eq 0 ]; then
     echo "Job completed: $(date)" >> {remote_job_path}/status.txt
     echo "COMPLETED" >> {remote_job_path}/status.txt
@@ -255,6 +270,109 @@ rm -rf {remote_job_path}/tmp
         print(f"✓ Submitted {job_name} → {database} ({job_id})")
 
         return job_id
+
+    def ensure_remote_hits_taxonomy(self, job_id: str,
+                                    force: bool = False) -> Optional[str]:
+        """Ensure hits_taxonomy.tsv exists on the remote for this search.
+
+        For searches submitted before the tax-by-default change, runs
+        ``mmseqs convertalis`` with taxonomy format fields against the
+        persisted resultDB — no re-search, seconds of compute. Returns
+        the absolute remote path, or None if the target DB has no
+        taxonomy (the convertalis call failed).
+
+        Args:
+            job_id: completed search job id.
+            force: if True, re-run convertalis even if the file exists.
+        """
+        status_info = self.status(job_id)
+        if status_info['status'] != 'COMPLETED':
+            raise ValueError(
+                f"Source search job {job_id} is not COMPLETED "
+                f"(status: {status_info['status']})"
+            )
+
+        job_db = self._load_job_db()
+        remote_path = job_db[job_id]['remote_path']
+        remote_tsv = f"{remote_path}/hits_taxonomy.tsv"
+
+        if not force:
+            check = self.conn.run(
+                f'[ -s {remote_tsv} ] && echo OK || echo MISSING',
+                hide=True, warn=True,
+            )
+            if check.stdout.strip() == 'OK':
+                return remote_tsv
+
+        db_path = job_db[job_id].get('database_path')
+        if not db_path:
+            raise RuntimeError(
+                f"Source search job {job_id} has no 'database_path' recorded; "
+                f"cannot rebuild hits_taxonomy.tsv."
+            )
+
+        print(f"Building hits_taxonomy.tsv for {job_id} on the remote...")
+        result = self.conn.run(
+            f'mmseqs convertalis '
+            f'{remote_path}/queryDB '
+            f'{db_path} '
+            f'{remote_path}/resultDB '
+            f'{remote_tsv} '
+            f'--format-output target,taxid,taxname,taxlineage',
+            hide=True, warn=True,
+        )
+        if not result.ok:
+            # Target DB has no taxonomy — expected for e.g. pdb_seqres.
+            # Leave no file and return None so callers can handle this.
+            self.conn.run(f'rm -f {remote_tsv}', hide=True, warn=True)
+            print(
+                f"  (target DB at {db_path} has no taxonomy — skipping)"
+            )
+            return None
+        return remote_tsv
+
+    def get_hit_taxonomy(self, job_id: str, refresh: bool = False) -> pd.DataFrame:
+        """Return per-hit taxonomy for a completed search as a DataFrame.
+
+        Ensures the TSV exists on the remote (building if necessary),
+        downloads it to the project dir, parses it, and returns a
+        DataFrame indexed by hit accession with the columns:
+          taxid, organism, lineage,
+          domain, kingdom, phylum, class, order, family, genus, species.
+
+        If the target DB has no taxonomy, returns an empty DataFrame.
+
+        Args:
+            job_id: completed search job id.
+            refresh: if True, re-run the remote convertalis AND re-download.
+        """
+        from .taxonomy import parse_lineage_df
+
+        project_dir = self.get_project_dir(job_id)
+        if not project_dir:
+            project_dir = self.create_project(job_id, 'search')
+        local_tsv = project_dir / "hits_taxonomy.tsv"
+
+        if refresh or not local_tsv.exists():
+            remote_tsv = self.ensure_remote_hits_taxonomy(job_id, force=refresh)
+            if remote_tsv is None:
+                return pd.DataFrame()
+            self.conn.get(remote_tsv, str(local_tsv))
+
+        # If the remote convertalis silently produced an empty file we
+        # still got a local file — treat as no taxonomy.
+        if local_tsv.stat().st_size == 0:
+            return pd.DataFrame()
+
+        df = pd.read_csv(
+            local_tsv, sep='\t',
+            names=['target', 'taxid', 'organism', 'lineage'],
+            dtype={'taxid': 'Int64'},
+        )
+        df = df.drop_duplicates(subset='target', keep='first').reset_index(drop=True)
+        df = parse_lineage_df(df)
+        df = df.set_index('target')
+        return df
 
     def ensure_remote_hits_fasta(self, job_id: str) -> str:
         """Ensure the hits FASTA exists on the remote for this search job.

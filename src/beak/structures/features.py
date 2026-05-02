@@ -246,18 +246,26 @@ def _parse_ss_from_mmcif(cif_path, chain_id):
     for row in struct_conf:
         conf_type = row[0]
         beg_chain = row[1]
-        end_chain = row[3]
 
-        if not conf_type.startswith('HELX'):
-            continue
         if beg_chain != chain_id:
+            continue
+
+        # AlphaFold CIFs encode strands as `STRN`/`STRN_P` in the same
+        # `_struct_conf` table as helices. PDB-deposited files put helices
+        # here and sheets in `_struct_sheet_range` (parsed below). Cover
+        # both conventions.
+        if conf_type.startswith('HELX'):
+            code = 'H'
+        elif conf_type.startswith('STRN'):
+            code = 'E'
+        else:
             continue
 
         try:
             beg_res = int(row[2])
             end_res = int(row[4])
             for resnum in range(beg_res, end_res + 1):
-                ss_map[resnum] = 'H'
+                ss_map[resnum] = code
         except (ValueError, TypeError):
             continue
 

@@ -1,5 +1,15 @@
 """Reference datasets for sequence annotation"""
 
-from .loaders import load_growth_temps, list_datasets
+from .loaders import (
+    download_metatraits,
+    list_datasets,
+    load_growth_temps,
+    load_metatraits,
+)
 
-__all__ = ['load_growth_temps', 'list_datasets']
+__all__ = [
+    'download_metatraits',
+    'list_datasets',
+    'load_growth_temps',
+    'load_metatraits',
+]

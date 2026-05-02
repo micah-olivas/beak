@@ -18,8 +18,9 @@ from typing import Callable, List, Optional, Union
 PDBE_SIFTS_URL = "https://www.ebi.ac.uk/pdbe/api/mappings/uniprot"
 RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download"
 ALPHAFOLD_CIF_URL = (
-    "https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.cif"
+    "https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v6.cif"
 )
+ALPHAFOLD_PREDICTION_API = "https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
 
 PDBE_BATCH_SIZE = 100
 MAX_RETRIES = 3
@@ -31,6 +32,54 @@ METHOD_PRIORITY = {
     "Electron Microscopy": 2,
     "Solution NMR": 3,
 }
+
+
+def resolve_alphafold_url(uniprot_id: str, fmt: str = "cif") -> str:
+    """Resolve the canonical AlphaFold model URL via the prediction API.
+
+    Robust to model-version bumps (the API returns whatever URL is current,
+    so we don't break when v6 → v7). Falls back to a hardcoded v6 template
+    only if the API itself is unreachable.
+
+    Args:
+        uniprot_id: UniProt accession.
+        fmt: 'cif', 'pdb', or 'bcif'.
+
+    Returns:
+        Canonical model URL.
+
+    Raises:
+        FileNotFoundError: API definitively reports no model for this accession.
+        ValueError: Unsupported `fmt`.
+    """
+    if fmt not in ('cif', 'pdb', 'bcif'):
+        raise ValueError(f"Unsupported format: {fmt!r}")
+    key = f"{fmt}Url"
+
+    api_url = ALPHAFOLD_PREDICTION_API.format(uniprot_id=uniprot_id)
+    try:
+        with urllib.request.urlopen(api_url, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if not data:
+            raise FileNotFoundError(f"No AlphaFold model for {uniprot_id}")
+        url = data[0].get(key)
+        if url:
+            return url
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise FileNotFoundError(
+                f"No AlphaFold model for {uniprot_id}"
+            ) from e
+        # Other HTTP errors → fall through to template fallback
+    except (urllib.error.URLError, TimeoutError, ConnectionError,
+            json.JSONDecodeError):
+        pass
+
+    # Template fallback (network/parse error). Pinned to v6 — will need
+    # bumping if v7 lands while AF is offline. Not worth chasing.
+    if fmt == 'cif':
+        return ALPHAFOLD_CIF_URL.format(uniprot_id=uniprot_id)
+    return f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v6.{fmt}"
 
 
 def find_structures(
