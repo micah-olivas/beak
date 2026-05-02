@@ -12,12 +12,18 @@ class MMseqsSearch(RemoteJobManager):
 
     JOB_TYPE = 'search'
     LOG_FILE = 'mmseqs.log'
+    # One detection keyword per logical stage, ordered top-to-bottom by
+    # MMseqs2's pipeline order. Bare "align" is intentionally not used
+    # here — it matches the `align` subcommand invocation banner before
+    # the actual alignment work has started, which gives a misleading
+    # "Aligning" indicator while the prefilter result database is still
+    # being merged. `Calculation of alignments` is emitted by MMseqs2
+    # only when SW alignment work genuinely begins.
     LOG_OPERATIONS = [
-        ('Index table: counting k-mers', 'Counting k-mers'),
-        ('Index table: fill', 'Building index'),
-        ('Starting prefiltering scores', 'Computing scores'),
-        ('align', 'Aligning'),
-        ('convertalis', 'Finalizing'),
+        ('Index table:',              'Loading k-mer index'),
+        ('Process prefiltering step', 'Prefiltering'),
+        ('Calculation of alignments', 'Aligning hits'),
+        ('convertalis',               'Formatting results'),
     ]
 
     AVAILABLE_DBS = {

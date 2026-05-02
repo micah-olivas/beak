@@ -210,7 +210,11 @@ class TaxonomyViewerScreen(Screen):
         max_label = max(len(label) for label, _ in counts)
         label_w = min(max(8, max_label), 32)
         count_w = max(3, len(str(biggest)))
-        bar_w = max(8, width - (label_w + count_w + 12))
+        # Bars are for visual comparison, not absolute scale — capping
+        # at ~40 cells keeps wide-screen layouts from turning a single
+        # taxon row into a 130-cell streak that drowns out the labels.
+        avail = max(8, width - (label_w + count_w + 12))
+        bar_w = min(40, avail)
 
         header = (
             f"[bold cyan]Counts by {self._level}[/bold cyan]  "
@@ -262,7 +266,8 @@ class TaxonomyViewerScreen(Screen):
         # Layout: " 25-30 °C  (n=12)  ███████"
         label_w = 11  # "  25-30 °C "
         count_w = max(4, len(f"n={biggest}"))
-        bar_w = max(8, width - (label_w + count_w + 6))
+        avail = max(8, width - (label_w + count_w + 6))
+        bar_w = min(40, avail)
 
         header = (
             f"[bold cyan]Growth temperature[/bold cyan]  "
@@ -341,15 +346,23 @@ class TaxonomyViewerScreen(Screen):
             f"NA = not in metaTraits)[/dim]"
         )
         # Compact bar pair per trait: one row per trait, true|false bars
-        # share a single 0..n_total scale so traits are comparable at a glance.
+        # share a single 0..n_known scale so traits are comparable at a
+        # glance. Bar width is capped well below the panel width so the
+        # row stays compact on wide terminals.
         label_w = max(len(label) for _, label, _ in rows_to_show) + 1
-        # 4 columns: label  true_count  false_count  bar (visual ratio)
-        bar_w = max(20, width - (label_w + 18))
+        avail = max(20, width - (label_w + 22))
+        bar_w = min(40, avail)
         out = [header]
         for col, label, s in rows_to_show:
-            n_true = int((s.astype(str).str.lower() == "true").sum()
-                         + (s == True).sum())  # noqa: E712 — mixed dtype safety
-            n_false = int(s.notna().sum() - n_true)
+            # Coerce mixed object/bool dtypes through a single
+            # str-lowered path. The previous version added the bool-
+            # comparison count on top of the string-comparison count,
+            # which double-counted any row where the underlying value
+            # was a real Python `True` and produced negative `false`
+            # counts (e.g. "92 ✓ -45 ✗" on an 81-row trait table).
+            text = s.dropna().astype(str).str.strip().str.lower()
+            n_true = int((text == "true").sum())
+            n_false = int((text == "false").sum())
             n_known = n_true + n_false
             if n_known == 0:
                 continue
@@ -360,8 +373,8 @@ class TaxonomyViewerScreen(Screen):
             false_bar = "█" * false_w
             out.append(
                 f"[bold]{label.ljust(label_w)}[/bold] "
-                f"[#6BCF7F]{str(n_true).rjust(5)} ✓[/#6BCF7F] "
-                f"[#FF6B6B]{str(n_false).rjust(5)} ✗[/#FF6B6B]  "
+                f"[#6BCF7F]{str(n_true).rjust(4)} ✓[/#6BCF7F] "
+                f"[#FF6B6B]{str(n_false).rjust(4)} ✗[/#FF6B6B]  "
                 f"[#6BCF7F]{true_bar}[/#6BCF7F][#FF6B6B]{false_bar}[/#FF6B6B]"
                 f"  [dim]{n_known}/{n_total}[/dim]"
             )

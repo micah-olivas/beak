@@ -1,3 +1,4 @@
+import re
 import uuid
 import pandas as pd
 from pathlib import Path
@@ -7,25 +8,49 @@ from typing import Optional, Dict
 from .base import RemoteJobManager
 
 
-# Algorithm definitions: command template, log file, supported output formats
+# Algorithm definitions: command template, log file, supported output
+# formats, and the keyword→stage map the job-status modal walks to render
+# stage progress. Keywords are matched against log lines from newest to
+# oldest, so the most recent matching stage is shown as "active".
 ALGORITHMS = {
     'clustalo': {
         'name': 'Clustal Omega',
         'log_file': 'clustalo.log',
         'output_formats': ['fasta', 'clustal', 'msf', 'phylip', 'selex', 'stockholm', 'vienna'],
         'default_format': 'fasta',
+        'log_operations': [
+            ('Read ', 'Reading sequences'),
+            ('Calculating pairwise', 'Pairwise distances'),
+            ('Guide-tree', 'Building guide tree'),
+            ('Progressive alignment', 'Progressive alignment'),
+        ],
     },
     'mafft': {
         'name': 'MAFFT',
         'log_file': 'mafft.log',
         'output_formats': ['fasta'],
         'default_format': 'fasta',
+        'log_operations': [
+            ('Making a distance matrix', 'Building distance matrix'),
+            ('Constructing a UPGMA tree', 'Building guide tree'),
+            ('Progressive alignment', 'Progressive alignment'),
+            ('STEP', 'Progressive alignment'),
+            ('Iterative refinement', 'Iterative refinement'),
+            ('Iteration', 'Iterative refinement'),
+        ],
     },
     'muscle': {
         'name': 'MUSCLE',
         'log_file': 'muscle.log',
         'output_formats': ['fasta'],
         'default_format': 'fasta',
+        'log_operations': [
+            ('Input:', 'Reading sequences'),
+            ('HMM', 'Computing HMMs'),
+            ('UPGMA', 'Building UPGMA tree'),
+            ('Refining', 'Refining alignment'),
+            ('iter', 'Iterative refinement'),
+        ],
     },
 }
 
@@ -76,13 +101,70 @@ class Align(RemoteJobManager):
     """Multiple sequence alignment manager supporting multiple algorithms."""
 
     JOB_TYPE = 'align'
-    LOG_FILE = 'align.log'  # overridden per-job in get_results
+    LOG_FILE = 'align.log'  # fallback only — actual file resolved per-job
 
     def _list_jobs_extra_columns(self, info: Dict) -> Dict:
         return {
             'algorithm': info.get('algorithm', 'clustalo'),
             'output_format': info.get('output_format', 'fasta'),
         }
+
+    def _resolve_log_file(self, job_info: Dict) -> str:
+        """Each algorithm writes to its own log file (clustalo.log /
+        mafft.log / muscle.log). Without this, `detailed_status` tries
+        to tail `align.log`, finds nothing, and the job-status modal
+        shows only the bare status header."""
+        algo = job_info.get('algorithm', 'clustalo')
+        return ALGORITHMS.get(algo, ALGORITHMS['clustalo'])['log_file']
+
+    def _resolve_log_operations(self, job_info: Dict) -> list:
+        """Algorithm-specific stage list — used by the job-status modal
+        to render the "Stages" block."""
+        algo = job_info.get('algorithm', 'clustalo')
+        return ALGORITHMS.get(algo, ALGORITHMS['clustalo']).get('log_operations', [])
+
+    def _parse_log_progress(self, log_content: str,
+                            log_operations: Optional[list] = None) -> Dict:
+        """Extend the base parse with align-specific counters.
+
+        - Sequence count from "Read N sequences" (clustalo) / "Input: N"
+          (muscle) / explicit n_homologs is shown so users know how big
+          a problem this run is solving.
+        - MAFFT prints `STEP X / Y` during progressive alignment; we
+          surface that as the align step counter so the modal renders
+          a live progress bar.
+        """
+        progress = super()._parse_log_progress(log_content, log_operations)
+
+        if not log_content or log_content == "No log file":
+            return progress
+
+        lines = log_content.strip().split('\n')
+
+        # MAFFT progressive-alignment step counter ("STEP   12 / 38").
+        # Walk newest→oldest so the bar reflects current state.
+        step_re = re.compile(r'STEP\s+(\d+)\s*/\s*(\d+)')
+        for line in reversed(lines):
+            m = step_re.search(line)
+            if m:
+                cur, tot = int(m.group(1)), int(m.group(2))
+                if tot > 0 and cur <= tot:
+                    progress['align_step'] = cur
+                    progress['total_align_steps'] = tot
+                    progress['current_step'] = 'align'
+                    break
+
+        # Sequence count — appears once near the top of the log.
+        seq_re = re.compile(
+            r'(?:Read|Input:)\s+(\d+)\s+(?:sequences|seqs)', re.IGNORECASE
+        )
+        for line in lines[:60]:
+            m = seq_re.search(line)
+            if m:
+                progress['n_sequences'] = int(m.group(1))
+                break
+
+        return progress
 
     def submit(self,
                input_file: str,

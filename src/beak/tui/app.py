@@ -1,10 +1,34 @@
 """Top-level Textual app for beak."""
 
+import resource
+
 from textual.app import App
 
 from .screens.projects import ProjectListScreen
 
 BEAK_BLUE = "#2E86AB"
+
+
+def _raise_fd_limit() -> None:
+    """Bump the FD soft limit toward the hard cap on startup.
+
+    macOS ships with a 256 soft limit. Long-running TUI sessions that
+    poll remote jobs can plausibly hit this even without leaks (each
+    SSH transport, parquet read, and structure parse takes a few FDs).
+    Raising the soft limit to 4096 (or the hard cap, whichever is
+    smaller) gives plenty of headroom. Best-effort: silently ignore
+    failures because the harness may not allow `setrlimit`.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(4096, hard) if hard != resource.RLIM_INFINITY else 4096
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        pass
+
+
+_raise_fd_limit()
 
 
 class BeakApp(App):
@@ -53,21 +77,29 @@ class BeakApp(App):
 
     #struct-controls {{
         height: 1;
-        padding: 0 2;
+        padding: 0 1;
     }}
 
-    /* Fixed-width labels so the three Label+Select pairs line up
-       cleanly regardless of the label text length. */
-    #struct-controls Label {{
-        width: 7;
+    /* Tight 5-char label slots — fits "color"/"view" with one
+       trailing space and lets all three label+select pairs plus the
+       Export button share a single row at narrow aspect ratios. */
+    #struct-controls .ctrl-lbl {{
+        width: auto;
         padding-right: 1;
         color: $text-muted;
         content-align: right middle;
     }}
 
     #color-select, #view-select, #bg-select {{
-        width: 14;
-        margin-right: 2;
+        width: 11;
+        margin-right: 1;
+    }}
+
+    /* Push Export to the right edge of the structure column. */
+    #export-cxc-btn {{
+        margin-left: 1;
+        min-width: 8;
+        dock: right;
     }}
 
     #sequence-view {{
@@ -96,18 +128,28 @@ class BeakApp(App):
         padding: 1 2;
     }}
 
-    /* Layer modal needs room for the homologs sets table + details. */
+    /* Layer modal needs room for the homologs sets table + details.
+       Height is fixed at 90% of viewport (rather than `max-height`) so
+       cycling rows in the sets table — which changes the per-set
+       details length — doesn't make the whole modal expand and contract
+       around the cursor. The details panel lives inside a scroller that
+       absorbs the variable height. */
     LayerDetailModal #modal-body {{
-        width: 100;
-        max-height: 90%;
+        width: 120;
+        height: 90%;
+        min-height: 30;
     }}
     LayerDetailModal #sets-table {{
         height: auto;
         max-height: 12;
         margin-top: 1;
     }}
-    LayerDetailModal .set-details {{
+    LayerDetailModal #set-details-scroll {{
+        height: 1fr;
+        min-height: 10;
         margin-top: 1;
+    }}
+    LayerDetailModal .set-details {{
         padding: 0 1;
     }}
     LayerDetailModal .section-label {{

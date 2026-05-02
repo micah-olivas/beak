@@ -140,6 +140,22 @@ def differential_color(score: float, scale: float = 0.5) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+# Domain palette used by the sequence view's domain bars; we share it
+# here so structure-view residues color in lock-step with the sequence
+# view when Pfam mode is active.
+DOMAIN_PALETTE = ("#FF6B9D", "#FFA62B", "#A66DD4", "#3DCFD4", "#7DD87D")
+# Color for residues that fall outside any annotated Pfam domain.
+PFAM_NONE_COLOR = "#3A3F4A"
+
+
+def pfam_color(domain_idx: float) -> str:
+    """Map a domain index (or -1 for unannotated) to a palette color."""
+    idx = int(domain_idx)
+    if idx < 0:
+        return PFAM_NONE_COLOR
+    return DOMAIN_PALETTE[idx % len(DOMAIN_PALETTE)]
+
+
 def color_for_mode(score: float, mode: str = "plddt", midpoint: float = 50.0) -> str:
     """Single entry point to map a per-residue score to a color."""
     if mode == "conservation":
@@ -148,6 +164,8 @@ def color_for_mode(score: float, mode: str = "plddt", midpoint: float = 50.0) ->
         return sasa_color(score)
     if mode == "differential":
         return differential_color(score)
+    if mode == "pfam":
+        return pfam_color(score)
     return plddt_color(score)
 
 

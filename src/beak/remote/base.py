@@ -517,6 +517,12 @@ class RemoteJobManager:
         job_info = job_db[job_id]
         remote_path = job_info['remote_path']
 
+        # Some jobs (Align) write to a per-algorithm log file rather
+        # than the class-level LOG_FILE. Resolve it once and reuse for
+        # both the progress parse and the "Latest log" tail.
+        log_file = self._resolve_log_file(job_info)
+        log_operations = self._resolve_log_operations(job_info)
+
         # Check process
         pid = job_info['pid']
         ps_result = self.conn.run(f'ps -p {pid} -o pid=', warn=True, hide=True)
@@ -537,19 +543,19 @@ class RemoteJobManager:
 
         # Parse progress if running
         progress = {}
-        if status in ['RUNNING', 'SUBMITTED'] and self.LOG_FILE:
+        if status in ['RUNNING', 'SUBMITTED'] and log_file:
             log_result = self.conn.run(
-                f'tail -n 100 {remote_path}/{self.LOG_FILE} 2>/dev/null || echo "No log file"',
+                f'tail -n 100 {remote_path}/{log_file} 2>/dev/null || echo "No log file"',
                 hide=True, warn=True
             )
-            progress = self._parse_log_progress(log_result.stdout)
+            progress = self._parse_log_progress(log_result.stdout, log_operations)
 
         # Build stages from LOG_OPERATIONS
         stages = []
         current_op = progress.get('current_operation')
-        if self.LOG_OPERATIONS:
+        if log_operations:
             found_current = False
-            for _keyword, label in self.LOG_OPERATIONS:
+            for _keyword, label in log_operations:
                 if label == current_op:
                     stages.append({'label': label, 'state': 'active'})
                     found_current = True
@@ -561,15 +567,22 @@ class RemoteJobManager:
                 else:
                     stages.append({'label': label, 'state': 'done'})
 
-        # Get last log line for running jobs
+        # Get last *informative* log line for running jobs.
+        # MMseqs2 echoes its full parameter set near the top of each
+        # subcommand invocation — lines like "Translation mode 0",
+        # "Threads 8", "Min seq id 0.150" — which leak through a naive
+        # tail and make the modal look stuck on parameter dumps. We pull
+        # a wider window and pick the most recent line that actually
+        # describes activity (anything with a colon, a fraction, or a
+        # sentence-like form), falling back to the raw tail.
         last_log_line = None
-        if status in ['RUNNING', 'SUBMITTED'] and self.LOG_FILE:
+        if status in ['RUNNING', 'SUBMITTED'] and log_file:
             log_tail = self.conn.run(
-                f"tail -n 5 {remote_path}/{self.LOG_FILE} 2>/dev/null | "
-                r"sed 's/\x1b\[[0-9;]*m//g' | grep -v '^\s*$' | tail -n 1",
+                f"tail -n 30 {remote_path}/{log_file} 2>/dev/null | "
+                r"sed 's/\x1b\[[0-9;]*m//g' | grep -v '^\s*$'",
                 hide=True, warn=True
             )
-            last_log_line = log_tail.stdout.strip() or None
+            last_log_line = self._pick_informative_log_line(log_tail.stdout)
 
         # Update local DB
         job_info['status'] = status
@@ -589,12 +602,36 @@ class RemoteJobManager:
             **progress
         }
 
-    def _parse_log_progress(self, log_content: str) -> Dict:
-        """Parse log file for progress information"""
+    # ── Hooks for per-job log resolution ────────────────────────────
+
+    def _resolve_log_file(self, job_info: Dict) -> str:
+        """Return the log file for this specific job. Defaults to the
+        class-level LOG_FILE; subclasses override when the file name
+        depends on per-job parameters (e.g., Align picks `clustalo.log`
+        / `mafft.log` / `muscle.log` from the chosen algorithm)."""
+        return self.LOG_FILE
+
+    def _resolve_log_operations(self, job_info: Dict) -> list:
+        """Return the LOG_OPERATIONS list for this specific job. Same
+        rationale as `_resolve_log_file` — Align ships a different stage
+        list per algorithm."""
+        return self.LOG_OPERATIONS
+
+    def _parse_log_progress(self, log_content: str,
+                            log_operations: Optional[list] = None) -> Dict:
+        """Parse log file for progress information.
+
+        `log_operations` is the keyword/label list to scan for the
+        current stage. Defaults to `self.LOG_OPERATIONS` so existing
+        callers (no extra arg) keep their behavior; the modal passes
+        the per-job list resolved via `_resolve_log_operations`.
+        """
         progress = {
             'current_step': None,
             'prefilter_step': None,
             'total_prefilter_steps': None,
+            'align_step': None,
+            'total_align_steps': None,
             'current_operation': None,
         }
 
@@ -603,7 +640,7 @@ class RemoteJobManager:
 
         lines = log_content.strip().split('\n')
 
-        # Parse prefiltering step
+        # Parse prefiltering step.
         prefilter_pattern = r'Process prefiltering step (\d+) of (\d+)'
         for line in reversed(lines):
             match = re.search(prefilter_pattern, line)
@@ -613,14 +650,100 @@ class RemoteJobManager:
                 progress['current_step'] = 'prefilter'
                 break
 
-        # Determine current operation using subclass-defined operations
-        for line in reversed(lines[:50]):
-            for keyword, operation in self.LOG_OPERATIONS:
+        # Parse alignment progress. MMseqs2 prints both
+        # "[X / Y]" tick lines and "X out of Y" summary lines during
+        # the `align` subcommand; surface whichever shows up most
+        # recently so the modal can render a real percentage.
+        align_pattern = r'(\d+)\s*(?:/|of|out of)\s*(\d+)'
+        for line in reversed(lines):
+            if any(k in line for k in (
+                'Calculation of alignments',
+                'Compute Smith-Waterman alignments',
+                'aligned',
+            )):
+                continue  # banner-style lines, not counters
+            # Only treat numeric ratios as alignment progress when the
+            # nearby context says it's alignment — guards against
+            # picking up unrelated counters like "step 1 of N" prefilter
+            # lines we already parsed above.
+            if 'align' not in line.lower():
+                continue
+            match = re.search(align_pattern, line)
+            if match:
+                cur = int(match.group(1))
+                tot = int(match.group(2))
+                if tot > 0 and cur <= tot:
+                    progress['align_step'] = cur
+                    progress['total_align_steps'] = tot
+                    progress['current_step'] = 'align'
+                    break
+
+        # Determine current operation using the (possibly per-job)
+        # operation list. `lines[-50:]` reversed walks the most recent
+        # log lines from newest to oldest, so the matched stage reflects
+        # the current activity rather than something from the start of
+        # a long-running job.
+        operations = log_operations if log_operations is not None else self.LOG_OPERATIONS
+        for line in reversed(lines[-50:]):
+            for keyword, operation in operations:
                 if keyword in line:
                     progress['current_operation'] = operation
                     return progress
 
         return progress
+
+    # Lines that are pure parameter echoes — MMseqs2 dumps the resolved
+    # value of every flag at the top of each subcommand invocation
+    # ("Translation mode 0", "Threads 8", "Min seq id 0.150"). Filter
+    # them out of the "Latest log" display so the user sees real
+    # activity instead of the most recent parameter dump.
+    #
+    # Constraints, tightened from a looser earlier version that
+    # over-matched lines like "Number aligned 12345":
+    #   - the title must be 1-3 capitalized words (each word starts
+    #     uppercase, then optional lowercase / digits / hyphens). This
+    #     matches MMseqs2's title format ("Index table fill", "Min
+    #     seq id") but rejects sentence-style lines that begin with
+    #     "Number " or "Computing " followed by lowercase content.
+    #   - the value must be one short token (no spaces).
+    #   - words like "of", "to", "and" anywhere in the title disqualify
+    #     it — MMseqs2 only uses those in real activity messages
+    #     ("Number of alignments", "Time for processing").
+    _PARAM_ECHO_RE = re.compile(
+        r'^([A-Z][a-z0-9\-]*)(?:\s+([A-Z][a-z0-9\-]*|[a-z]{1,4}))?'
+        r'(?:\s+([A-Z][a-z0-9\-]*|[a-z]{1,4}))?'
+        r'\s+(\d+(?:\.\d+)?(?:e[+\-]?\d+)?|true|false|nan|null)\s*$'
+    )
+    # Connectives that show up only in real activity lines; if any of
+    # these appear, the line is informative and we keep it.
+    _ACTIVITY_KEYWORDS = (
+        " of ", " for ", " to ", " from ", " and ", " in ", " on ",
+        " into ", " out ", " with ", "Number ", "Time ",
+    )
+
+    def _pick_informative_log_line(self, log_text: str) -> Optional[str]:
+        """Return the most recent log line that's not a parameter echo."""
+        if not log_text:
+            return None
+        candidates = [ln for ln in log_text.strip().split('\n') if ln.strip()]
+        if not candidates:
+            return None
+        for line in reversed(candidates):
+            stripped = line.strip()
+            # Activity-keyword whitelist runs before the param-echo
+            # regex so an informative line that happens to look like
+            # "Number aligned 12345" is preserved.
+            if any(k in stripped for k in self._ACTIVITY_KEYWORDS):
+                return stripped
+            if self._PARAM_ECHO_RE.match(stripped):
+                continue
+            # Empty headers like "=================" aren't useful either.
+            if set(stripped) <= {'=', '-', ' '}:
+                continue
+            return stripped
+        # Everything was a parameter echo — fall back to the latest line
+        # so the user still sees something rather than a blank slot.
+        return candidates[-1].strip()
 
     def print_detailed_status(self, job_id: str, watch: bool = False, animation_frame: int = 0):
         """Print formatted status with optional live updates
@@ -769,21 +892,48 @@ class RemoteJobManager:
     # ── Cancel / Cleanup / Log ──────────────────────────────────────
 
     def cancel(self, job_id: str):
-        """Cancel a running job"""
+        """Cancel a running job and its entire descendant tree.
+
+        The launch script is `nohup bash run.sh &` and the actual worker
+        (mmseqs / clustalo / mafft / muscle / docker exec) runs as a
+        forked child. Killing only the recorded wrapper PID leaves the
+        worker orphaned and still consuming CPU and memory — which is
+        exactly what makes a runaway alignment "gum up the server." We
+        walk descendants via `pgrep -P`, SIGTERM the whole tree, give it
+        2s to flush, then SIGKILL anything still alive.
+        """
         job_db = self._load_job_db()
 
         if job_id not in job_db:
             raise ValueError(f"Job {job_id} not found")
 
         pid = job_db[job_id]['pid']
-        self.conn.run(f'kill {pid} 2>/dev/null || true', warn=True, hide=True)
+
+        kill_tree = (
+            'descendants() { '
+            '  local p=$1 kids; '
+            '  kids=$(pgrep -P "$p" 2>/dev/null); '
+            '  for k in $kids; do descendants "$k"; echo "$k"; done; '
+            '}; '
+            f'ALL=$(descendants {pid}; echo {pid}); '
+            'kill -TERM $ALL 2>/dev/null; sleep 2; '
+            'kill -KILL $ALL 2>/dev/null; true'
+        )
+        self.conn.run(kill_tree, warn=True, hide=True)
 
         remote_path = job_db[job_id]['remote_path']
         self.conn.run(
             f'echo "Job cancelled: $(date)" >> {remote_path}/status.txt && '
             f'echo "CANCELLED" >> {remote_path}/status.txt',
-            hide=True
+            hide=True, warn=True,
         )
+
+        # Reflect the cancellation locally so the layers panel and
+        # `beak jobs` don't continue showing RUNNING until the next poll
+        # re-derives status from the remote.
+        job_db[job_id]['status'] = 'CANCELLED'
+        job_db[job_id]['last_checked'] = datetime.now().isoformat()
+        self._save_job_db(job_db)
 
         print(f"✓ Job {job_id} cancelled")
 
