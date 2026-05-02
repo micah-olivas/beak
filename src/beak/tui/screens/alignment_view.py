@@ -164,6 +164,13 @@ class AlignmentViewerScreen(Screen):
         Binding("escape",   "back",        "Back"),
         Binding("space",    "cycle_color", "Color"),
         Binding("g",        "cycle_gap",   "Ungap"),
+        # Conservation midpoint shift — mirrors the structure/sequence
+        # panel's left/right arrow on the inline colorbar, but those
+        # keys are already pan here, so use brackets. (Textual's
+        # binding parser splits on bare commas, hence `left_square_bracket`
+        # / `right_square_bracket` rather than the literal characters.)
+        Binding("left_square_bracket",  "midpoint_down", "Mid -"),
+        Binding("right_square_bracket", "midpoint_up",   "Mid +"),
         Binding("up",       "row_up",      "Row ↑",  show=False),
         Binding("down",     "row_down",    "Row ↓",  show=False),
         Binding("left",     "pan_left",    "Pan ←",  show=False),
@@ -173,6 +180,10 @@ class AlignmentViewerScreen(Screen):
         Binding("home",     "pan_home",    "Home",   show=False),
         Binding("end",      "pan_end",     "End",    show=False),
     ]
+
+    _MIDPOINT_STEP = 5.0
+    _MIDPOINT_MIN = 5.0
+    _MIDPOINT_MAX = 95.0
 
     DEFAULT_CSS = """
     AlignmentViewerScreen _AlignmentBody { height: 1fr; padding: 1 2; }
@@ -203,8 +214,26 @@ class AlignmentViewerScreen(Screen):
         self._col_offset: int = 0
         self._color_mode: str = "biochem"
         self._gap_threshold: Optional[float] = 0.9
+        # Midpoint for conservation coloring. Persisted in
+        # `[view] aln_midpoint` so a user who shifted it on one project
+        # doesn't have to re-shift on the next open. Only meaningful in
+        # `conservation` mode — biochem ignores it.
+        prefs = (project.manifest().get("view") or {})
+        try:
+            mid = float(prefs.get("aln_midpoint", 50.0))
+        except (TypeError, ValueError):
+            mid = 50.0
+        self._midpoint: float = max(
+            self._MIDPOINT_MIN, min(self._MIDPOINT_MAX, mid)
+        )
         # Per-column conservation aligned to _displayed. Recomputed on ungap.
         self._col_conservation: Optional[np.ndarray] = None
+        # Per-column logo cache aligned to _displayed. Recomputed on
+        # ungap; consumed cheaply by `_logo_lines` / `_consensus_line`
+        # so scroll/pan don't repeat O(n_seqs * n_visible_cols) work.
+        self._logo_top: List[str] = []
+        self._logo_level: List[int] = []
+        self._logo_freq: List[float] = []
         # Diversity metrics — computed once at load.
         self._mean_identity: Optional[float] = None
         self._neff: Optional[int] = None
@@ -239,9 +268,14 @@ class AlignmentViewerScreen(Screen):
             diversity += f"  ·  ident {self._mean_identity:.0f}%"
         if self._neff is not None:
             diversity += f"  ·  Neff@80 {self._neff}"
+        # Show the midpoint only in conservation mode — it has no
+        # effect in biochem / none, so surfacing it elsewhere is noise.
+        color_str = self._color_mode
+        if self._color_mode == "conservation":
+            color_str += f" mid={int(self._midpoint)}"
         self.app.sub_title = (
             f"{kind} · {self._project.name} ({n})  ·  "
-            f"color: {self._color_mode}{gap}{diversity}"
+            f"color: {color_str}{gap}{diversity}"
         )
 
     def _load(self) -> None:
@@ -352,6 +386,47 @@ class AlignmentViewerScreen(Screen):
             self._compute_column_conservation(self._displayed)
             if self._aligned else None
         )
+        self._rebuild_logo_cache()
+
+    def _rebuild_logo_cache(self) -> None:
+        """Precompute (top-char, intensity-level) per alignment column.
+
+        Without this the logo + consensus rows walk the full sequence
+        list and run Counter on every column on every paint — which is
+        the dominant cost when scrolling, even for a few-hundred-row
+        alignment. Building it once per `_displayed` change collapses
+        the per-frame work to a slice + markup join.
+        """
+        if not self._displayed:
+            self._logo_top: List[str] = []
+            self._logo_level: List[int] = []
+            self._logo_freq: List[float] = []
+            return
+
+        # Stack into a 2-D character array once, then iterate columns
+        # vectorised through Counter — way cheaper than the per-paint
+        # Python-level scan that was here before.
+        max_len = max(len(s) for _, s in self._displayed)
+        cols = max_len
+        seqs = [s.ljust(max_len, "-") for _, s in self._displayed]
+
+        n_glyphs = len(_BAR_GLYPHS)
+        top: List[str] = [" "] * cols
+        level: List[int] = [0] * cols
+        freqs: List[float] = [0.0] * cols
+        for col in range(cols):
+            chars = [s[col] for s in seqs if s[col] not in "-."]
+            if not chars:
+                continue
+            t, count = Counter(chars).most_common(1)[0]
+            f = count / len(chars)
+            top[col] = t
+            level[col] = min(n_glyphs - 1, int(round(f * (n_glyphs - 1))))
+            freqs[col] = f
+
+        self._logo_top = top
+        self._logo_level = level
+        self._logo_freq = freqs
 
     def _ungap(self, sequences: List[Tuple[str, str]], threshold: float) -> List[Tuple[str, str]]:
         """Drop columns where gap-fraction >= `threshold`. Vectorised."""
@@ -436,6 +511,41 @@ class AlignmentViewerScreen(Screen):
     def action_cycle_color(self) -> None:
         idx = self._COLOR_MODES.index(self._color_mode)
         self._color_mode = self._COLOR_MODES[(idx + 1) % len(self._COLOR_MODES)]
+        self._update_title()
+        self._refresh_body()
+
+    def action_midpoint_down(self) -> None:
+        self._shift_midpoint(-self._MIDPOINT_STEP)
+
+    def action_midpoint_up(self) -> None:
+        self._shift_midpoint(+self._MIDPOINT_STEP)
+
+    def _shift_midpoint(self, delta: float) -> None:
+        # No-op in any mode where the midpoint has no visual effect —
+        # avoids the surprising case where the user mashes `,/.` while
+        # in biochem mode and wonders why the title isn't changing.
+        if self._color_mode != "conservation":
+            try:
+                self.notify(
+                    "Midpoint only applies to conservation coloring "
+                    "(press `space` to switch).",
+                    timeout=3,
+                )
+            except Exception:
+                pass
+            return
+        new_mid = max(
+            self._MIDPOINT_MIN,
+            min(self._MIDPOINT_MAX, self._midpoint + delta),
+        )
+        if new_mid == self._midpoint:
+            return
+        self._midpoint = new_mid
+        try:
+            with self._project.mutate() as m:
+                m.setdefault("view", {})["aln_midpoint"] = new_mid
+        except Exception:
+            pass
         self._update_title()
         self._refresh_body()
 
@@ -534,80 +644,108 @@ class AlignmentViewerScreen(Screen):
         return f"[dim]Phyla:[/dim]  {chips}"
 
     def _color_segment(self, segment: str, start_col: int) -> str:
-        """Apply the active color mode to a slice of one row."""
+        """Apply the active color mode to a slice of one row.
+
+        Runs of consecutive same-color cells are coalesced into a
+        single `[color]...[/color]` span so a row of N residues emits
+        ~10-20 markup spans instead of one per character. Big win
+        for scroll latency on long visible windows.
+        """
         if self._color_mode == "none":
             return segment
 
         if self._color_mode == "biochem":
-            parts = []
-            for ch in segment:
-                color = _BIOCHEM_COLORS.get(ch.upper())
-                if color and ch not in "-.":
-                    parts.append(f"[{color}]{ch}[/{color}]")
-                else:
-                    parts.append(ch)
-            return "".join(parts)
+            return self._coalesce(
+                segment,
+                lambda ch, _col: (
+                    None if ch in "-." else _BIOCHEM_COLORS.get(ch.upper())
+                ),
+                start_col,
+            )
 
         if self._color_mode == "conservation" and self._col_conservation is not None:
             from ..structure import conservation_color
-            parts = []
             cons = self._col_conservation
-            for offset, ch in enumerate(segment):
-                col = start_col + offset
-                if ch in "-." or col >= len(cons):
-                    parts.append(ch)
-                else:
-                    color = conservation_color(float(cons[col]))
-                    parts.append(f"[{color}]{ch}[/{color}]")
-            return "".join(parts)
+            cons_len = len(cons)
+            midpoint = self._midpoint
+
+            def cons_color(ch: str, col: int):
+                if ch in "-." or col >= cons_len:
+                    return None
+                return conservation_color(float(cons[col]), midpoint)
+
+            return self._coalesce(segment, cons_color, start_col)
 
         return segment
 
-    def _logo_lines(self, start: int, end_exc: int) -> list:
-        """Two-row sequence logo: bar height row + consensus letter row.
+    @staticmethod
+    def _coalesce(segment: str, color_fn, start_col: int) -> str:
+        """Walk `segment` and merge consecutive same-color cells into one span."""
+        parts: List[str] = []
+        run_color: Optional[str] = None
+        run_chars: List[str] = []
+        for offset, ch in enumerate(segment):
+            color = color_fn(ch, start_col + offset)
+            if color != run_color:
+                if run_chars:
+                    if run_color is None:
+                        parts.append("".join(run_chars))
+                    else:
+                        parts.append(
+                            f"[{run_color}]{''.join(run_chars)}[/{run_color}]"
+                        )
+                run_color = color
+                run_chars = [ch]
+            else:
+                run_chars.append(ch)
+        if run_chars:
+            if run_color is None:
+                parts.append("".join(run_chars))
+            else:
+                parts.append(
+                    f"[{run_color}]{''.join(run_chars)}[/{run_color}]"
+                )
+        return "".join(parts)
 
-        Row 0: a `▁▂▃▄▅▆▇█` block per column whose height encodes the
-            column's identity fraction. Conserved columns get tall bars,
-            diverse ones get short bars. Color = top-letter biochem hue.
-        Row 1: the most-frequent residue per column, colored by biochem.
-        """
-        bar_chars = []
-        letter_chars = []
+    def _logo_lines(self, start: int, end_exc: int) -> list:
+        """Two-row sequence logo using the precomputed per-column cache."""
+        if not self._logo_top:
+            return ["", ""]
+        cap = len(self._logo_top)
+        end_exc = min(end_exc, cap)
+        if start >= end_exc:
+            return ["", ""]
+
+        bar_chars: List[str] = []
+        letter_chars: List[str] = []
         for col in range(start, end_exc):
-            chars = [
-                s[col] for _, s in self._displayed
-                if col < len(s) and s[col] not in "-."
-            ]
-            if not chars:
+            top = self._logo_top[col]
+            if top == " ":
                 bar_chars.append(" ")
                 letter_chars.append(" ")
                 continue
-            top, count = Counter(chars).most_common(1)[0]
-            freq = count / len(chars)
             color = _BIOCHEM_COLORS.get(top.upper(), "white")
-            level = min(len(_BAR_GLYPHS) - 1, int(round(freq * (len(_BAR_GLYPHS) - 1))))
-            glyph = _BAR_GLYPHS[level]
+            glyph = _BAR_GLYPHS[self._logo_level[col]]
             bar_chars.append(f"[{color}]{glyph}[/{color}]")
             letter_chars.append(f"[{color}]{top}[/{color}]")
-
         return ["".join(bar_chars), "".join(letter_chars)]
 
     def _consensus_line(self, start: int, end_exc: int) -> str:
-        """One-line sequence logo: top AA per column, intensity scales
-        with the column's identity fraction. Brightest when conserved,
-        dim when diverse, blank for gap-only columns.
-        """
-        parts = []
+        """One-line consensus from the cache."""
+        if not self._logo_top:
+            return ""
+        cap = len(self._logo_top)
+        end_exc = min(end_exc, cap)
+        if start >= end_exc:
+            return ""
+
+        parts: List[str] = []
         for col in range(start, end_exc):
-            chars = [
-                s[col] for _, s in self._displayed
-                if col < len(s) and s[col] not in "-."
-            ]
-            if not chars:
+            top = self._logo_top[col]
+            if top == " ":
                 parts.append(" ")
                 continue
-            top, count = Counter(chars).most_common(1)[0]
-            freq = count / len(chars)
+            freq = self._logo_freq[col]
             color = _BIOCHEM_COLORS.get(top.upper(), "white")
             if freq > 0.7:
                 parts.append(f"[bold {color}]{top}[/bold {color}]")
