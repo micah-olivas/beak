@@ -52,6 +52,28 @@ _STATUS_STYLES = {
 }
 
 
+def _close_mgr(mgr) -> None:
+    """Best-effort close on a remote-job manager's SSH connection.
+
+    Workers that instantiate fresh `MMseqsSearch` / `ClustalAlign` /
+    `ESMEmbeddings` / `MMseqsTaxonomy` objects each open a Paramiko
+    Transport. Without an explicit close, the socket FD is held until
+    the process exits — a 15s poll cadence exhausts macOS's 256-FD
+    limit in about 4 minutes.
+
+    The bare `except Exception` is intentionally narrow — it swallows
+    transient close errors (already-closed sockets, broken pipes) but
+    lets KeyboardInterrupt / SystemExit propagate so the user can
+    still abort a hung close with Ctrl-C.
+    """
+    try:
+        conn = getattr(mgr, "conn", None)
+        if conn is not None:
+            conn.close()
+    except Exception:
+        pass
+
+
 def _human_size(n: float) -> str:
     if n < 1024:
         return f"{int(n)} B"
@@ -152,7 +174,10 @@ class LayersPanel(Vertical):
         self._project = project
         self._remote_statuses: Dict[str, str] = {}
         self._mgr_unavailable: bool = False
-        self._pulling: bool = False
+        # Per-kind pull gates. A single shared flag previously meant a
+        # poll cycle that finished both `align` and `tax` would silently
+        # drop one of them; now each kind reentry-guards itself.
+        self._pulling_kinds: set = set()
         self._submitting_align: bool = False  # gate against double-submit
         self._submitting_embed: bool = False
 
@@ -262,10 +287,29 @@ class LayersPanel(Vertical):
         return bool(data)
 
     def force_refresh(self) -> None:
-        """Refresh state AND kick off a remote poll right now."""
+        """Refresh state AND kick off a remote poll right now.
+
+        Debounces against an in-flight poll: the worker is decorated
+        `exclusive=True` so a second call would queue, and on flaky
+        networks a queued backlog leaves the UI feeling unresponsive
+        as it drains. Skip the queue and surface a hint when the user
+        mashes `r` while a poll is already running.
+        """
         self.refresh_state()
-        if self._pending_jobs():
-            self._poll_remote_status()
+        if not self._pending_jobs():
+            return
+        # Any pull or status fetch from a previous trigger still in
+        # progress means the next 15 s tick (or the running worker
+        # itself) will surface fresh state — no need to enqueue.
+        if self._pulling_kinds:
+            try:
+                self.notify(
+                    "Refresh already in progress…", timeout=2,
+                )
+            except Exception:
+                pass
+            return
+        self._poll_remote_status()
 
     def _pending_jobs(self) -> Dict[str, str]:
         """{kind: job_id} for tagged-but-unfulfilled remote jobs.
@@ -487,41 +531,50 @@ class LayersPanel(Vertical):
             self._mgr_unavailable = True
             return
 
-        managers = {}
+        managers: Dict[str, object] = {}
         mgr_factories = {
             "search": MMseqsSearch,
             "align": ClustalAlign,
             "embed": ESMEmbeddings,
             "tax": MMseqsTaxonomy,
         }
-        for kind, job_id in pending.items():
-            factory = mgr_factories.get(kind)
-            if factory and kind not in managers:
-                try:
-                    managers[kind] = factory()
-                except Exception:
-                    self._mgr_unavailable = True
-                    return
+        try:
+            for kind, job_id in pending.items():
+                factory = mgr_factories.get(kind)
+                if factory and kind not in managers:
+                    try:
+                        managers[kind] = factory()
+                    except Exception:
+                        self._mgr_unavailable = True
+                        return
 
-        for kind, job_id in pending.items():
-            mgr = managers.get(kind)
-            if mgr is None:
-                continue
-            try:
-                info = mgr.status(job_id)
-                status = info.get("status", "UNKNOWN")
-                self._remote_statuses[job_id] = status
-                if status == "COMPLETED":
-                    if kind == "search":
-                        self._pull_homologs_now(mgr, job_id)
-                    elif kind == "align":
-                        self._pull_alignment_now(mgr, job_id)
-                    elif kind == "embed":
-                        self._pull_embeddings_now(mgr, job_id)
-                    elif kind == "tax":
-                        self._pull_taxonomy_now(mgr, job_id)
-            except Exception:
-                self._remote_statuses[job_id] = "UNKNOWN"
+            for kind, job_id in pending.items():
+                mgr = managers.get(kind)
+                if mgr is None:
+                    continue
+                try:
+                    info = mgr.status(job_id)
+                    status = info.get("status", "UNKNOWN")
+                    self._remote_statuses[job_id] = status
+                    if status == "COMPLETED":
+                        if kind == "search":
+                            self._pull_homologs_now(mgr, job_id)
+                        elif kind == "align":
+                            self._pull_alignment_now(mgr, job_id)
+                        elif kind == "embed":
+                            self._pull_embeddings_now(mgr, job_id)
+                        elif kind == "tax":
+                            self._pull_taxonomy_now(mgr, job_id)
+                except Exception:
+                    self._remote_statuses[job_id] = "UNKNOWN"
+        finally:
+            # Close every SSH connection we opened above. Without this
+            # each 15s poll leaks a Paramiko Transport socket and macOS
+            # hits its 256-FD soft limit within a few minutes (after
+            # which even opening the project's manifest TOML fails with
+            # OSError 24).
+            for mgr in managers.values():
+                _close_mgr(mgr)
 
         self.app.call_from_thread(self.refresh_state)
 
@@ -573,9 +626,9 @@ class LayersPanel(Vertical):
 
     def _pull_homologs_now(self, mgr, job_id: str) -> None:
         """Download hits.fasta into the project's homologs/ and tag the manifest."""
-        if self._pulling:
+        if "homologs" in self._pulling_kinds:
             return
-        self._pulling = True
+        self._pulling_kinds.add("homologs")
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling homologs · {job_id}…"
@@ -613,13 +666,13 @@ class LayersPanel(Vertical):
                 timeout=10,
             )
         finally:
-            self._pulling = False
+            self._pulling_kinds.discard("homologs")
 
     def _pull_alignment_now(self, mgr, job_id: str) -> None:
         """Download alignment.fasta into the active set + tag the manifest."""
-        if self._pulling:
+        if "alignment" in self._pulling_kinds:
             return
-        self._pulling = True
+        self._pulling_kinds.add("alignment")
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling alignment · {job_id}…"
@@ -659,7 +712,7 @@ class LayersPanel(Vertical):
                 timeout=10,
             )
         finally:
-            self._pulling = False
+            self._pulling_kinds.discard("alignment")
 
     @work(thread=True, exclusive=True, group="align-submit")
     def _submit_alignment(self) -> None:
@@ -668,6 +721,7 @@ class LayersPanel(Vertical):
         if not hits_fasta.exists():
             self._submitting_align = False
             return
+        mgr = None
         try:
             from ...remote.align import ClustalAlign
             mgr = ClustalAlign()
@@ -692,6 +746,7 @@ class LayersPanel(Vertical):
                 timeout=8,
             )
         finally:
+            _close_mgr(mgr)
             # Clear the gate AFTER the worker thread has actually returned —
             # done synchronously here so a follow-up click is allowed once
             # the previous submission has finished (succeeded or failed).
@@ -724,9 +779,9 @@ class LayersPanel(Vertical):
 
     def _pull_embeddings_now(self, mgr, job_id: str) -> None:
         """Download embeddings tarball, extract into project's embeddings/."""
-        if self._pulling:
+        if "embeddings" in self._pulling_kinds:
             return
-        self._pulling = True
+        self._pulling_kinds.add("embeddings")
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling embeddings · {job_id}…"
@@ -747,17 +802,16 @@ class LayersPanel(Vertical):
                 model = ""
 
             from datetime import datetime
-            manifest = self._project.manifest()
-            emb = manifest.setdefault("embeddings", {})
-            emb["n_embeddings"] = n
-            emb["model"] = model
-            emb["last_updated"] = datetime.now()
-            # Stamp the source set on completion too — covers jobs that
-            # were submitted before this tag was introduced.
-            emb.setdefault(
-                "source_homologs_set", self._project.active_set_name()
-            )
-            self._project.write(manifest)
+            with self._project.mutate() as manifest:
+                emb = manifest.setdefault("embeddings", {})
+                emb["n_embeddings"] = n
+                emb["model"] = model
+                emb["last_updated"] = datetime.now()
+                # Stamp the source set on completion too — covers jobs that
+                # were submitted before this tag was introduced.
+                emb.setdefault(
+                    "source_homologs_set", self._project.active_set_name()
+                )
 
             self.app.call_from_thread(
                 self.notify, f"Embeddings ready · {n} files", timeout=8
@@ -768,7 +822,7 @@ class LayersPanel(Vertical):
                 severity="error", timeout=10,
             )
         finally:
-            self._pulling = False
+            self._pulling_kinds.discard("embeddings")
 
     @work(thread=True, exclusive=True, group="embed-submit")
     def _submit_embeddings(self) -> None:
@@ -777,21 +831,21 @@ class LayersPanel(Vertical):
         if not hits_fasta.exists():
             self._submitting_embed = False
             return
+        mgr = None
         try:
             from ...remote.embeddings import ESMEmbeddings
             mgr = ESMEmbeddings()
             job_name = f"{self._project.name}_embed"
             job_id = mgr.submit(str(hits_fasta), job_name=job_name)
 
-            manifest = self._project.manifest()
-            emb = manifest.setdefault("embeddings", {})
-            # Tag embeddings with the homolog set they were computed
-            # against so we can warn when the user switches active sets
-            # without rebuilding.
-            emb["source_homologs_set"] = self._project.active_set_name()
-            remote = emb.setdefault("remote", {})
-            remote["job_id"] = job_id
-            self._project.write(manifest)
+            with self._project.mutate() as manifest:
+                emb = manifest.setdefault("embeddings", {})
+                # Tag embeddings with the homolog set they were computed
+                # against so we can warn when the user switches active sets
+                # without rebuilding.
+                emb["source_homologs_set"] = self._project.active_set_name()
+                remote = emb.setdefault("remote", {})
+                remote["job_id"] = job_id
 
             self.app.call_from_thread(self.refresh_state)
             self.app.call_from_thread(
@@ -803,6 +857,7 @@ class LayersPanel(Vertical):
                 severity="error", timeout=8,
             )
         finally:
+            _close_mgr(mgr)
             self._submitting_embed = False
             try:
                 self.app.call_from_thread(self.refresh_state)
@@ -811,9 +866,9 @@ class LayersPanel(Vertical):
 
     def _pull_taxonomy_now(self, mgr, job_id: str) -> None:
         """Pull MMseqs LCA results, save TSV + merge into taxonomy.parquet."""
-        if self._pulling:
+        if "taxonomy" in self._pulling_kinds:
             return
-        self._pulling = True
+        self._pulling_kinds.add("taxonomy")
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling taxonomy · {job_id}…"
@@ -826,11 +881,10 @@ class LayersPanel(Vertical):
             df.to_parquet(homologs_dir / "taxonomy_mmseqs.parquet", index=False)
 
             from datetime import datetime
-            manifest = self._project.manifest()
-            tax = manifest.setdefault("taxonomy", {})
-            tax["n_assigned"] = int(len(df))
-            tax["last_updated"] = datetime.now()
-            self._project.write(manifest)
+            with self._project.mutate() as manifest:
+                tax = manifest.setdefault("taxonomy", {})
+                tax["n_assigned"] = int(len(df))
+                tax["last_updated"] = datetime.now()
 
             self.app.call_from_thread(
                 self.notify, f"Taxonomy ready · {len(df)} assignments", timeout=8
@@ -847,7 +901,7 @@ class LayersPanel(Vertical):
                 severity="error", timeout=10,
             )
         finally:
-            self._pulling = False
+            self._pulling_kinds.discard("taxonomy")
 
     def submit_embeddings(self) -> None:
         """Public entry point — gated against double-submit."""

@@ -86,6 +86,26 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
             return
         self.dismiss(None)
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Live-validate the set name as the user types so the regex
+        # constraint surfaces before they hit Submit.
+        if event.input.id != "set-name":
+            return
+        candidate = event.value.strip()
+        if not candidate:
+            # Empty is allowed — `_submit` falls back to "default".
+            self._set_status("")
+            return
+        if _SET_NAME_RE.match(candidate):
+            self._set_status(
+                f"[dim]Will create / reuse set [bold]{candidate}[/bold].[/dim]"
+            )
+        else:
+            self._set_status(
+                "[red]Set name must start with a letter or digit and use "
+                "only letters / digits / `_` / `-`.[/red]"
+            )
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel-btn":
             self.action_cancel()
@@ -113,6 +133,7 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
             self._set_status, "[dim]Submitting (this can take a few seconds)…[/dim]"
         )
 
+        mgr = None
         try:
             from ...remote.search import MMseqsSearch
             mgr = MMseqsSearch()
@@ -134,6 +155,15 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
             )
             self._submitting = False
             return
+        finally:
+            # Release the SSH socket — without this, every search-modal
+            # submission leaks a Paramiko Transport FD that lives until
+            # the TUI exits.
+            try:
+                if mgr is not None and getattr(mgr, "conn", None) is not None:
+                    mgr.conn.close()
+            except Exception:
+                pass
 
         self.app.call_from_thread(self.dismiss, job_id)
 

@@ -10,6 +10,7 @@ from ...project import BeakProject
 from ..widgets.colorbar import Colorbar
 from ..widgets.layers_panel import LayersPanel
 from ..widgets.sequence_view import SequenceView
+from ..widgets.server_status import ServerStatusBar
 from ..widgets.structure_view import StructureView
 
 
@@ -38,6 +39,10 @@ class ProjectDetailScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        # Thin 1-row strip below the header — content right-aligned via
+        # the widget's own CSS, so the empty left side just blends with
+        # the screen background.
+        yield ServerStatusBar(id="server-status")
         with Horizontal(id="detail-body"):
             with Vertical(id="info-col"):
                 yield Static(self._target_panel(), classes="panel", id="target-panel")
@@ -46,19 +51,25 @@ class ProjectDetailScreen(Screen):
                 yield StructureView(
                     self._project, classes="panel", id="structure-view"
                 )
+                # All four controls share one row. Labels are minimal
+                # ("color/view/bg") and the dropdown options are
+                # abbreviated so the Export button stays right-aligned
+                # without pushing past the structure column at narrow
+                # aspect ratios.
                 with Horizontal(id="struct-controls"):
-                    yield Label("Color:")
+                    yield Label("color", classes="ctrl-lbl")
                     yield Select(
                         [("pLDDT", "plddt"),
-                         ("Conservation", "conservation"),
+                         ("cons", "conservation"),
                          ("SASA", "sasa"),
-                         ("Differential", "differential")],
+                         ("diff", "differential"),
+                         ("Pfam", "pfam")],
                         value=self._color_mode,
                         id="color-select",
                         allow_blank=False,
                         compact=True,
                     )
-                    yield Label("View:")
+                    yield Label("view", classes="ctrl-lbl")
                     yield Select(
                         [("trace", "trace"), ("tube", "tube")],
                         value=self._view_mode,
@@ -66,7 +77,7 @@ class ProjectDetailScreen(Screen):
                         allow_blank=False,
                         compact=True,
                     )
-                    yield Label("BG:")
+                    yield Label("bg", classes="ctrl-lbl")
                     yield Select(
                         [("default", "default"), ("black", "black"),
                          ("slate", "slate"), ("light", "light"),
@@ -234,10 +245,9 @@ class ProjectDetailScreen(Screen):
 
     def _save_view_pref(self, key: str, value) -> None:
         try:
-            m = self._project.manifest()
-            view = m.setdefault("view", {})
-            view[key] = value
-            self._project.write(m)
+            with self._project.mutate() as m:
+                view = m.setdefault("view", {})
+                view[key] = value
         except Exception:
             pass  # don't let a manifest write failure break the UI
 
@@ -269,6 +279,13 @@ class ProjectDetailScreen(Screen):
             self.query_one(LayersPanel).refresh_state()
             return
         if action_str == "set-deleted":
+            self.query_one(LayersPanel).refresh_state()
+            self.query_one(SequenceView).reload()
+            self.query_one(StructureView).reload_set_data()
+            return
+        if action_str == "set-renamed":
+            # The renamed set may also be the active one — refresh
+            # anything that resolves the active set's directory.
             self.query_one(LayersPanel).refresh_state()
             self.query_one(SequenceView).reload()
             self.query_one(StructureView).reload_set_data()
@@ -310,7 +327,16 @@ class ProjectDetailScreen(Screen):
             )
         elif message.pill_id in ("homologs-status-pill", "embeddings-status-pill") and message.value:
             from .job_status import JobStatusModal
-            self.app.push_screen(JobStatusModal(message.value))
+            # Refresh the layers panel after the modal closes so a
+            # successful cancel/clear from inside the modal flips the
+            # row state without waiting for the next poll. The modal
+            # gets the project so it can clear failed jobs out of the
+            # manifest (which is what re-enables the Embed/Search/Align
+            # pills after a failure).
+            self.app.push_screen(
+                JobStatusModal(message.value, project=self._project),
+                lambda _: self.query_one(LayersPanel).force_refresh(),
+            )
 
     def _on_tax_submitted(self, job_id) -> None:
         if not job_id:

@@ -14,7 +14,7 @@ from typing import List, Optional
 import numpy as np
 from textual import work
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from ...project import BeakProject
@@ -26,8 +26,11 @@ _SS_COLORS = {
     'E': '#FFD93D',
 }
 
-# Cycle through these for sequential Pfam domains.
-_DOMAIN_PALETTE = ["#FF6B9D", "#FFA62B", "#A66DD4", "#3DCFD4", "#7DD87D"]
+# Cycle through these for sequential Pfam domains. The structure view
+# uses the same palette (via `tui.structure.DOMAIN_PALETTE`) so a
+# residue's domain reads as the same color whether you're looking at
+# the ribbon or the sequence panel.
+from ..structure import DOMAIN_PALETTE as _DOMAIN_PALETTE
 
 
 class _SequenceBody(Static):
@@ -45,11 +48,21 @@ class SequenceView(Vertical):
     """Sequence panel: header pill row + body Static."""
 
     DEFAULT_CSS = """
-    SequenceView { height: auto; }
-    SequenceView _SequenceBody { height: 1fr; }
+    /* The panel takes whatever vertical room the parent allocates; the
+       body sits inside a scroll container so very long proteins
+       (P300 = 2414 aa = ~16 wrapped blocks) are reachable by mouse
+       wheel / PageDown rather than running off the bottom. */
+    SequenceView { height: 1fr; }
+    SequenceView #seq-scroll {
+        height: 1fr;
+        overflow-y: auto;
+        scrollbar-gutter: stable;
+    }
+    SequenceView _SequenceBody { height: auto; }
     SequenceView #seq-footer {
         height: 1;
         padding-right: 1;
+        dock: bottom;
     }
     /* Scope to specific IDs so the Colorbar (a Static subclass) keeps its
        own width: 42 from DEFAULT_CSS rather than getting clobbered. */
@@ -66,6 +79,10 @@ class SequenceView(Vertical):
         self._conservation: Optional[np.ndarray] = None
         self._sasa: Optional[np.ndarray] = None
         self._differential: Optional[np.ndarray] = None
+        # Per-residue Pfam domain index (`-1` for unannotated positions).
+        # Recomputed when domains are loaded; consumed by the "pfam"
+        # color mode shared with the structure view.
+        self._pfam_idx: Optional[np.ndarray] = None
         self._ss: str = ""
         self._domains: List[dict] = []
         self._status: str = "[dim]Loading sequence…[/dim]"
@@ -75,13 +92,18 @@ class SequenceView(Vertical):
             (project.manifest().get("view") or {}).get("color_mode", "plddt")
         )
         self._midpoint: float = 50.0
-        self._show_domains: bool = True
-        self._show_ss: bool = bool(
-            (project.manifest().get("view") or {}).get("show_ss", False)
-        )
+        # Domain bars and the SS track are both off on first project view —
+        # they tile vertically below the sequence and crowd the layout
+        # before the user has decided what they care about. Once a user
+        # toggles either on (`d` / `s`), the choice is persisted in the
+        # manifest's `[view]` block so future opens remember it.
+        view_prefs = project.manifest().get("view") or {}
+        self._show_domains: bool = bool(view_prefs.get("show_domains", False))
+        self._show_ss: bool = bool(view_prefs.get("show_ss", False))
 
     def compose(self) -> ComposeResult:
-        yield _SequenceBody(self, id="seq-body")
+        with VerticalScroll(id="seq-scroll"):
+            yield _SequenceBody(self, id="seq-body")
         with Horizontal(id="seq-footer"):
             # SS key pinned to the left; spacer pushes the rest right.
             yield Static("", id="seq-ss-key")
@@ -104,7 +126,19 @@ class SequenceView(Vertical):
             self._refresh_view()
 
     def reload(self) -> None:
-        """Public hook for the screen to re-trigger a load."""
+        """Public hook for the screen to re-trigger a load.
+
+        Resets the scroll container to the top — when reload is called
+        on a set switch the meaning of "row N" changes (different
+        wrapped block, different conservation overlay), so leaving the
+        viewport mid-protein leaves the user looking at numerically the
+        same residues with semantically different context.
+        """
+        try:
+            scroll = self.query_one("#seq-scroll")
+            scroll.scroll_home(animate=False)
+        except Exception:
+            pass
         self._load()
 
     def set_color_mode(self, mode: str) -> bool:
@@ -120,6 +154,8 @@ class SequenceView(Vertical):
                 self._differential = None
             if self._differential is None:
                 return False
+        if mode == "pfam" and (self._pfam_idx is None or not self._domains):
+            return False
         self._color_mode = mode
         try:
             self.query_one("#seq-colorbar", Colorbar).set_mode(mode)
@@ -139,6 +175,8 @@ class SequenceView(Vertical):
             return self._sasa
         if self._color_mode == "differential" and self._differential is not None:
             return self._differential
+        if self._color_mode == "pfam" and self._pfam_idx is not None:
+            return self._pfam_idx
         return self._plddt
 
     def on_colorbar_midpoint_changed(self, message: Colorbar.MidpointChanged) -> None:
@@ -150,11 +188,42 @@ class SequenceView(Vertical):
         if not self._domains:
             return False
         self._show_domains = not self._show_domains
+        try:
+            with self._project.mutate() as m:
+                m.setdefault("view", {})["show_domains"] = self._show_domains
+        except Exception:
+            pass
         self._refresh_view()
         return self._show_domains
 
     def has_domains(self) -> bool:
         return bool(self._domains)
+
+    def has_pfam(self) -> bool:
+        """True iff Pfam coloring would actually paint anything."""
+        return self._pfam_idx is not None and bool(self._domains)
+
+    def _compute_pfam_idx(self) -> Optional[np.ndarray]:
+        """Build a per-residue array: domain index, or `-1` outside any.
+
+        Domains are indexed in manifest order so the colors line up
+        with the bars `_domain_line` already paints. Overlaps resolve
+        to the first hit (consistent with how the bars draw).
+        """
+        if not self._sequence or not self._domains:
+            return None
+        n = len(self._sequence)
+        idx = np.full(n, -1, dtype=np.int8)
+        for i, d in enumerate(self._domains):
+            try:
+                start = max(0, int(d.get("env_from", 1)) - 1)
+                end = min(n, int(d.get("env_to", 0)))
+            except (TypeError, ValueError):
+                continue
+            for pos in range(start, end):
+                if idx[pos] == -1:
+                    idx[pos] = i
+        return idx
 
     def _refresh_view(self) -> None:
         """Update the body Static and footer keys."""
@@ -166,7 +235,12 @@ class SequenceView(Vertical):
         try:
             ss_legend = self._ss_legend() if (self._show_ss and self._ss) else ""
             self.query_one("#seq-ss-key", Static).update(ss_legend)
-            self.query_one("#seq-colorbar", Colorbar).set_midpoint(self._midpoint)
+            cb = self.query_one("#seq-colorbar", Colorbar)
+            cb.set_midpoint(self._midpoint)
+            # Pfam coloring is categorical, so the gradient bar would
+            # be misleading — hide it and let the domain chip legend
+            # do the talking.
+            cb.display = self._color_mode != "pfam"
             self.query_one("#seq-domains-key", Static).update(self._domains_legend())
         except Exception:
             pass
@@ -176,9 +250,8 @@ class SequenceView(Vertical):
             return False
         self._show_ss = not self._show_ss
         try:
-            m = self._project.manifest()
-            m.setdefault("view", {})["show_ss"] = self._show_ss
-            self._project.write(m)
+            with self._project.mutate() as m:
+                m.setdefault("view", {})["show_ss"] = self._show_ss
         except Exception:
             pass
         self._refresh_view()
@@ -202,23 +275,23 @@ class SequenceView(Vertical):
             return
 
         from datetime import datetime
-        manifest = self._project.manifest()
-        manifest["domains"] = {
-            "n_hits": len(hits),
-            "last_updated": datetime.now(),
-            "hits": [
-                {
-                    "pfam_id": h.get("pfam_id", ""),
-                    "pfam_name": h.get("pfam_name", ""),
-                    "env_from": int(h.get("env_from", 0)),
-                    "env_to": int(h.get("env_to", 0)),
-                    "i_evalue": float(h.get("i_evalue", 1.0)),
-                }
-                for h in hits
-            ],
-        }
-        self._project.write(manifest)
-        self._domains = manifest["domains"]["hits"]
+        with self._project.mutate() as manifest:
+            manifest["domains"] = {
+                "n_hits": len(hits),
+                "last_updated": datetime.now(),
+                "hits": [
+                    {
+                        "pfam_id": h.get("pfam_id", ""),
+                        "pfam_name": h.get("pfam_name", ""),
+                        "env_from": int(h.get("env_from", 0)),
+                        "env_to": int(h.get("env_to", 0)),
+                        "i_evalue": float(h.get("i_evalue", 1.0)),
+                    }
+                    for h in hits
+                ],
+            }
+            self._domains = list(manifest["domains"]["hits"])
+        self._pfam_idx = self._compute_pfam_idx()
         self.app.call_from_thread(self._refresh_view)
 
     @work(thread=True, exclusive=True, group="sequence-load")
@@ -277,6 +350,7 @@ class SequenceView(Vertical):
         self._sasa = sasa
         self._ss = ss
         self._domains = list(domains)
+        self._pfam_idx = self._compute_pfam_idx()
         self.app.call_from_thread(self._refresh_view)
 
     # ---- rendering (called by inner _SequenceBody.render) ----
@@ -375,7 +449,11 @@ class SequenceView(Vertical):
         )
 
     def _domains_legend(self) -> str:
-        if not (self._show_domains and self._domains):
+        # Pfam color mode replaces the gradient colorbar with this
+        # categorical legend, so render the chips even when the user
+        # has hidden the inline domain bars.
+        active_in_pfam = self._color_mode == "pfam" and bool(self._domains)
+        if not active_in_pfam and not (self._show_domains and self._domains):
             return ""
         parts = ["[dim]│[/dim]"]
         for i, d in enumerate(self._domains):

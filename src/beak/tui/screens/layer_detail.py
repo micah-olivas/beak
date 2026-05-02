@@ -7,7 +7,7 @@ from pathlib import Path
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Label, Select, Static
 
@@ -133,17 +133,29 @@ class LayerDetailModal(ModalScreen):
                 active_row = i
         yield table
 
-        # Per-row details panel — refreshes on cursor move.
-        yield Static("", id="set-details", classes="set-details")
+        # Per-row details panel lives in a scroller so the modal's overall
+        # height doesn't shift when the highlighted set's content gets
+        # longer/shorter (taxonomy / files / job blocks vary). The
+        # scroller takes the remaining vertical space inside #modal-body.
+        with VerticalScroll(id="set-details-scroll"):
+            yield Static("", id="set-details", classes="set-details")
 
-        # Action buttons. Visibility recomputed each refresh.
+        # Action buttons. Compact so all seven fit a 120-cell modal
+        # without overflowing into the right border.
         with Horizontal(id="modal-buttons"):
-            yield Button("New search", id="new-search-btn")
-            yield Button("Make active", id="make-active-btn", variant="primary")
-            yield Button("Build taxonomy", id="build-tax-btn")
-            yield Button("Reset align", id="reset-align-btn")
-            yield Button("Delete set", id="delete-set-btn", variant="warning")
-            yield Button("Close", id="close-btn")
+            yield Button("New search", id="new-search-btn", compact=True)
+            yield Button(
+                "Make active", id="make-active-btn",
+                variant="primary", compact=True,
+            )
+            yield Button("Rename", id="rename-set-btn", compact=True)
+            yield Button("Build taxonomy", id="build-tax-btn", compact=True)
+            yield Button("Reset align", id="reset-align-btn", compact=True)
+            yield Button(
+                "Delete set", id="delete-set-btn",
+                variant="warning", compact=True,
+            )
+            yield Button("Close", id="close-btn", compact=True)
 
         # Seed cursor on the active row so the details panel and the
         # button states match the dropdown's old default.
@@ -460,10 +472,30 @@ class LayerDetailModal(ModalScreen):
             self._delete_set_clicked(event.button)
         elif bid == "new-search-btn":
             self._open_new_search()
+        elif bid == "rename-set-btn":
+            self._open_rename_set()
 
     def _open_new_search(self) -> None:
         """Dismiss with a marker so the detail screen opens the search modal."""
         self.dismiss("open-search")
+
+    def _open_rename_set(self) -> None:
+        """Push the rename modal for the highlighted set; refresh on success."""
+        if not self._selected_set:
+            return
+        old_name = self._selected_set
+        from .rename_set import RenameSetModal
+
+        def _on_renamed(new_name: str | None) -> None:
+            if not new_name or new_name == old_name:
+                return
+            # Re-seed the table cursor on the renamed row. Cheapest path
+            # is to dismiss with a marker — the parent screen already
+            # rebuilds the layers panel for `set-switched`, and the
+            # active set's name may have changed if we renamed it.
+            self.dismiss("set-renamed")
+
+        self.app.push_screen(RenameSetModal(self._project, old_name), _on_renamed)
 
     # ---- homologs sets table interactions ----
 
@@ -472,6 +504,13 @@ class LayerDetailModal(ModalScreen):
             table = self.query_one("#sets-table", DataTable)
         except Exception:
             return
+        # Clamp into the current row range so a stale `row_idx` (e.g.
+        # from a manifest read between compose and call_after_refresh)
+        # can't trip move_cursor on an out-of-bounds row.
+        n_rows = max(0, table.row_count)
+        if n_rows == 0:
+            return
+        row_idx = max(0, min(row_idx, n_rows - 1))
         try:
             table.move_cursor(row=row_idx, animate=False)
         except Exception:
@@ -544,6 +583,14 @@ class LayerDetailModal(ModalScreen):
             # Always allow delete (the project tolerates losing all sets);
             # arming state is owned by `_delete_set_clicked`.
             del_btn.disabled = False
+        except Exception:
+            pass
+
+        try:
+            rename_btn = self.query_one("#rename-set-btn", Button)
+            # Rename always available once a row is highlighted — the
+            # modal validates the new name itself.
+            rename_btn.disabled = self._selected_set is None
         except Exception:
             pass
 
@@ -628,18 +675,17 @@ class LayerDetailModal(ModalScreen):
             if f.exists():
                 f.unlink()
 
-        m = self._project.manifest()
-        homologs = m.setdefault("homologs", {})
-        sets = homologs.get("sets") or []
-        for i, s in enumerate(sets):
-            if s.get("name") == set_name:
-                s.pop("n_aligned", None)
-                remote = s.get("remote") or {}
-                remote.pop("align_job_id", None)
-                s["remote"] = remote
-                sets[i] = s
-                break
-        self._project.write(m)
+        with self._project.mutate() as m:
+            homologs = m.setdefault("homologs", {})
+            sets = homologs.get("sets") or []
+            for i, s in enumerate(sets):
+                if s.get("name") == set_name:
+                    s.pop("n_aligned", None)
+                    remote = s.get("remote") or {}
+                    remote.pop("align_job_id", None)
+                    s["remote"] = remote
+                    sets[i] = s
+                    break
         self.dismiss("reset-align")
 
     def _reset_homologs(self) -> None:
@@ -650,18 +696,17 @@ class LayerDetailModal(ModalScreen):
         if h_dir.exists():
             shutil.rmtree(h_dir)
 
-        m = self._project.manifest()
-        homologs = m.get("homologs") or {}
-        sets = homologs.get("sets") or []
-        sets = [s for s in sets if s.get("name") != active_name]
-        if sets:
-            homologs["sets"] = sets
-            # Make the next remaining set active.
-            homologs["active"] = sets[0].get("name", "default")
-            m["homologs"] = homologs
-        else:
-            m.pop("homologs", None)
-        self._project.write(m)
+        with self._project.mutate() as m:
+            homologs = m.get("homologs") or {}
+            sets = homologs.get("sets") or []
+            sets = [s for s in sets if s.get("name") != active_name]
+            if sets:
+                homologs["sets"] = sets
+                # Make the next remaining set active.
+                homologs["active"] = sets[0].get("name", "default")
+                m["homologs"] = homologs
+            else:
+                m.pop("homologs", None)
         self.dismiss("reset-homologs")
 
     def _reset_embeddings(self) -> None:
@@ -670,7 +715,6 @@ class LayerDetailModal(ModalScreen):
         e_dir = self._project.path / "embeddings"
         if e_dir.exists():
             shutil.rmtree(e_dir)
-        m = self._project.manifest()
-        m.pop("embeddings", None)
-        self._project.write(m)
+        with self._project.mutate() as m:
+            m.pop("embeddings", None)
         self.dismiss("reset-embeddings")

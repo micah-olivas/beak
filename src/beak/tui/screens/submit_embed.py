@@ -95,6 +95,7 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
             self._set_status, "[dim]Submitting (a few seconds)…[/dim]"
         )
 
+        mgr = None
         try:
             from ...remote.embeddings import ESMEmbeddings
             mgr = ESMEmbeddings()
@@ -104,18 +105,23 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
                 job_name=job_name,
                 repr_layers=layers,
             )
-            manifest = self._project.manifest()
-            emb = manifest.setdefault("embeddings", {})
-            remote = emb.setdefault("remote", {})
-            remote["job_id"] = job_id
-            emb["model"] = model
-            self._project.write(manifest)
+            with self._project.mutate() as manifest:
+                emb = manifest.setdefault("embeddings", {})
+                remote = emb.setdefault("remote", {})
+                remote["job_id"] = job_id
+                emb["model"] = model
         except Exception as e:  # noqa: BLE001
             self.app.call_from_thread(
                 self._set_status, f"[red]{type(e).__name__}: {e}[/red]"
             )
             self._submitting = False
             return
+        finally:
+            try:
+                if mgr is not None and getattr(mgr, "conn", None) is not None:
+                    mgr.conn.close()
+            except Exception:
+                pass
 
         self.app.call_from_thread(self.dismiss, job_id)
 

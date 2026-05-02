@@ -85,22 +85,28 @@ class SubmitTaxonomyModal(ModalScreen[Optional[str]]):
         self.app.call_from_thread(
             self._set_status, "[dim]Submitting (a few seconds)…[/dim]"
         )
+        mgr = None
         try:
             from ...remote.taxonomy import MMseqsTaxonomy
             mgr = MMseqsTaxonomy()
             job_id = mgr.submit(str(hits), database=db, job_name=job_name)
-            manifest = self._project.manifest()
-            tax = manifest.setdefault("taxonomy", {})
-            remote = tax.setdefault("remote", {})
-            remote["job_id"] = job_id
-            remote["database"] = db
-            self._project.write(manifest)
+            with self._project.mutate() as manifest:
+                tax = manifest.setdefault("taxonomy", {})
+                remote = tax.setdefault("remote", {})
+                remote["job_id"] = job_id
+                remote["database"] = db
         except Exception as e:  # noqa: BLE001
             self.app.call_from_thread(
                 self._set_status, f"[red]{type(e).__name__}: {e}[/red]"
             )
             self._submitting = False
             return
+        finally:
+            try:
+                if mgr is not None and getattr(mgr, "conn", None) is not None:
+                    mgr.conn.close()
+            except Exception:
+                pass
         self.app.call_from_thread(self.dismiss, job_id)
 
     def _set_status(self, msg: str) -> None:

@@ -17,6 +17,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Label, Static
 
 from ...project import BeakProject
+from ..widgets.server_status import ServerStatusBar
 
 
 _STATUS_COLORS = {
@@ -98,9 +99,16 @@ class ProjectListScreen(Screen):
     def __init__(self) -> None:
         super().__init__()
         self._projects: List[BeakProject] = []
+        # Mtime-keyed cache: { project_name: (manifest_mtime, row_dict) }.
+        # `_populate` only re-reads a project's manifest when its TOML
+        # mtime has changed since the last refresh — for users with 50+
+        # projects this turns the typical refresh from 50 file reads
+        # into 0.
+        self._row_cache: dict = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield ServerStatusBar(id="server-status")
         with Horizontal(id="list-body"):
             yield DataTable(id="projects-table", cursor_type="row")
             with Vertical(id="project-summary"):
@@ -127,15 +135,41 @@ class ProjectListScreen(Screen):
                 timeout=8,
             )
             return
+
+        live_names = set()
         for proj in self._projects:
-            m = proj.manifest()
-            target = m.get("target", {})
-            target_id = target.get("uniprot_id") or target.get("uniprot_name") or "-"
-            status_str = _format_status(proj.status_summary())
-            table.add_row(proj.name, target_id, status_str, key=proj.name)
+            row = self._row_for(proj)
+            table.add_row(
+                row["name"], row["target"], row["status"], key=row["name"]
+            )
+            live_names.add(proj.name)
+        # Drop cache entries for projects that no longer exist.
+        for stale in list(self._row_cache.keys() - live_names):
+            self._row_cache.pop(stale, None)
         # Seed the summary with the first row.
         if self._projects:
             self._update_summary(self._projects[0])
+
+    def _row_for(self, proj: BeakProject) -> dict:
+        """Mtime-cached row data. Re-reads the manifest only when the
+        TOML file's mtime has advanced since the last cached read."""
+        try:
+            mtime = proj.manifest_path.stat().st_mtime
+        except OSError:
+            mtime = -1.0
+        cached = self._row_cache.get(proj.name)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        m = proj.manifest()
+        target = m.get("target", {}) or {}
+        target_id = target.get("uniprot_id") or target.get("uniprot_name") or "-"
+        # `status_summary` reads the manifest itself; we can't easily
+        # avoid that second read without refactoring the API, but it's
+        # cheap and only fires on the slow path (cache miss).
+        status_str = _format_status(proj.status_summary())
+        row = {"name": proj.name, "target": target_id, "status": status_str}
+        self._row_cache[proj.name] = (mtime, row)
+        return row
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "projects-table":

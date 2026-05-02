@@ -86,6 +86,10 @@ class StructureView(Vertical):
         self._conservation = None
         self._sasa = None
         self._differential = None  # signed JSD per target residue
+        # Per-residue Pfam index (-1 = outside any domain). Populated
+        # lazily on demand via the manifest because the StructureView
+        # otherwise has no reason to read the domains layer.
+        self._pfam_idx = None
         self._cif_path: Optional[Path] = None
         # Honor persisted view prefs from the project manifest so the first
         # render after re-opening a project matches the user's last choice.
@@ -133,10 +137,42 @@ class StructureView(Vertical):
             self._reload_differential()
             if self._differential is None:
                 return False
+        if mode == "pfam":
+            self._reload_pfam()
+            if self._pfam_idx is None:
+                return False
         self._color_mode = mode
         self._refresh_subtitle()
         self._refresh_canvas()
         return True
+
+    def _reload_pfam(self) -> None:
+        """Build the per-residue Pfam index from the manifest's hmmscan hits."""
+        if self._coords is None:
+            self._pfam_idx = None
+            return
+        domains = (self._project.manifest().get("domains") or {}).get("hits") or []
+        if not domains:
+            self._pfam_idx = None
+            return
+        import numpy as np
+        n = len(self._coords)
+        idx = np.full(n, -1, dtype=np.int8)
+        for i, d in enumerate(domains):
+            try:
+                start = max(0, int(d.get("env_from", 1)) - 1)
+                end = min(n, int(d.get("env_to", 0)))
+            except (TypeError, ValueError):
+                continue
+            for pos in range(start, end):
+                if idx[pos] == -1:
+                    idx[pos] = i
+        self._pfam_idx = idx
+
+    def has_pfam(self) -> bool:
+        if self._pfam_idx is None:
+            self._reload_pfam()
+        return self._pfam_idx is not None
 
     def _reload_differential(self) -> None:
         """Pull the active comparative scores from disk; cheap on every flip."""
@@ -205,6 +241,9 @@ class StructureView(Vertical):
 
     def set_midpoint(self, midpoint: float) -> None:
         self._midpoint = midpoint
+        # The legend lives in the border subtitle and shows `mid=NN` for
+        # conservation mode, so it has to refresh alongside the canvas.
+        self._refresh_subtitle()
         self._refresh_canvas()
 
     def set_view_mode(self, mode: str) -> None:
@@ -221,6 +260,11 @@ class StructureView(Vertical):
                 self._reload_differential()
             if self._differential is not None:
                 return self._differential
+        if self._color_mode == "pfam":
+            if self._pfam_idx is None:
+                self._reload_pfam()
+            if self._pfam_idx is not None:
+                return self._pfam_idx
         return self._plddt
 
     def has_conservation(self) -> bool:
@@ -230,9 +274,68 @@ class StructureView(Vertical):
         return self._sasa is not None
 
     def _refresh_subtitle(self) -> None:
-        # Color mode now lives in the inline footer dropdown, not the
-        # bottom border. Leave the subtitle empty for a cleaner look.
-        self.border_subtitle = ""
+        """Render the colorbar legend on the panel's bottom border.
+
+        Living on the border (rather than overlaying the canvas's last
+        row) tucks the legend literally into the corner of the panel
+        outline and frees up a row of structure pixels. Min/max labels
+        come along for free, mirroring the inline sequence-view legend.
+        """
+        self.border_subtitle = self._build_legend()
+
+    def _build_legend(self) -> str:
+        from ..structure import color_for_mode, DOMAIN_PALETTE
+
+        # Categorical Pfam mode: paint one chip per actual domain so
+        # the legend doubles as a mini-key. Capped so the chip strip
+        # doesn't push past the available subtitle width on narrow
+        # panels — the structure panel is 50–80 cells wide.
+        if self._color_mode == "pfam":
+            domains = (
+                self._project.manifest().get("domains") or {}
+            ).get("hits") or []
+            if not domains:
+                return ""
+            cells = []
+            for i in range(min(len(domains), 8)):
+                color = DOMAIN_PALETTE[i % len(DOMAIN_PALETTE)]
+                cells.append(f"[{color}]█[/{color}]")
+            return "[dim]Pfam[/dim] " + "".join(cells)
+
+        bar_cells = 10
+        cells = []
+        for i in range(bar_cells):
+            score = (i / (bar_cells - 1)) * 100
+            color = color_for_mode(score, self._color_mode, self._midpoint)
+            cells.append(f"[{color}]█[/{color}]")
+        bar = "".join(cells)
+
+        label = {
+            "plddt": "pLDDT",
+            "conservation": "cons",
+            "sasa": "SASA",
+            "differential": "diff",
+        }.get(self._color_mode, self._color_mode)
+
+        if self._color_mode == "conservation":
+            head = f"[dim]{label} mid={int(self._midpoint)}[/dim]"
+        else:
+            head = f"[dim]{label}[/dim]"
+
+        # Surface a stale-set badge in differential mode when the
+        # cached scores were computed against a different homolog set
+        # than is currently active. Mirrors the embeddings stale pill.
+        if self._color_mode == "differential":
+            try:
+                from ..comparative import differential_is_stale
+                if differential_is_stale(self._project):
+                    head = f"[yellow]{label} · stale[/yellow]"
+            except Exception:
+                pass
+
+        # Single-space gutter between the numeric labels and the bar so
+        # they don't read as continuous with the gradient.
+        return f"{head} [dim]0[/dim] {bar} [dim]100[/dim]"
 
     def _refresh_canvas(self) -> None:
         try:
@@ -373,32 +476,52 @@ class StructureView(Vertical):
         if w < 4 or h < 2:
             return ""
         scalar = self._scalar_for_mode()
+
+        # Conservation is the only mode with a user-adjustable midpoint,
+        # so it's the only one that earns a `▼` indicator. We reserve the
+        # last canvas row for the arrow and render the structure into
+        # the row above so the `▼` sits directly over the bar that lives
+        # in `border_subtitle` one row below.
+        show_arrow = (
+            self._color_mode == "conservation"
+            and h >= 3 and w >= 14
+        )
+        render_h = h - 1 if show_arrow else h
+
         rendered = render_structure(
-            self._coords, scalar, w, h,
+            self._coords, scalar, w, render_h,
             angle_y=radians(self._angle_y),
             angle_x=radians(self._angle_x),
             color_mode=self._color_mode,
             midpoint=self._midpoint,
             view_mode=self._view_mode,
         )
-        return self._overlay_corner_colorbar(rendered, w)
 
-    def _overlay_corner_colorbar(self, rendered: str, width: int) -> str:
-        """Tuck a tiny gradient bar into the bottom-right of the canvas."""
-        from ..structure import color_for_mode
+        if show_arrow:
+            rendered += "\n" + self._midpoint_arrow_row(w)
+        return rendered
+
+    def _midpoint_arrow_row(self, width: int) -> str:
+        """Single canvas row with `▼` aligned over the bar's mid cell.
+
+        Layout assumed for `border_subtitle`:
+            ... 0 [10-cell bar] 100
+        With Textual right-aligning the subtitle (default) and reserving
+        one cell for the bottom-right corner glyph, the bar's rightmost
+        cell sits 4 cells in from the panel's right edge ("100" + space
+        + corner). Translating to canvas coordinates (which are inset by
+        the panel's 2-cell horizontal padding + 1-cell border), the bar
+        occupies canvas cols `width-12` through `width-3`.
+        """
         bar_cells = 10
-        if width < bar_cells + 4:
-            return rendered
-        cells = []
-        for i in range(bar_cells):
-            score = (i / (bar_cells - 1)) * 100
-            color = color_for_mode(score, self._color_mode, self._midpoint)
-            cells.append(f"[{color}]█[/{color}]")
-        bar = "".join(cells)
-
-        lines = rendered.split("\n")
-        if not lines:
-            return rendered
-        pad_left = max(0, width - bar_cells)
-        lines[-1] = " " * pad_left + bar
-        return "\n".join(lines)
+        # Cell index closest to the current midpoint (0..bar_cells-1).
+        mid_idx = round((self._midpoint / 100.0) * (bar_cells - 1))
+        mid_idx = max(0, min(bar_cells - 1, mid_idx))
+        arrow_col = (width - 12) + mid_idx
+        if not 0 <= arrow_col < width:
+            return " " * width
+        return (
+            " " * arrow_col
+            + "[#65CBF3]▼[/#65CBF3]"
+            + " " * (width - arrow_col - 1)
+        )

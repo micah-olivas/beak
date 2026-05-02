@@ -184,21 +184,20 @@ class ImportExperimentModal(ModalScreen[Optional[str]]):
             dest = dest_dir / "raw.csv"
             shutil.copy2(path, dest)
 
-            manifest = self._project.manifest()
-            exps = manifest.setdefault("experiments", [])
-            exps[:] = [
-                e for e in exps
-                if not (isinstance(e, dict) and e.get("name") == name)
-            ]
-            exps.append({
-                "name": name,
-                "file": f"experiments/{name}/raw.csv",
-                "position_col": pos_col,
-                "perturbation_col": pert_col,
-                "property_cols": prop_cols,
-                "imported_at": datetime.now(),
-            })
-            self._project.write(manifest)
+            with self._project.mutate() as manifest:
+                exps = manifest.setdefault("experiments", [])
+                exps[:] = [
+                    e for e in exps
+                    if not (isinstance(e, dict) and e.get("name") == name)
+                ]
+                exps.append({
+                    "name": name,
+                    "file": f"experiments/{name}/raw.csv",
+                    "position_col": pos_col,
+                    "perturbation_col": pert_col,
+                    "property_cols": prop_cols,
+                    "imported_at": datetime.now(),
+                })
         except Exception as e:  # noqa: BLE001
             self._set_status(f"[red]Import failed: {e}[/red]")
             return

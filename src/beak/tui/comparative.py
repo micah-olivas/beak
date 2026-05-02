@@ -178,35 +178,60 @@ def build_comparative(
         # surface this via trait_summary's median to suggest a better split.
         return None
 
-    out_dir = project.path / "comparative"
-    out_dir.mkdir(exist_ok=True)
+    # Comparative scores are scoped to a single homolog set's
+    # alignment, so every cache file lives under that set's directory.
+    # The legacy project-level path (`project/comparative/`) is left
+    # untouched for backward compat with old projects, but new writes
+    # always land here.
+    out_dir = project.homologs_set_dir(project.active_set_name()) / "comparative"
+    out_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{_slug(column)}__{threshold:g}.npy"
     np.save(out_dir / fname, scores)
 
     if set_active:
         np.save(out_dir / "active.npy", scores)
         # Record provenance in the manifest for the modal / display.
-        m = project.manifest()
-        comp = m.setdefault("comparative", {})
-        comp["active_column"] = column
-        comp["active_threshold"] = float(threshold)
-        comp["active_n_high"] = int(sum(
-            1 for v in values if v is not None and v >= float(threshold)
-        ))
-        comp["active_n_low"] = int(sum(
-            1 for v in values if v is not None and v < float(threshold)
-        ))
-        comp["active_set"] = project.active_set_name()
-        comp["last_updated"] = datetime.now()
-        project.write(m)
+        with project.mutate() as m:
+            comp = m.setdefault("comparative", {})
+            comp["active_column"] = column
+            comp["active_threshold"] = float(threshold)
+            comp["active_n_high"] = int(sum(
+                1 for v in values if v is not None and v >= float(threshold)
+            ))
+            comp["active_n_low"] = int(sum(
+                1 for v in values if v is not None and v < float(threshold)
+            ))
+            comp["active_set"] = project.active_set_name()
+            comp["last_updated"] = datetime.now()
     return scores
 
 
 def load_active_scores(project) -> Optional[np.ndarray]:
-    """Read the cached active comparative scores, length-checked against target."""
-    p = project.path / "comparative" / "active.npy"
-    if not p.exists():
+    """Read the cached active comparative scores, length-checked against target.
+
+    Returns None if (a) no cache exists for the active homolog set, or
+    (b) the manifest's recorded `active_set` doesn't match the current
+    one — in which case the cached scores belong to a different
+    alignment and would mislead the structure ribbon.
+    """
+    active = project.active_set_name()
+    # New per-set path first, then fall back to the legacy project-
+    # level cache for projects created before per-set scoping landed.
+    candidates = [
+        project.homologs_set_dir(active) / "comparative" / "active.npy",
+        project.path / "comparative" / "active.npy",
+    ]
+    p = next((c for c in candidates if c.exists()), None)
+    if p is None:
         return None
+
+    # Stale guard: refuse the legacy cache when the manifest says it
+    # was computed for a different set.
+    comp = project.manifest().get("comparative") or {}
+    src_set = comp.get("active_set")
+    if src_set and src_set != active:
+        return None
+
     try:
         arr = np.load(p)
     except Exception:
@@ -215,6 +240,20 @@ def load_active_scores(project) -> Optional[np.ndarray]:
     if len(arr) != len(target):
         return None
     return arr
+
+
+def differential_is_stale(project) -> bool:
+    """True iff manifest's `comp.active_set` disagrees with the current set.
+
+    The structure view uses this to render a stale-set badge so the
+    user knows the cached differential coloring isn't from the current
+    alignment.
+    """
+    comp = project.manifest().get("comparative") or {}
+    src = comp.get("active_set")
+    if not src:
+        return False
+    return src != project.active_set_name()
 
 
 def active_label(project) -> Optional[str]:

@@ -8,9 +8,11 @@ add-structures, import, refresh, etc. land in subsequent commits.
 import json
 import re
 import shutil
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .manifest import read_manifest, write_manifest
 
@@ -20,6 +22,21 @@ _NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$')
 
 # Cached size in [stats] is reused for this many seconds in cached_size().
 _SIZE_CACHE_TTL = 3600
+
+# Per-path RLocks shared across BeakProject instances pointing at the
+# same directory. Threads can recurse (e.g. update_active_set calling
+# write inside the lock), so RLock not Lock.
+_MANIFEST_LOCKS: Dict[str, threading.RLock] = {}
+_MANIFEST_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _MANIFEST_LOCKS_GUARD:
+        lk = _MANIFEST_LOCKS.get(key)
+        if lk is None:
+            lk = _MANIFEST_LOCKS[key] = threading.RLock()
+        return lk
 
 
 class BeakProjectError(Exception):
@@ -111,9 +128,8 @@ class BeakProject:
         self.path = new_path
         self.name = new_name
         try:
-            m = self.manifest()
-            m.setdefault("project", {})["name"] = new_name
-            self.write(m)
+            with self.mutate() as m:
+                m.setdefault("project", {})["name"] = new_name
         except Exception:  # noqa: BLE001 — best-effort manifest sync
             pass
 
@@ -138,7 +154,31 @@ class BeakProject:
         return read_manifest(self.manifest_path)
 
     def write(self, data: Dict[str, Any]) -> None:
-        write_manifest(self.manifest_path, data)
+        # Always serialize writes against the per-project lock so two
+        # workers reading-modifying-writing the manifest in parallel
+        # can't clobber each other.
+        with _lock_for(self.path):
+            write_manifest(self.manifest_path, data)
+
+    @contextmanager
+    def mutate(self):
+        """Atomic read-modify-write of the manifest.
+
+        Use this from any worker that needs to mutate the manifest:
+
+            with project.mutate() as m:
+                m.setdefault("embeddings", {})["n_embeddings"] = n
+
+        The manifest is read inside the lock and written back when the
+        block exits, so a concurrent `_pull_homologs_now` can't read a
+        stale manifest, miss your update, and clobber it on its own
+        write. Cheap when uncontended (a single non-recursive lock
+        acquisition); a few microseconds when contended.
+        """
+        with _lock_for(self.path):
+            data = read_manifest(self.manifest_path)
+            yield data
+            write_manifest(self.manifest_path, data)
 
     # ---- multi-set homologs ----
     #
@@ -152,8 +192,27 @@ class BeakProject:
     DEFAULT_SET_NAME = "default"
 
     def active_set_name(self) -> str:
+        """Name of the active homolog set, falling back gracefully.
+
+        If `homologs.active` points at a name that no longer exists in
+        `homologs.sets` (e.g. after a delete that removed the active
+        set without picking a successor), prefer the first set that
+        does exist over returning a stale name. If there are no sets
+        at all, fall back to `DEFAULT_SET_NAME` — this is the literal
+        sentinel callers like `active_homologs_dir` use to compute the
+        path of a not-yet-created set, not a claim that a "default" set
+        is real.
+        """
         m = self.manifest()
-        return (m.get("homologs") or {}).get("active", self.DEFAULT_SET_NAME)
+        homologs = m.get("homologs") or {}
+        sets = homologs.get("sets") or []
+        names = [s.get("name") for s in sets if s.get("name")]
+        active = homologs.get("active")
+        if active and active in names:
+            return active
+        if names:
+            return names[0]
+        return self.DEFAULT_SET_NAME
 
     def active_homologs_dir(self, ensure: bool = False) -> Path:
         """Path to the active set's homologs directory.
@@ -181,25 +240,72 @@ class BeakProject:
         """
         import shutil
         self._migrate_homologs_to_sets()
-        m = self.manifest()
-        homologs = m.get("homologs") or {}
-        sets = list(homologs.get("sets") or [])
-        new_sets = [s for s in sets if s.get("name") != name]
-        if len(new_sets) == len(sets):
+        with self.mutate() as m:
+            homologs = m.get("homologs") or {}
+            sets = list(homologs.get("sets") or [])
+            new_sets = [s for s in sets if s.get("name") != name]
+            if len(new_sets) == len(sets):
+                return False
+
+            d = self.homologs_set_dir(name)
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+
+            if new_sets:
+                homologs["sets"] = new_sets
+                if homologs.get("active") == name:
+                    homologs["active"] = new_sets[0].get("name", self.DEFAULT_SET_NAME)
+                m["homologs"] = homologs
+            else:
+                m.pop("homologs", None)
+        return True
+
+    def rename_homolog_set(self, old_name: str, new_name: str) -> bool:
+        """Rename a homolog set: move its directory + update the manifest.
+
+        Validates the new name against the same regex as project names so
+        downstream paths stay safe. If the active set is being renamed,
+        the manifest's `active` pointer is updated to match. Raises
+        BeakProjectError on invalid name, collision, or unknown source;
+        returns False only when the source set isn't in the manifest.
+        """
+        if not _NAME_RE.match(new_name):
+            raise BeakProjectError(
+                f"Invalid set name '{new_name}'. Use letters, digits, "
+                "'_' or '-' (must start with letter/digit, max 64 chars)."
+            )
+        if old_name == new_name:
+            return True
+
+        self._migrate_homologs_to_sets()
+        sets = self.homologs_sets()
+        if not any(s.get("name") == old_name for s in sets):
             return False
+        if any(s.get("name") == new_name for s in sets):
+            raise BeakProjectError(
+                f"A set named '{new_name}' already exists."
+            )
 
-        d = self.homologs_set_dir(name)
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
+        # Move the on-disk directory first; any failure surfaces before
+        # we touch the manifest, leaving state consistent.
+        old_dir = self.homologs_set_dir(old_name)
+        new_dir = self.homologs_set_dir(new_name)
+        if old_dir.exists():
+            try:
+                old_dir.rename(new_dir)
+            except OSError as e:
+                raise BeakProjectError(
+                    f"Could not move set directory: {e}"
+                ) from e
 
-        if new_sets:
-            homologs["sets"] = new_sets
-            if homologs.get("active") == name:
-                homologs["active"] = new_sets[0].get("name", self.DEFAULT_SET_NAME)
-            m["homologs"] = homologs
-        else:
-            m.pop("homologs", None)
-        self.write(m)
+        with self.mutate() as m:
+            homologs = m.setdefault("homologs", {})
+            for s in homologs.get("sets") or []:
+                if s.get("name") == old_name:
+                    s["name"] = new_name
+                    break
+            if homologs.get("active") == old_name:
+                homologs["active"] = new_name
         return True
 
     def homologs_sets(self) -> List[Dict[str, Any]]:
@@ -219,30 +325,26 @@ class BeakProject:
     def update_active_set(self, **fields) -> None:
         """Merge `fields` into the active set's dict; create it if absent."""
         self._migrate_homologs_to_sets()
-        m = self.manifest()
-        homologs = m.setdefault("homologs", {})
-        active = homologs.setdefault("active", self.DEFAULT_SET_NAME)
-        sets = homologs.setdefault("sets", [])
-        for s in sets:
-            if s.get("name") == active:
-                s.update(fields)
-                self.write(m)
-                return
-        new_set = {"name": active, **fields}
-        sets.append(new_set)
-        self.write(m)
+        with self.mutate() as m:
+            homologs = m.setdefault("homologs", {})
+            active = homologs.setdefault("active", self.DEFAULT_SET_NAME)
+            sets = homologs.setdefault("sets", [])
+            for s in sets:
+                if s.get("name") == active:
+                    s.update(fields)
+                    return
+            sets.append({"name": active, **fields})
 
     def set_active_set(self, name: str) -> bool:
         """Switch the active set. Returns True if `name` exists."""
         self._migrate_homologs_to_sets()
-        m = self.manifest()
-        homologs = m.setdefault("homologs", {})
-        for s in homologs.get("sets") or []:
-            if s.get("name") == name:
-                homologs["active"] = name
-                self.write(m)
-                return True
-        return False
+        with self.mutate() as m:
+            homologs = m.setdefault("homologs", {})
+            for s in homologs.get("sets") or []:
+                if s.get("name") == name:
+                    homologs["active"] = name
+                    return True
+            return False
 
     def add_homolog_set(self, name: str, **fields) -> None:
         """Register a new set in the manifest. Doesn't create files."""
@@ -251,19 +353,17 @@ class BeakProject:
                 f"Invalid set name '{name}'. Use letters, digits, '_' or '-'."
             )
         self._migrate_homologs_to_sets()
-        m = self.manifest()
-        homologs = m.setdefault("homologs", {})
-        sets = homologs.setdefault("sets", [])
-        for s in sets:
-            if s.get("name") == name:
-                # Already exists — update in place.
-                s.update(fields)
-                self.write(m)
-                return
-        sets.append({"name": name, **fields})
-        if "active" not in homologs:
-            homologs["active"] = name
-        self.write(m)
+        with self.mutate() as m:
+            homologs = m.setdefault("homologs", {})
+            sets = homologs.setdefault("sets", [])
+            for s in sets:
+                if s.get("name") == name:
+                    # Already exists — update in place.
+                    s.update(fields)
+                    return
+            sets.append({"name": name, **fields})
+            if "active" not in homologs:
+                homologs["active"] = name
 
     def _migrate_homologs_to_sets(self) -> None:
         """One-shot: convert legacy `homologs/{file}` + flat manifest
