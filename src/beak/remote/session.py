@@ -3,9 +3,22 @@
 from pathlib import Path
 from typing import Optional
 
-from fabric import Connection
+from fabric import Config, Connection
 
 from .base import RemoteJobManager
+
+
+def _no_stdin_config() -> Config:
+    """Fabric config that disables stdin forwarding.
+
+    Required when running under Textual: the TUI takes over the local
+    stdin (raw mode for keyboard events), so Fabric's default
+    stdin-forwarding thread crashes mid-`conn.run` with an OSError on
+    `paramiko.channel.sendall`. Setting `run.in_stream=False` skips
+    the forwarding thread entirely, which is what we want for all of
+    beak's non-interactive remote commands.
+    """
+    return Config(overrides={"run": {"in_stream": False}})
 
 
 class BeakSession:
@@ -46,7 +59,8 @@ class BeakSession:
             host=host,
             user=user,
             connect_timeout=10,
-            connect_kwargs={"key_filename": str(Path(key_path).expanduser())}
+            connect_kwargs={"key_filename": str(Path(key_path).expanduser())},
+            config=_no_stdin_config(),
         )
 
         # Lazy instances

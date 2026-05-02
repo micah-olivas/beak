@@ -156,8 +156,12 @@ def cancel(job_id):
 @main.command()
 @click.argument('job_id')
 @click.option('--parse', is_flag=True, help='Parse results and print summary')
-def results(job_id, parse):
-    """Download job results"""
+@click.option('--taxonomy', '-t', 'with_taxonomy', is_flag=True,
+              help='(search jobs) Build hits_taxonomy.tsv on the remote via '
+                   '`mmseqs convertalis` if it is missing, then download. '
+                   'Use this for searches submitted before taxonomy-by-default.')
+def results(job_id, parse, with_taxonomy):
+    """Download job results."""
     mgr = get_manager(job_id=job_id)
 
     # Embeddings have a richer results story than "print the DataFrame" —
@@ -179,12 +183,70 @@ def results(job_id, parse):
     else:
         click.echo("Results download not supported for this job type.")
 
+    # Extract / fetch taxonomy for search jobs. Default behavior is
+    # "download if already on the remote"; --taxonomy forces the build
+    # when missing (useful for pre-taxonomy-by-default searches).
+    if mgr.JOB_TYPE == 'search':
+        _maybe_show_search_taxonomy(mgr, job_id, force_build=with_taxonomy)
+
+
+def _maybe_show_search_taxonomy(mgr, job_id: str, force_build: bool = False):
+    """Download (and optionally build) hits_taxonomy.tsv for a search job.
+
+    When ``force_build`` is False, only pulls the TSV if it already
+    exists remotely — the default `beak results` call shouldn't trigger
+    a convertalis rebuild on every invocation. When True, runs
+    ensure_remote_hits_taxonomy first, so the TSV is materialized even
+    for searches submitted before taxonomy-by-default.
+    """
+    try:
+        if force_build:
+            tax = mgr.get_hit_taxonomy(job_id, refresh=False)
+        else:
+            # Peek at the remote: only download if it's already there.
+            job_db = mgr._load_job_db()
+            remote_path = job_db[job_id]['remote_path']
+            remote_tsv = f"{remote_path}/hits_taxonomy.tsv"
+            check = mgr.conn.run(
+                f'[ -s {remote_tsv} ] && echo OK || echo MISSING',
+                hide=True, warn=True,
+            )
+            if check.stdout.strip() != 'OK':
+                return  # silent — searches without taxonomy shouldn't be noisy
+            tax = mgr.get_hit_taxonomy(job_id)
+    except Exception as exc:  # noqa: BLE001 — taxonomy is opportunistic
+        click.echo(f"(couldn't fetch taxonomy: {exc})")
+        return
+
+    if tax.empty:
+        if force_build:
+            click.echo(
+                "(target DB has no taxonomy — no hits_taxonomy.tsv produced)"
+            )
+        return
+
+    from pathlib import Path
+    project_dir = mgr.get_project_dir(job_id)
+    tsv_path = Path(project_dir) / "hits_taxonomy.tsv"
+    n_domains = tax['domain'].nunique(dropna=True)
+    n_phyla = tax['phylum'].nunique(dropna=True)
+    click.echo(
+        f"Taxonomy: {len(tax):,} hits, {n_domains} domain(s), "
+        f"{n_phyla} phyla  →  {tsv_path}"
+    )
+    click.echo("  from beak.embeddings import load_hit_taxonomy")
+    click.echo(f"  tax = load_hit_taxonomy('{tsv_path}')")
+
 
 def _show_embeddings_results(mgr, job_id: str):
     """Download an embeddings job and print a human-friendly summary."""
     embeddings_dir = mgr.download(job_id)
 
-    from ..embeddings import load_mean_embeddings, load_per_token_embeddings
+    from ..embeddings import (
+        load_mean_embeddings,
+        load_per_token_embeddings,
+        load_hit_taxonomy,
+    )
 
     info = mgr._load_job_db().get(job_id, {})
     model = info.get('model', '?')
@@ -193,6 +255,7 @@ def _show_embeddings_results(mgr, job_id: str):
     mean_path = embeddings_dir / 'mean_embeddings.pkl'
     tok_path = embeddings_dir / 'per_token_embeddings.pkl'
     failed_path = embeddings_dir / 'failed.tsv'
+    tax_path = embeddings_dir / 'hits_taxonomy.tsv'
 
     click.echo(f"\nModel: {model}")
     click.echo(f"Layers: {params.get('repr_layers', [])}")
@@ -217,6 +280,16 @@ def _show_embeddings_results(mgr, job_id: str):
         if n_failed:
             click.echo(f"Failed sequences:      {n_failed}  →  {failed_path}")
 
+    tax_df = None
+    if tax_path.exists() and tax_path.stat().st_size > 0:
+        tax_df = load_hit_taxonomy(tax_path)
+        n_domains = tax_df['domain'].nunique(dropna=True) if not tax_df.empty else 0
+        n_phyla = tax_df['phylum'].nunique(dropna=True) if not tax_df.empty else 0
+        click.echo(
+            f"Taxonomy:              {len(tax_df):,} hits, "
+            f"{n_domains} domain(s), {n_phyla} phyla  →  {tax_path}"
+        )
+
     click.echo("\nLoad in Python:")
     if mean_path.exists():
         click.echo("  from beak.embeddings import load_mean_embeddings")
@@ -224,3 +297,7 @@ def _show_embeddings_results(mgr, job_id: str):
     if tok_path.exists():
         click.echo("  from beak.embeddings import load_per_token_embeddings")
         click.echo(f"  tok = load_per_token_embeddings('{tok_path}')")
+    if tax_df is not None:
+        click.echo("  from beak.embeddings import load_hit_taxonomy")
+        click.echo(f"  tax = load_hit_taxonomy('{tax_path}')")
+        click.echo("  # plot_pca(df, color=tax.loc[df.index, 'domain'])")

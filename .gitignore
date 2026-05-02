@@ -50,6 +50,9 @@ my*
 # Cached reference datasets (downloaded on first use via beak.datasets)
 src/beak/datasets/data/*.tsv
 src/beak/datasets/data/*.csv
+src/beak/datasets/data/*.parquet
+src/beak/datasets/data/*.jsonl.gz
+src/beak/datasets/data/*.jsonl
 
 # Additional ignores
 __pycache__/

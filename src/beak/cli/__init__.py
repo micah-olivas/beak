@@ -7,5 +7,7 @@ from . import submit
 from . import pfam
 from . import structures
 from . import setup
+from . import project
+from . import ui
 
 __all__ = ['main']

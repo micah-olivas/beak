@@ -30,17 +30,20 @@ def annotate_temperature(
     temps = load_growth_temps()
 
     if method == 'exact':
+        # Rename the lookup table's `organism`/`domain` upfront so they
+        # can't collide with same-named columns already on `df` (which
+        # is the case when the input is the project's taxonomy table).
+        lookup = temps[['organism', 'temperature', 'domain']].rename(
+            columns={'organism': '_temp_organism', 'domain': 'temp_domain'}
+        )
         merged = df.merge(
-            temps[['organism', 'temperature', 'domain']],
+            lookup,
             left_on=organism_col,
-            right_on='organism',
+            right_on='_temp_organism',
             how='left'
         )
-        merged = merged.rename(columns={
-            'temperature': 'growth_temp',
-            'domain': 'temp_domain'
-        })
-        merged = merged.drop(columns=['organism'], errors='ignore')
+        merged = merged.rename(columns={'temperature': 'growth_temp'})
+        merged = merged.drop(columns=['_temp_organism'], errors='ignore')
 
     elif method == 'fuzzy':
         try:
@@ -61,16 +64,17 @@ def annotate_temperature(
         df['matched_organism'] = [m[0] for m in matches]
         df['match_score'] = [m[1] for m in matches]
 
+        lookup = temps[['organism', 'temperature', 'domain']].rename(
+            columns={'organism': '_temp_organism', 'domain': 'temp_domain'}
+        )
         merged = df.merge(
-            temps[['organism', 'temperature', 'domain']],
+            lookup,
             left_on='matched_organism',
-            right_on='organism',
+            right_on='_temp_organism',
             how='left'
         )
-        merged = merged.rename(columns={
-            'temperature': 'growth_temp',
-            'domain': 'temp_domain'
-        })
+        merged = merged.rename(columns={'temperature': 'growth_temp'})
+        merged = merged.drop(columns=['_temp_organism'], errors='ignore')
     else:
         raise ValueError(f"Unknown method: {method}. Use 'exact' or 'fuzzy'")
 

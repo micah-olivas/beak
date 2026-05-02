@@ -1,0 +1,404 @@
+"""StructureView — braille ribbon panel with header toggles.
+
+Loads the AlphaFold model for the project's UniProt ID (fetching on
+first view) and renders Cα coordinates as braille characters colored
+by a per-residue scalar (pLDDT or conservation).
+
+Layout: a header row with a clickable color-mode pill, plus the
+braille canvas below it. The canvas owns mouse events for drag-rotate.
+
+Worker → state → render() pattern: the load worker only writes state and
+calls refresh() on the canvas — calling self.update() from a worker thread
+with heavy markup content trips a Textual 8.x bug.
+"""
+
+from pathlib import Path
+from typing import Optional, Tuple
+
+from textual import work
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.message import Message
+from textual.widgets import Static
+
+from ...project import BeakProject
+from .colorbar import Colorbar
+
+
+class _StructureCanvas(Static):
+    """Inner braille-rendering body. Holds no state; queries the parent."""
+
+    ALLOW_SELECT = False
+
+    def __init__(self, parent_view: "StructureView", **kwargs) -> None:
+        super().__init__("[dim]Loading structure…[/dim]", **kwargs)
+        self._pv = parent_view
+
+    def render(self):
+        return self._pv._render_canvas(self.size.width, self.size.height)
+
+    def on_resize(self, event) -> None:
+        if self._pv._coords is not None:
+            self.refresh()
+
+    def on_mouse_down(self, event) -> None:
+        self._pv._canvas_mouse_down(self, event)
+
+    def on_mouse_move(self, event) -> None:
+        self._pv._canvas_mouse_move(event)
+
+    def on_mouse_up(self, event) -> None:
+        self._pv._canvas_mouse_up(self, event)
+
+
+class StructureView(Vertical):
+    """Outer panel: header pill row + braille canvas + state."""
+
+    DEFAULT_CSS = """
+    StructureView { height: auto; }
+    /* The canvas fills the panel; the gradient is overlaid in the
+       bottom-right by `_render_canvas`, no separate widget needed. */
+    StructureView _StructureCanvas {
+        height: 1fr;
+    }
+    """
+
+    # Rotation: ~12 s per revolution (3°/frame at 10 fps).
+    _ROTATION_FPS = 10
+    _DEGREES_PER_FRAME = 3.0
+
+    # Drag sensitivity: degrees per cell.
+    _DRAG_DEG_PER_CELL_X = 5.0
+    _DRAG_DEG_PER_CELL_Y = 8.0
+    _MAX_TILT = 90.0
+
+    class CifLoaded(Message):
+        """Posted when the target's CIF is on disk and parsed."""
+        def __init__(self, cif_path: Path) -> None:
+            super().__init__()
+            self.cif_path = cif_path
+
+    def __init__(self, project: BeakProject, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._project = project
+        self._coords = None
+        self._plddt = None
+        self._conservation = None
+        self._sasa = None
+        self._differential = None  # signed JSD per target residue
+        self._cif_path: Optional[Path] = None
+        # Honor persisted view prefs from the project manifest so the first
+        # render after re-opening a project matches the user's last choice.
+        prefs = (project.manifest().get("view") or {})
+        self._color_mode: str = prefs.get("color_mode", "plddt")
+        self._midpoint: float = 50.0
+        legacy_view = prefs.get("view_mode", "trace")
+        self._view_mode: str = "trace" if legacy_view == "shaded" else legacy_view
+        self._status: str = "[dim]Loading structure…[/dim]"
+        self._angle_y: float = 0.0
+        self._angle_x: float = 0.0
+        self._rotating: bool = True
+        self._dragging: bool = False
+        self._drag_start_x: int = 0
+        self._drag_start_y: int = 0
+        self._drag_start_angle_y: float = 0.0
+        self._drag_start_angle_x: float = 0.0
+        self._was_rotating_before_drag: bool = True
+
+        # Size the panel: width tracks protein length; height stays
+        # tight so the sequence panel below gets enough room for
+        # multi-block layouts on long proteins.
+        target = (project.manifest().get("target") or {})
+        length = int(target.get("length") or 200)
+        self.styles.width = max(50, min(80, 30 + length // 20))
+        self.styles.height = max(18, min(22, 16 + length // 60))
+
+    def compose(self) -> ComposeResult:
+        yield _StructureCanvas(self, id="sv-canvas")
+        # No separate colorbar widget — the gradient is overlaid by
+        # `_render_canvas` in the bottom-right corner of the canvas.
+
+    def on_mount(self) -> None:
+        self._refresh_subtitle()
+        self._load()
+        self.set_interval(1.0 / self._ROTATION_FPS, self._tick)
+
+    def set_color_mode(self, mode: str) -> bool:
+        """Switch the per-residue color scalar. Returns True if applied."""
+        if mode == "conservation" and self._conservation is None:
+            return False
+        if mode == "sasa" and self._sasa is None:
+            return False
+        if mode == "differential":
+            self._reload_differential()
+            if self._differential is None:
+                return False
+        self._color_mode = mode
+        self._refresh_subtitle()
+        self._refresh_canvas()
+        return True
+
+    def _reload_differential(self) -> None:
+        """Pull the active comparative scores from disk; cheap on every flip."""
+        try:
+            from ..comparative import load_active_scores
+            self._differential = load_active_scores(self._project)
+        except Exception:
+            self._differential = None
+
+    def has_differential(self) -> bool:
+        if self._differential is None:
+            self._reload_differential()
+        return self._differential is not None
+
+    def reload_set_data(self) -> None:
+        """Recompute set-scoped scalars (conservation/SASA/differential).
+
+        Cheaper than a full reload — keeps the cached coords + pLDDT and
+        only refreshes things that depend on which homolog set is
+        active. Call this after the user switches sets.
+        """
+        if self._coords is None:
+            return
+        try:
+            from ..conservation import compute_quick_conservation
+            cons = compute_quick_conservation(self._project)
+            self._conservation = (
+                cons if cons is not None and len(cons) == len(self._coords) else None
+            )
+        except Exception:
+            self._conservation = None
+        self._reload_differential()
+        self._refresh_canvas()
+
+    def export_current_to_chimerax(self, out_dir: Path, name: str) -> Optional[Tuple[Path, Path, int]]:
+        """Write a CIF + .cxc for whatever scalar is currently rendered.
+
+        Returns ``(cif_out, cxc_out, n_residues)`` on success, None when
+        the underlying CIF or scalar isn't loaded yet.
+        """
+        cif_path = self._cif_path
+        if cif_path is None or not cif_path.exists():
+            return None
+        scalars = self._scalar_for_mode()
+        if scalars is None:
+            return None
+        target_seq = self._project.target_sequence() or ""
+        if not target_seq or len(scalars) != len(target_seq):
+            return None
+        from ...viz.chimerax import export_chimerax
+        title = f"{self._project.name} · {self._color_mode}"
+        if self._color_mode == "differential":
+            from ..comparative import active_label
+            label = active_label(self._project)
+            if label:
+                title = f"{self._project.name} · {label}"
+        return export_chimerax(
+            cif_path=cif_path,
+            scores=scalars,
+            target_seq=target_seq,
+            out_dir=out_dir,
+            name=name,
+            mode=self._color_mode,
+            title=title,
+        )
+
+    def set_midpoint(self, midpoint: float) -> None:
+        self._midpoint = midpoint
+        self._refresh_canvas()
+
+    def set_view_mode(self, mode: str) -> None:
+        self._view_mode = mode
+        self._refresh_canvas()
+
+    def _scalar_for_mode(self):
+        if self._color_mode == "conservation" and self._conservation is not None:
+            return self._conservation
+        if self._color_mode == "sasa" and self._sasa is not None:
+            return self._sasa
+        if self._color_mode == "differential":
+            if self._differential is None:
+                self._reload_differential()
+            if self._differential is not None:
+                return self._differential
+        return self._plddt
+
+    def has_conservation(self) -> bool:
+        return self._conservation is not None
+
+    def has_sasa(self) -> bool:
+        return self._sasa is not None
+
+    def _refresh_subtitle(self) -> None:
+        # Color mode now lives in the inline footer dropdown, not the
+        # bottom border. Leave the subtitle empty for a cleaner look.
+        self.border_subtitle = ""
+
+    def _refresh_canvas(self) -> None:
+        try:
+            self.query_one("#sv-canvas", _StructureCanvas).refresh()
+        except Exception:
+            pass
+
+    def _tick(self) -> None:
+        if not self._rotating or self._coords is None:
+            return
+        self._angle_y = (self._angle_y + self._DEGREES_PER_FRAME) % 360.0
+        self._refresh_canvas()
+
+    # ---- mouse events forwarded by the canvas ----
+
+    def _canvas_mouse_down(self, canvas, event) -> None:
+        if self._coords is None:
+            return
+        canvas.capture_mouse()
+        self._dragging = True
+        self._drag_start_x = event.x
+        self._drag_start_y = event.y
+        self._drag_start_angle_y = self._angle_y
+        self._drag_start_angle_x = self._angle_x
+        self._was_rotating_before_drag = self._rotating
+        self._rotating = False
+        event.stop()
+
+    def _canvas_mouse_move(self, event) -> None:
+        if not self._dragging:
+            return
+        delta_x = event.x - self._drag_start_x
+        delta_y = event.y - self._drag_start_y
+        self._angle_y = (
+            self._drag_start_angle_y + delta_x * self._DRAG_DEG_PER_CELL_X
+        ) % 360.0
+        new_tilt = self._drag_start_angle_x + delta_y * self._DRAG_DEG_PER_CELL_Y
+        self._angle_x = max(-self._MAX_TILT, min(self._MAX_TILT, new_tilt))
+        self._refresh_canvas()
+
+    def _canvas_mouse_up(self, canvas, event) -> None:
+        if not self._dragging:
+            return
+        canvas.release_mouse()
+        self._dragging = False
+        self._rotating = self._was_rotating_before_drag
+
+    # ---- async load ----
+
+    @work(thread=True, exclusive=True, group="structure-load")
+    def _load(self) -> None:
+        from ..structure import fetch_alphafold, load_ca_coords
+
+        try:
+            target = self._project.manifest().get("target", {}) or {}
+            uniprot = target.get("uniprot_id")
+            if not uniprot:
+                self._status = "[dim]No structure: project has no UniProt ID.[/dim]"
+                self.app.call_from_thread(self._refresh_canvas)
+                return
+
+            structures_dir = self._project.path / "structures"
+            existing = (
+                sorted(structures_dir.glob(f"{uniprot}_AF.cif"))
+                if structures_dir.exists() else []
+            )
+
+            if existing:
+                cif_path = existing[0]
+            else:
+                self._status = f"[dim]Fetching AlphaFold model for {uniprot}…[/dim]"
+                self.app.call_from_thread(self._refresh_canvas)
+                cif_path = fetch_alphafold(uniprot, structures_dir)
+
+            coords, plddt = load_ca_coords(cif_path)
+        except FileNotFoundError as e:
+            self._status = f"[dim]{e}[/dim]"
+            self.app.call_from_thread(self._refresh_canvas)
+            return
+        except Exception as e:  # noqa: BLE001
+            self._status = f"[red]Structure error: {e}[/red]"
+            self.app.call_from_thread(self._refresh_canvas)
+            return
+
+        # Quick per-residue conservation from hits.fasta when present.
+        conservation = None
+        try:
+            from ..conservation import compute_quick_conservation
+            cons = compute_quick_conservation(self._project)
+            if cons is not None and len(cons) == len(plddt):
+                conservation = cons
+        except Exception:
+            pass
+
+        # Per-residue SASA from the CIF.
+        sasa = None
+        try:
+            from ..structure import load_sasa
+            s = load_sasa(cif_path, len(plddt))
+            if s is not None and len(s) == len(plddt):
+                sasa = s
+        except Exception:
+            pass
+
+        # PCA-align so the protein's longest axis is horizontal at the
+        # default rotation — fills the panel width nicely from the start.
+        try:
+            import numpy as np
+            centered = coords - coords.mean(axis=0)
+            _, _, vt = np.linalg.svd(centered, full_matrices=False)
+            # Ensure right-handed coordinate system to avoid mirror-image
+            if np.linalg.det(vt) < 0:
+                vt[2] *= -1
+            coords = centered @ vt.T
+        except Exception:
+            pass
+
+        self._coords = coords
+        self._plddt = plddt
+        self._conservation = conservation
+        self._sasa = sasa
+        self.app.call_from_thread(self._on_loaded, cif_path, uniprot)
+
+    def _on_loaded(self, cif_path: Path, uniprot: str) -> None:
+        self._cif_path = cif_path
+        self.border_title = f"{uniprot} · AlphaFold"
+        self._refresh_subtitle()
+        self._refresh_canvas()
+        self.post_message(self.CifLoaded(cif_path))
+
+    # ---- rendering, called by inner _StructureCanvas.render ----
+
+    def _render_canvas(self, w: int, h: int) -> str:
+        if self._coords is None:
+            return self._status
+        from math import radians
+        from ..structure import render_structure
+        if w < 4 or h < 2:
+            return ""
+        scalar = self._scalar_for_mode()
+        rendered = render_structure(
+            self._coords, scalar, w, h,
+            angle_y=radians(self._angle_y),
+            angle_x=radians(self._angle_x),
+            color_mode=self._color_mode,
+            midpoint=self._midpoint,
+            view_mode=self._view_mode,
+        )
+        return self._overlay_corner_colorbar(rendered, w)
+
+    def _overlay_corner_colorbar(self, rendered: str, width: int) -> str:
+        """Tuck a tiny gradient bar into the bottom-right of the canvas."""
+        from ..structure import color_for_mode
+        bar_cells = 10
+        if width < bar_cells + 4:
+            return rendered
+        cells = []
+        for i in range(bar_cells):
+            score = (i / (bar_cells - 1)) * 100
+            color = color_for_mode(score, self._color_mode, self._midpoint)
+            cells.append(f"[{color}]█[/{color}]")
+        bar = "".join(cells)
+
+        lines = rendered.split("\n")
+        if not lines:
+            return rendered
+        pad_left = max(0, width - bar_cells)
+        lines[-1] = " " * pad_left + bar
+        return "\n".join(lines)

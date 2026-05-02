@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "beak"
 version = "0.1.0"
-description = "A toolkit for evolutionary sequence analysis and remote job management"
+description = "A toolkit for interpreting protein biophysics and biochemistry experiments alongside evolutionary, structural, and other contextual data."
 authors = [{name = "Micah Olivas", email = "micah5051olivas@gmail.com"}]
 license = {text = "MIT"}
 readme = "README.md"
@@ -43,6 +43,8 @@ dependencies = [
     "click>=8.0",
     "rich>=13.0",
     "tomli>=1.0; python_version < '3.11'",
+    "tomli-w>=1.0",
+    "textual>=0.50",
 ]
 
 [project.scripts]

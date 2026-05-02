@@ -54,11 +54,13 @@ class RemoteJobManager:
             if key_path is None:
                 key_path = self._find_ssh_key()
 
+            from .session import _no_stdin_config
             self.conn = Connection(
                 host=host,
                 user=user,
                 connect_timeout=10,
-                connect_kwargs={"key_filename": str(Path(key_path).expanduser())}
+                connect_kwargs={"key_filename": str(Path(key_path).expanduser())},
+                config=_no_stdin_config(),
             )
 
         # Default remote job directory
