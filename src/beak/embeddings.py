@@ -127,6 +127,143 @@ def load_per_token_embeddings(
     return pd.concat(frames) if frames else pd.DataFrame()
 
 
+def load_or_compute_pca_2d(
+    pkl_path: Union[str, Path],
+    layer: Optional[Union[int, str]] = None,
+):
+    """Return 2-component PCA coords for a `mean_embeddings.pkl`, cached.
+
+    Sidecar lives at `<pkl>.pca.npz` next to the pickle. Cache validity
+    is keyed on:
+        - sidecar mtime ≥ pkl mtime (catches model swaps, fresh nseqs,
+          re-pulls — anything that rewrites the pickle).
+        - stored ``layer`` matches the requested layer (a layer switch
+          inside the same pickle invalidates the cache).
+        - stored embedding dim matches the pickle's current dim (defense
+          against a stale sidecar copied across files).
+
+    On miss, deserializes the pkl, fits a 2-component PCA, and writes
+    the sidecar atomically. The pickle gets read at most once per cache
+    miss; the sidecar is `np.load(allow_pickle=False)` + a couple of
+    integer comparisons on hit, ~30 ms even for 25k sequences.
+
+    Returns:
+        ``(coords, var_ratio, seq_ids, n_dropped)``:
+            - coords: ``np.ndarray`` shape ``(N, 2)``, float32.
+            - var_ratio: ``np.ndarray`` shape ``(2,)``, float32.
+            - seq_ids: list of seq id strings, aligned to ``coords``.
+            - n_dropped: rows with NaN values that were skipped before
+              fitting (matches the legacy in-screen behavior).
+    """
+    pkl_path = Path(pkl_path)
+    cache_path = pkl_path.with_name(pkl_path.name + ".pca.npz")
+    layer_key = "" if layer is None else str(layer)
+
+    if _pca_cache_fresh(cache_path, pkl_path):
+        try:
+            return _load_pca_cache(cache_path, layer_key)
+        except Exception:
+            # Fall through to a full recompute on cache corruption — the
+            # write below will overwrite the bad sidecar.
+            pass
+
+    df = load_mean_embeddings(pkl_path, layer=layer)
+    if df.empty:
+        return None
+
+    n_before = len(df)
+    df = df.dropna()
+    n_dropped = n_before - len(df)
+    if df.empty or df.shape[1] < 2 or df.shape[0] < 2:
+        return None
+
+    from sklearn.decomposition import PCA
+    model = PCA(n_components=2, random_state=0)
+    coords = model.fit_transform(df.values).astype("float32")
+    var_ratio = model.explained_variance_ratio_.astype("float32")
+    seq_ids = [str(s) for s in df.index]
+
+    try:
+        _save_pca_cache(
+            cache_path,
+            coords=coords,
+            var_ratio=var_ratio,
+            seq_ids=seq_ids,
+            layer_key=layer_key,
+            n_cols=int(df.shape[1]),
+            n_dropped=int(n_dropped),
+        )
+    except Exception:
+        # Cache writes are best-effort; never let a sidecar problem
+        # block the screen from rendering the freshly computed PCA.
+        pass
+
+    return coords, var_ratio, seq_ids, int(n_dropped)
+
+
+def invalidate_pca_cache(pkl_path: Union[str, Path]) -> None:
+    """Remove the PCA sidecar for a pickle. Cheap; no-op if missing."""
+    p = Path(pkl_path).with_name(Path(pkl_path).name + ".pca.npz")
+    try:
+        p.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pca_cache_fresh(cache_path: Path, pkl_path: Path) -> bool:
+    if not cache_path.exists():
+        return False
+    try:
+        return cache_path.stat().st_mtime >= pkl_path.stat().st_mtime
+    except OSError:
+        return False
+
+
+def _load_pca_cache(cache_path: Path, layer_key: str):
+    import numpy as np
+    with np.load(cache_path, allow_pickle=False) as data:
+        # Layer + n_cols guards against accidental sidecar misuse — e.g.
+        # if someone copied a sidecar across (model, layer) pairs the
+        # mtime check could pass but the contents wouldn't match.
+        stored_layer = str(data["layer"].item())
+        if stored_layer != layer_key:
+            raise ValueError("layer mismatch")
+        coords = data["coords"]
+        var_ratio = data["var_ratio"]
+        seq_ids = [str(s) for s in data["seq_ids"]]
+        n_dropped = int(data["n_dropped"].item())
+    return coords, var_ratio, seq_ids, n_dropped
+
+
+def _save_pca_cache(
+    cache_path: Path,
+    coords,
+    var_ratio,
+    seq_ids,
+    layer_key: str,
+    n_cols: int,
+    n_dropped: int,
+) -> None:
+    import numpy as np
+    seq_ids_arr = np.array(seq_ids)  # auto-fixed-width unicode
+    # np.savez adds `.npz` to any path that doesn't already end in it,
+    # so the tmp name has to end in `.npz` itself or `tmp.replace`
+    # below tries to rename a file that np.savez actually wrote to a
+    # different path. `.with_suffix(".tmp.npz")` swaps the final
+    # extension so the on-disk write target matches what we rename.
+    tmp = cache_path.with_suffix(".tmp.npz")
+    np.savez(
+        tmp,
+        coords=coords,
+        var_ratio=var_ratio,
+        seq_ids=seq_ids_arr,
+        layer=np.array(layer_key),
+        n_cols=np.array(n_cols),
+        n_dropped=np.array(n_dropped),
+    )
+    tmp.replace(cache_path)
+
+
 def pca(df: pd.DataFrame, n_components: int = 2, random_state=None) -> pd.DataFrame:
     """Principal-component transform of a wide embedding DataFrame.
 

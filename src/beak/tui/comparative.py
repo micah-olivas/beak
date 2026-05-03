@@ -62,13 +62,11 @@ def _coerce_to_value(v) -> Optional[float]:
 
 
 def _load_records(alignment_path: Path) -> List[Tuple[str, str]]:
-    from Bio import SeqIO
-    records = []
-    for r in SeqIO.parse(str(alignment_path), "fasta"):
-        # Match the FASTA id format the taxonomy/traits builders use
-        # (first whitespace-delimited token from the header).
-        records.append((r.id, str(r.seq).upper()))
-    return records
+    from ..alignments.cache import load_alignment_records
+    # Names are already first-whitespace tokens — that's how Bio.SeqIO
+    # populates `r.id`, and the cache preserves the same id field — so
+    # downstream taxonomy / trait joins still match.
+    return [(name, seq.upper()) for name, seq in load_alignment_records(alignment_path)]
 
 
 def trait_columns(project) -> List[str]:

@@ -6,9 +6,11 @@ taxonomic rank present in `taxonomy.parquet` (domain through species);
 the target sequence is highlighted in red with a star marker.
 """
 
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
@@ -20,6 +22,15 @@ _AXIS_H = 3        # cells reserved at the bottom for the x-axis label
 _DEFAULT_COLOR = "#65CBF3"
 _TARGET_COLOR = "#FF6B6B"
 _UNKNOWN_COLOR = "#6E7681"
+
+# Subsample budget for the scatter renderer. With tens of thousands of
+# points crammed into a few thousand cells, the picture is dominated by
+# overdraw — capping at ~3× the cell budget leaves the visual density
+# essentially unchanged while dropping the per-render work several-fold.
+# `_MIN_RENDER_POINTS` is the floor we never subsample below, so small
+# projects still render every point.
+_OVERSAMPLE = 3
+_MIN_RENDER_POINTS = 5000
 
 # Distinct, high-saturation colors for taxonomic groups. Sequenced for
 # good legibility on dark terminals (no two adjacent are similar in hue).
@@ -76,6 +87,7 @@ class EmbeddingPCAScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "Back"),
         Binding("c", "cycle_color", "Color"),
+        Binding("m", "cycle_model", "Model"),
     ]
 
     DEFAULT_CSS = """
@@ -99,6 +111,10 @@ class EmbeddingPCAScreen(Screen):
         self._color_mode: str = "off"
         # Group → color, computed lazily per mode.
         self._color_cache: Dict[str, Dict[str, str]] = {}
+        # Multi-model selection. Populated in _load from the active
+        # homolog set's embeddings entries; `m` cycles the active one.
+        self._available_models: List[str] = []
+        self._active_model: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -134,6 +150,34 @@ class EmbeddingPCAScreen(Screen):
         self._update_title()
         self.query_one("#pca-body", _PCABody).refresh()
 
+    def action_cycle_model(self) -> None:
+        """Cycle through embeddings computed for the active homolog set."""
+        if len(self._available_models) <= 1:
+            self.notify(
+                "Only one model embedded for this set — submit another "
+                "via the embeddings layer to compare.",
+                timeout=4,
+            )
+            return
+        idx = (
+            self._available_models.index(self._active_model)
+            if self._active_model in self._available_models else 0
+        )
+        self._active_model = self._available_models[
+            (idx + 1) % len(self._available_models)
+        ]
+        # Recompute PCA + reset taxonomy/legend caches — vectors changed.
+        self._pcs = None
+        self._var_ratio = None
+        self._target_idx = None
+        self._tax_levels = {}
+        self._color_cache = {}
+        self._error = None
+        self._n_dropped = 0
+        self._load()
+        self._update_title()
+        self.query_one("#pca-body", _PCABody).refresh()
+
     def _update_title(self) -> None:
         self.app.title = "beak"
         if self._error:
@@ -149,52 +193,95 @@ class EmbeddingPCAScreen(Screen):
             f"  ·  color: {self._color_mode}" if self._color_mode != "off"
             else ""
         )
-        self.app.sub_title = f"PCA · {self._project.name} ({n} seqs){var}{dropped}{color}"
+        # Show which model is active (and `m` to switch) when more than
+        # one is available for this set.
+        model_seg = ""
+        if self._active_model:
+            short = self._active_model.split("/")[-1]
+            n_models = len(self._available_models)
+            if n_models > 1:
+                model_seg = f"  ·  model: {short} (m to switch · {n_models})"
+            else:
+                model_seg = f"  ·  model: {short}"
+        self.app.sub_title = (
+            f"PCA · {self._project.name} ({n} seqs)"
+            f"{var}{dropped}{model_seg}{color}"
+        )
 
     def _load(self) -> None:
-        embed_dir = self._project.path / "embeddings"
-        pkls = list(embed_dir.rglob("mean_embeddings.pkl"))
+        # Refresh the available-models list every load — the user may
+        # have submitted another model since the last time.
+        active_set = self._project.active_set_name()
+        entries = [
+            e for e in self._project.embeddings_models_for_set(active_set)
+            if e.get("model") and e.get("n_embeddings")
+        ]
+        # Sort smallest-pkl-first so the foreground PCA loads on the
+        # cheapest model. The other models get warmed in the background
+        # by `_warm_pca_caches` after this returns, so cycling to them
+        # later via `m` lands on a fresh sidecar instead of triggering
+        # another 10-second fit.
+        models_with_size = []
+        for e in entries:
+            model = e["model"]
+            pkl = self._pkl_for_model(model)
+            size = pkl.stat().st_size if pkl is not None else 0
+            models_with_size.append((size, model))
+        models_with_size.sort(key=lambda kv: kv[0])
+        self._available_models = [m for _, m in models_with_size]
+        if not self._active_model and self._available_models:
+            # Default to the smallest model so first-paint is fast even
+            # when the user has both a 35M-param and a 650M-param model
+            # embedded — the bigger one finishes warming in the bg and
+            # is one keystroke away.
+            self._active_model = self._available_models[0]
+
+        # Scope to the active (homolog set, model) embeddings dir.
+        # Older projects pre-multi-model laid files at the per-set
+        # root; we let `active_embeddings_dir(model=None)` resolve to
+        # that legacy path if no model is selected (e.g. when the
+        # manifest hasn't recorded a model yet).
+        embed_dir = self._project.active_embeddings_dir(
+            model=self._active_model
+        )
+        pkls = (
+            list(embed_dir.rglob("mean_embeddings.pkl"))
+            if embed_dir.exists() else []
+        )
         if not pkls:
             self._error = (
-                "No mean_embeddings.pkl in embeddings/ — submit an "
-                "embedding job (with mean pooling) first."
+                f"No mean_embeddings.pkl under "
+                f"embeddings/{self._project.active_set_name()}/"
+                f"{self._active_model or ''} — "
+                "submit an embedding job (with mean pooling) for "
+                "this set first."
             )
             return
+        # Use the cached PCA path: returns immediately when a fresh
+        # `<pkl>.pca.npz` sidecar exists, otherwise deserializes the
+        # pickle, fits, and writes the sidecar. Any rewrite of the
+        # pickle (model swap, fresh nseqs, re-pull) bumps its mtime and
+        # invalidates the cache automatically.
         try:
-            from ...embeddings import load_mean_embeddings
-            df = load_mean_embeddings(pkls[0])
-        except Exception as e:  # noqa: BLE001
-            self._error = f"Could not read embeddings: {e}"
-            return
-        if df.empty:
-            self._error = "Empty embeddings file."
-            return
-
-        n_before = len(df)
-        df = df.dropna()
-        n_dropped = n_before - len(df)
-        if df.empty:
-            self._error = "All embedding rows contained NaN."
-            return
-
-        try:
-            n_comp = min(2, df.shape[0], df.shape[1])
-            if n_comp < 2:
-                self._error = "Need at least 2 sequences with valid embeddings for PCA."
-                return
-            from sklearn.decomposition import PCA
-            model = PCA(n_components=2, random_state=0)
-            coords = model.fit_transform(df.values)
-            self._pcs = coords
-            self._var_ratio = model.explained_variance_ratio_
-            self._n_dropped = n_dropped
+            from ...embeddings import load_or_compute_pca_2d
+            result = load_or_compute_pca_2d(pkls[0])
         except Exception as e:  # noqa: BLE001
             self._error = f"PCA failed: {e}"
             return
 
+        if result is None:
+            self._error = (
+                "Need at least 2 sequences with valid embeddings for PCA."
+            )
+            return
+
+        coords, var_ratio, seq_ids, n_dropped = result
+        self._pcs = coords
+        self._var_ratio = var_ratio
+        self._n_dropped = n_dropped
+
         # Match each PCA row against its taxonomy row by sequence_id, so
         # the per-point colors line up regardless of FASTA ordering.
-        seq_ids = [str(s) for s in df.index]
         self._tax_levels = self._load_taxonomy(seq_ids)
         self._color_modes = ["off"] + [
             rank for rank in _RANK_ORDER if rank in self._tax_levels
@@ -208,6 +295,47 @@ class EmbeddingPCAScreen(Screen):
                 if target_id in seq_id:
                     self._target_idx = i
                     break
+
+        # Foreground load done — warm the other models' PCA caches in
+        # the background so a model switch is instant instead of paying
+        # another fit.
+        if len(self._available_models) > 1:
+            self._warm_pca_caches()
+
+    def _pkl_for_model(self, model_name: Optional[str]) -> Optional[Path]:
+        """Resolve a model's `mean_embeddings.pkl`, or None if missing."""
+        embed_dir = self._project.active_embeddings_dir(model=model_name)
+        if not embed_dir.exists():
+            return None
+        pkls = list(embed_dir.rglob("mean_embeddings.pkl"))
+        return pkls[0] if pkls else None
+
+    @work(thread=True, exclusive=True, group="pca-warm")
+    def _warm_pca_caches(self) -> None:
+        """Build PCA sidecars for the non-active models, sequentially.
+
+        Sequential rather than parallel: sklearn's PCA is multi-threaded
+        already, so two concurrent fits compete for the same cores and
+        each one runs slower than if they took turns. The cache writer
+        is atomic, so the user can cycle to a model mid-warm and pick
+        up whichever sidecar finished first; on a partial cache miss
+        the cycle path simply re-fits.
+        """
+        from ...embeddings import load_or_compute_pca_2d
+
+        for model in self._available_models:
+            if model == self._active_model:
+                continue
+            pkl = self._pkl_for_model(model)
+            if pkl is None:
+                continue
+            try:
+                load_or_compute_pca_2d(pkl)
+            except Exception:
+                # Don't let a corrupt or unreadable pkl block warming
+                # the rest — the user will see the error if they
+                # actually cycle to that model.
+                continue
 
     def _load_taxonomy(self, seq_ids: List[str]) -> Dict[str, List[Optional[str]]]:
         """Build per-rank label arrays aligned to `seq_ids`.
@@ -278,6 +406,88 @@ class EmbeddingPCAScreen(Screen):
             cache[label] = _PALETTE[len(cache) % len(_PALETTE)]
         return cache[label]
 
+    def _compute_cell_mode_colors(
+        self,
+        flat: np.ndarray,
+        row: np.ndarray,
+        col: np.ndarray,
+        orig_idx: np.ndarray,
+        plot_w: int,
+    ):
+        """Per-cell mode coloring, fully vectorized.
+
+        Returns parallel arrays ``(rows, cols, colors)`` listing one
+        entry per occupied cell, where ``colors[k]`` is the most-
+        common label's color among the points that fell into that cell.
+        Ties resolve deterministically (lexsort on (cell, -count) — the
+        first label encountered wins among equally-frequent ones).
+
+        When the active color mode is ``"off"`` or no taxonomy is
+        loaded, every cell gets `_DEFAULT_COLOR` and we fall back to
+        cheap first-occurrence-per-cell.
+        """
+        if (
+            self._color_mode == "off"
+            or self._color_mode not in self._tax_levels
+        ):
+            _, first = np.unique(flat, return_index=True)
+            colors = [_DEFAULT_COLOR] * len(first)
+            return row[first], col[first], colors
+
+        # Build a label array aligned to `orig_idx`. Missing or empty
+        # labels collapse to the sentinel "(unknown)" string so they
+        # share the unknown-color cell.
+        full_labels = self._tax_levels[self._color_mode]
+        labels = np.empty(len(orig_idx), dtype=object)
+        for k, idx in enumerate(orig_idx):
+            ii = int(idx)
+            lab = full_labels[ii] if ii < len(full_labels) else None
+            labels[k] = str(lab) if lab else "(unknown)"
+
+        # Encode labels as integer codes so we can fold them into the
+        # cell-id key for a single np.unique pass that simultaneously
+        # groups by cell *and* counts label occurrences.
+        unique_labels, codes = np.unique(labels, return_inverse=True)
+        n_labels = len(unique_labels)
+        if n_labels == 0:
+            _, first = np.unique(flat, return_index=True)
+            return (
+                row[first], col[first],
+                [_DEFAULT_COLOR] * len(first),
+            )
+
+        combined = flat * n_labels + codes.astype(np.int64)
+        combo_unique, counts = np.unique(combined, return_counts=True)
+        combo_cells = combo_unique // n_labels
+        combo_codes = combo_unique % n_labels
+
+        # Sort by (cell ascending, count descending). The first row per
+        # unique cell after this sort is the modal (cell, label) pair.
+        order = np.lexsort([-counts, combo_cells])
+        sorted_cells = combo_cells[order]
+        sorted_codes = combo_codes[order]
+        _, first_per_cell = np.unique(sorted_cells, return_index=True)
+        mode_cells = sorted_cells[first_per_cell]
+        mode_codes = sorted_codes[first_per_cell]
+
+        # Translate cell ids back to (row, col) and look up the color
+        # for each modal label via the per-mode color cache.
+        rows_out = (mode_cells // plot_w).astype(np.int32)
+        cols_out = (mode_cells % plot_w).astype(np.int32)
+        cache = self._color_cache.setdefault(self._color_mode, {})
+        colors_out: List[str] = []
+        for code in mode_codes:
+            label = str(unique_labels[int(code)])
+            if label == "(unknown)":
+                colors_out.append(_UNKNOWN_COLOR)
+                continue
+            cached = cache.get(label)
+            if cached is None:
+                cached = _PALETTE[len(cache) % len(_PALETTE)]
+                cache[label] = cached
+            colors_out.append(cached)
+        return rows_out, cols_out, colors_out
+
     # ---- rendering ----
 
     def _render_scatter(self, width: int, height: int) -> str:
@@ -295,28 +505,78 @@ class EmbeddingPCAScreen(Screen):
         y_min, y_max = float(ys.min()), float(ys.max())
         x_range = max(x_max - x_min, 1e-6)
         y_range = max(y_max - y_min, 1e-6)
+        n_total = len(xs)
 
-        # One braille cell is the smallest unit; we now plot a full cell
-        # per point (using ●) instead of one sub-pixel — points read as
-        # bigger and the color is unambiguous.
-        col = ((xs - x_min) / x_range * (plot_w - 1)).astype(int)
-        row = ((y_max - ys) / y_range * (plot_h - 1)).astype(int)
+        # Subsample for big sets. With 25k+ points crammed into a few
+        # thousand cells, the picture is dominated by overdraw — every
+        # cell after the first ~plot_cells * _OVERSAMPLE points only
+        # changes which color "wins" a cell. Capping at that level
+        # drops the per-render work ~5× while leaving the visual
+        # density essentially unchanged. Deterministic seed so cycling
+        # models doesn't reshuffle the points the user just saw.
+        plot_cells = plot_w * plot_h
+        max_points = max(plot_cells * _OVERSAMPLE, _MIN_RENDER_POINTS)
+        if n_total > max_points:
+            rng = np.random.default_rng(0)
+            sample_idx = rng.choice(n_total, size=max_points, replace=False)
+            # Always preserve the target — it's the focal point of the
+            # plot and must paint regardless of where it lands in the
+            # random sample.
+            if (self._target_idx is not None
+                    and self._target_idx not in sample_idx):
+                sample_idx = np.concatenate(
+                    [sample_idx, np.array([self._target_idx])]
+                )
+            xs_s = xs[sample_idx]
+            ys_s = ys[sample_idx]
+            orig_idx = sample_idx
+        else:
+            xs_s = xs
+            ys_s = ys
+            orig_idx = np.arange(n_total)
 
-        # Per-cell winner: target outranks all others; otherwise the
-        # most recently drawn color wins (cheap, deterministic).
+        col = ((xs_s - x_min) / x_range * (plot_w - 1)).astype(np.int32)
+        row = ((y_max - ys_s) / y_range * (plot_h - 1)).astype(np.int32)
+
+        # In-bounds clamp via mask — handles edge points that round to
+        # exactly plot_w/plot_h.
+        in_bounds = (
+            (col >= 0) & (col < plot_w) & (row >= 0) & (row < plot_h)
+        )
+        col = col[in_bounds]
+        row = row[in_bounds]
+        orig_idx = orig_idx[in_bounds]
+
+        # Mode-per-cell coloring: when many points overlap a single
+        # cell (eukaryotes + bacteria projecting to the same PC1×PC2
+        # square), show the *majority* label rather than whichever
+        # point np.unique happened to pick first. The whole pass stays
+        # vectorized — the inner Python loop runs once per occupied
+        # cell (a few thousand at most), not once per point.
         grid: List[List[Optional[Tuple[str, bool]]]] = [
             [None] * plot_w for _ in range(plot_h)
         ]
-        for i in range(len(xs)):
-            r, c = int(row[i]), int(col[i])
-            if not (0 <= r < plot_h and 0 <= c < plot_w):
-                continue
-            is_target = i == self._target_idx
-            current = grid[r][c]
-            if current is not None and current[1] and not is_target:
-                continue  # don't overwrite the target dot
-            color = self._color_for_idx(i)
-            grid[r][c] = (color, is_target)
+
+        if col.size:
+            flat = row.astype(np.int64) * plot_w + col.astype(np.int64)
+            occupied_rows, occupied_cols, occupied_colors = (
+                self._compute_cell_mode_colors(flat, row, col, orig_idx, plot_w)
+            )
+            for k in range(len(occupied_rows)):
+                grid[int(occupied_rows[k])][int(occupied_cols[k])] = (
+                    occupied_colors[k], False,
+                )
+
+        # Target is overlaid last so the cell it lands in always shows
+        # ★ regardless of how many other points share the cell or what
+        # the mode color says.
+        if self._target_idx is not None and 0 <= self._target_idx < n_total:
+            tx = float(xs[self._target_idx])
+            ty = float(ys[self._target_idx])
+            tc = int((tx - x_min) / x_range * (plot_w - 1))
+            tr = int((y_max - ty) / y_range * (plot_h - 1))
+            if 0 <= tr < plot_h and 0 <= tc < plot_w:
+                grid[tr][tc] = (_TARGET_COLOR, True)
 
         lines = []
         for cell_row in range(plot_h):

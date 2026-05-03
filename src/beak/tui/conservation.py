@@ -64,14 +64,30 @@ def compute_quick_conservation(project) -> Optional[np.ndarray]:
 
 
 def _conservation_from_msa(alignment_path: Path, target_seq: str) -> Optional[np.ndarray]:
-    from Bio import SeqIO
+    from ..alignments.cache import load_alignment_records
 
-    records = list(SeqIO.parse(str(alignment_path), "fasta"))
+    records = load_alignment_records(alignment_path)
     if len(records) < 2:
         return None
 
-    aligned = [str(r.seq).upper() for r in records]
-    target_aln = aligned[0]
+    aligned = [seq.upper() for _, seq in records]
+    # Identify the target row by ungapped-sequence equality with the
+    # passed-in `target_seq` rather than assuming `records[0]`. An MSA
+    # written by a third-party tool or sorted by id may not have the
+    # target first — using the wrong row would compute conservation
+    # against a homolog and silently mis-color the structure view.
+    target_seq_upper = target_seq.upper()
+    target_aln: Optional[str] = None
+    for seq in aligned:
+        if seq.replace("-", "").replace(".", "") == target_seq_upper:
+            target_aln = seq
+            break
+    if target_aln is None:
+        # Fallback to the legacy first-row assumption, which is correct
+        # for MSAs beak's own pipeline produces. Better than refusing
+        # to compute when an external tool reordered the file but kept
+        # the target in row 0 anyway.
+        target_aln = aligned[0]
 
     target_len = len(target_seq)
     counts = np.zeros(target_len, dtype=np.int32)

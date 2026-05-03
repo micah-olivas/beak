@@ -302,8 +302,11 @@ class AlignmentViewerScreen(Screen):
             return
 
         try:
-            from Bio import SeqIO
-            records = [(r.id, str(r.seq)) for r in SeqIO.parse(str(path), "fasta")]
+            # Cached parse — first open of a 20k-sequence MSA still pays
+            # the SeqIO cost, but subsequent opens read from the sidecar
+            # `.npz` in tens of milliseconds.
+            from ...alignments.cache import load_alignment_records
+            records = load_alignment_records(path)
         except Exception:
             records = []
 
