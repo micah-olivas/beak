@@ -18,9 +18,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import pandas as pd
+
+# Signature of the progress callback `build_taxonomy_table` invokes
+# after each UniProt batch. Receives (sequences_done, sequences_total);
+# called from the worker thread, so callers must marshal back to the UI
+# thread themselves (e.g. `app.call_from_thread`).
+ProgressCb = Optional[Callable[[int, int], None]]
 
 
 _UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
@@ -133,11 +139,56 @@ def _fetch_batch(accessions: List[str]) -> List[dict]:
     return rows
 
 
-def build_taxonomy_table(project, force: bool = False) -> Optional[pd.DataFrame]:
+def _maybe_reanneal_growth_temp(
+    df: pd.DataFrame, cache_path: Path
+) -> pd.DataFrame:
+    """Recompute `growth_temp` on a cached frame if it's all-NaN/missing.
+
+    Older parquets were written before `annotate_temperature` could
+    parse "Escherichia coli" against the Enqvist dataset's
+    "escherichia_coli". They land here with an empty growth_temp
+    column even though the organism column is populated — recompute
+    the temperature locally and overwrite the cache so the next read
+    is fast again.
+    """
+    has_growth = "growth_temp" in df.columns
+    has_some = has_growth and df["growth_temp"].notna().any()
+    if has_some:
+        return df  # already populated — nothing to do
+    if "organism" not in df.columns or df["organism"].dropna().empty:
+        return df  # no organisms to look up either; bail
+
+    try:
+        from ..temperature import annotate_temperature
+        # Drop the empty growth_temp / temp_source columns first so the
+        # merge doesn't append "_x"/"_y" suffixes alongside the originals.
+        cleaned = df.drop(
+            columns=["growth_temp", "temp_source"], errors="ignore"
+        )
+        rebuilt = annotate_temperature(cleaned, organism_col="organism")
+    except Exception:
+        return df  # silent fallback — never let a bad parquet block the view
+
+    try:
+        rebuilt.to_parquet(cache_path, index=False)
+    except Exception:
+        pass
+    return rebuilt
+
+
+def build_taxonomy_table(
+    project,
+    force: bool = False,
+    progress_cb: ProgressCb = None,
+) -> Optional[pd.DataFrame]:
     """Materialise `homologs/taxonomy.parquet` for a project.
 
     Returns the DataFrame, or None if no homologs exist. Cached: returns
-    the existing file if present unless `force=True`.
+    the existing file if present unless `force=True`. When `progress_cb`
+    is given, it's called as `(done, total)` after each UniProt batch
+    so the UI can render a live progress indicator — at ~50 accessions
+    per round-trip and ~1 s per call, a 25k-sequence build runs for
+    several minutes and benefits from incremental feedback.
     """
     homologs_dir = project.active_homologs_dir()
     fasta = homologs_dir / "sequences.fasta"
@@ -147,13 +198,27 @@ def build_taxonomy_table(project, force: bool = False) -> Optional[pd.DataFrame]
     cache = homologs_dir / "taxonomy.parquet"
     if cache.exists() and not force:
         try:
-            return pd.read_parquet(cache)
+            cached = pd.read_parquet(cache)
         except Exception:
-            pass  # bad cache; recompute
+            cached = None  # bad cache; fall through to rebuild
+        else:
+            # One-shot migration for parquets written before
+            # `annotate_temperature` learned to normalize UniProt-style
+            # organism names. The expensive UniProt round-trip is
+            # already on disk; we only need to re-run the local Enqvist
+            # join when it produced an all-NaN growth_temp column.
+            cached = _maybe_reanneal_growth_temp(cached, cache)
+            return cached
 
     seq_ids = _parse_fasta_ids(fasta)
     if not seq_ids:
         return None
+
+    if progress_cb is not None:
+        try:
+            progress_cb(0, len(seq_ids))
+        except Exception:
+            pass
 
     # Map seq_id → accession (drops any we can't parse).
     seq_to_acc = {sid: _accession_from_seq_id(sid) for sid in seq_ids}
@@ -175,10 +240,22 @@ def build_taxonomy_table(project, force: bool = False) -> Optional[pd.DataFrame]
             pass
         return df
 
-    # Batch the API calls.
+    # Batch the API calls. Progress is reported in *sequence* units
+    # (not accession units) so the UI counter matches the user's mental
+    # model — a 25k-hit set polls 25k regardless of how many duplicate
+    # accessions get folded into one UniProt batch.
     rows: List[dict] = []
-    for i in range(0, len(accs), _BATCH_SIZE):
+    n_total = len(seq_ids)
+    n_accs = len(accs)
+    for i in range(0, n_accs, _BATCH_SIZE):
         rows.extend(_fetch_batch(accs[i:i + _BATCH_SIZE]))
+        if progress_cb is not None:
+            done = int(min(n_accs, i + _BATCH_SIZE) / n_accs * n_total) \
+                if n_accs else n_total
+            try:
+                progress_cb(done, n_total)
+            except Exception:
+                pass
     by_acc = {r["uniprot_id"]: r for r in rows if r.get("uniprot_id")}
 
     # Build the per-sequence frame.
