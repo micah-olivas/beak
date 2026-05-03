@@ -366,9 +366,3 @@ MIT License - see [LICENSE](LICENSE) file for details
 ## Contributing
 
 Contributions welcome! Please open an issue or submit a pull request.
-
----
-
-## Contact
-
-micah5051olivas@gmail.com
