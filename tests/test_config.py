@@ -48,7 +48,7 @@ class TestSaveLoadConfig:
         config = {
             'connection': {
                 'host': 'myserver.edu',
-                'user': 'micah',
+                'user': 'testuser',
             }
         }
         save_config(config)
