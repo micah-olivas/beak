@@ -460,11 +460,18 @@ class StructureView(Vertical):
         self.app.call_from_thread(self._on_loaded, cif_path, uniprot)
 
     def _on_loaded(self, cif_path: Path, uniprot: str) -> None:
-        self._cif_path = cif_path
-        self.border_title = f"{uniprot} · AlphaFold"
-        self._refresh_subtitle()
-        self._refresh_canvas()
-        self.post_message(self.CifLoaded(cif_path))
+        # Worker → UI hop: the load worker fires `app.call_from_thread`
+        # to land here, which can race the user popping the project
+        # detail screen. Setting `border_title` and posting a message
+        # on a vanished widget raises; guard the whole hop.
+        try:
+            self._cif_path = cif_path
+            self.border_title = f"{uniprot} · AlphaFold"
+            self._refresh_subtitle()
+            self._refresh_canvas()
+            self.post_message(self.CifLoaded(cif_path))
+        except Exception:
+            pass
 
     # ---- rendering, called by inner _StructureCanvas.render ----
 

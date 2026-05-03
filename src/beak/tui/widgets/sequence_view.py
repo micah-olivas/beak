@@ -226,10 +226,19 @@ class SequenceView(Vertical):
         return idx
 
     def _refresh_view(self) -> None:
-        """Update the body Static and footer keys."""
+        """Update the body Static and footer keys.
+
+        `refresh(layout=True)` is load-bearing: toggling the domain bar
+        or SS track changes how many lines `_render_body` emits per
+        wrapped block, so the body's `height: auto` needs a fresh
+        layout pass to pick up the new size. A plain `refresh()` only
+        repaints inside the previously-computed geometry, which on the
+        domains toggle clips the sequence rows out of the visible
+        scroll area and the panel looks empty.
+        """
         try:
             body = self.query_one("#seq-body", _SequenceBody)
-            body.refresh()
+            body.refresh(layout=True)
         except Exception:
             pass
         try:
