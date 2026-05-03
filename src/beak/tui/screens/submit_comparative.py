@@ -69,12 +69,18 @@ class SubmitComparativeModal(ModalScreen[Optional[str]]):
             yield Label("Threshold (rows >= go in the 'high' group)")
             yield Input(value="", placeholder="loading suggested split…",
                         id="threshold-input")
+            # `#trait-stats` carries the threshold-suggestion info
+            # (median / mean / range). `#status-line` is the dedicated
+            # error / progress slot, matching every other modal in the
+            # app — separating them means an error message can't
+            # clobber the stats hint while the user reads it.
             yield Label("", id="trait-stats")
+            yield Label("", id="status-line")
 
             with Horizontal(id="modal-buttons"):
                 yield Button("Cancel", id="cancel-btn")
-                yield Button("Build", id="submit-btn", variant="primary")
                 yield Button("Build + ChimeraX", id="export-btn")
+                yield Button("Build", id="submit-btn", variant="primary")
 
     def on_mount(self) -> None:
         if self._cols:
@@ -216,4 +222,6 @@ class SubmitComparativeModal(ModalScreen[Optional[str]]):
         )
 
     def _set_msg(self, msg: str) -> None:
-        self.query_one("#trait-stats", Label).update(msg)
+        # Errors / progress land on the dedicated status-line so the
+        # threshold-suggestion stats stay readable underneath.
+        self.query_one("#status-line", Label).update(msg)

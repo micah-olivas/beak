@@ -21,11 +21,18 @@ _POLL_SECONDS = 15.0
 # Single-line remote probe. Each command is `2>/dev/null`'d so a missing
 # tool (e.g. nvidia-smi on a CPU-only host) leaves its slot empty rather
 # than printing an error into our pipe-delimited output.
+#
+# GPU: report the *max* utilization across all visible GPUs. The earlier
+# `head -1` only saw GPU 0, so an embedding job pinned to GPU 1+ kept
+# the bar reading 0% even while the card was saturated.
 _PROBE_CMD = (
     "load=$(awk '{print $1}' /proc/loadavg 2>/dev/null); "
     "cores=$(nproc 2>/dev/null); "
     'gpu=$(nvidia-smi --query-gpu=utilization.gpu '
-    '--format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " "); '
+    '--format=csv,noheader,nounits 2>/dev/null '
+    "| awk 'BEGIN{m=\"\"} "
+    '{gsub(/ /,""); if ($1+0>m+0 || m==\"\") m=$1} '
+    "END{print m}'); "
     "jobs=$(ps -eo comm 2>/dev/null | "
     "grep -cE '^(mmseqs|clustalo|mafft|muscle|hmmscan|hmmsearch|jackhmmer)$'); "
     'echo "$load|$cores|$gpu|$jobs"'
@@ -47,11 +54,25 @@ class ServerStatusBar(Static):
         text-align: right;
         color: $text-muted;
     }
+    /* Clicking the pill opens the detail modal — give it a hover hint
+       so users discover the affordance. */
+    ServerStatusBar:hover {
+        text-style: underline;
+    }
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__("[dim]srv · checking…[/dim]", **kwargs)
         self._unavailable: bool = False
+
+    def on_click(self) -> None:
+        """Pop the rich server-status modal on click."""
+        # Don't bother if SSH was never reachable — modal would just
+        # show the same "not configured" hint already in the pill.
+        if self._unavailable:
+            return
+        from ..screens.server_status_modal import ServerStatusModal
+        self.app.push_screen(ServerStatusModal())
 
     def on_mount(self) -> None:
         self._poll()

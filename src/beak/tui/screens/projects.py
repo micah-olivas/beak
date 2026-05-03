@@ -20,13 +20,34 @@ from ...project import BeakProject
 from ..widgets.server_status import ServerStatusBar
 
 
+# Status colors pulled from beak's existing palette (`tui/app.py`,
+# `tui/structure.py`) so the project list reads as part of the same
+# visual system as the panel borders, structure ribbon, and pill
+# affordances.
+#   #65CBF3 — beak cyan (also the high-pLDDT band)
+#   #FFA62B — amber (also the Pfam element + the search/embed pills)
+#   #7DD87D — palette green (one of the DOMAIN_PALETTE chips)
+#   #FF6B6B — palette red (helix accent in the SS legend)
+_BEAK_CYAN = "#65CBF3"
+_BEAK_AMBER = "#FFA62B"
+_BEAK_GREEN = "#7DD87D"
+_BEAK_RED = "#FF6B6B"
+
 _STATUS_COLORS = {
-    "ready":     "green",
-    "running":   "yellow",
-    "submitted": "cyan",
-    "queued":    "cyan",
-    "completed": "green",
-    "failed":    "red",
+    "ready":     _BEAK_GREEN,
+    "completed": _BEAK_GREEN,
+    # Compute / IO-bound stages: cyan. Long-running compute (embed,
+    # multi-job): amber. The two-color split mirrors the in-flight
+    # pill colors in the layers panel so a glance from the project
+    # list to the layer panel reads as the same status.
+    "search":    _BEAK_CYAN,
+    "align":     _BEAK_CYAN,
+    "tax":       _BEAK_CYAN,
+    "submitted": _BEAK_CYAN,
+    "queued":    _BEAK_CYAN,
+    "embed":     _BEAK_AMBER,
+    "running":   _BEAK_AMBER,
+    "failed":    _BEAK_RED,
     "cancelled": "dim",
     "new":       "dim",
 }
@@ -56,6 +77,41 @@ def _format_dt(value) -> str:
 def _format_status(status: str) -> str:
     color = _STATUS_COLORS.get(status, "dim")
     return f"[{color}]{status}[/{color}]"
+
+
+def _relative_age(ts: float) -> str:
+    """Compact relative timestamp ("2h", "3d", "5w"). 0 → '—'."""
+    if not ts:
+        return "—"
+    import time
+    secs = max(0.0, time.time() - ts)
+    if secs < 60:
+        return "just now"
+    mins = secs / 60
+    if mins < 60:
+        return f"{int(mins)}m"
+    hours = mins / 60
+    if hours < 24:
+        return f"{int(hours)}h"
+    days = hours / 24
+    if days < 14:
+        return f"{int(days)}d"
+    weeks = days / 7
+    if weeks < 9:
+        return f"{int(weeks)}w"
+    months = days / 30
+    if months < 18:
+        return f"{int(months)}mo"
+    return f"{int(days / 365)}y"
+
+
+def _shorten(text: str, width: int) -> str:
+    """Trim a string to `width` cells with an ellipsis if it overflows."""
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
 
 
 class ProjectListScreen(Screen):
@@ -105,6 +161,26 @@ class ProjectListScreen(Screen):
         # projects this turns the typical refresh from 50 file reads
         # into 0.
         self._row_cache: dict = {}
+        # Marquee state for the Detail column. Each project carries
+        # one long ticker string (built from its in-flight jobs +
+        # settled summary, joined by separators) and a per-row
+        # character offset that advances on every tick. The cell
+        # content is a window onto the ticker; when offset wraps past
+        # the end, a doubled string keeps the window seamless.
+        self._detail_text: Dict[str, str] = {}
+        self._detail_color: Dict[str, str] = {}
+        self._detail_offset: Dict[str, int] = {}
+        # Ticks remaining of "stay at offset 0" dwell. Set on init and
+        # whenever the offset wraps back to 0, so each loop pauses long
+        # enough to read the lead item before scrolling resumes.
+        self._detail_dwell: Dict[str, int] = {}
+        # Snapshot of the previous ticker text per project — used by
+        # `_populate` to detect content changes so a new job lands at
+        # offset 0 with a fresh dwell, not whatever offset the old
+        # ticker happened to be on.
+        self._detail_text_seen: Dict[str, str] = {}
+        # Column key for the Detail cell — captured at on_mount.
+        self._detail_col_key = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -118,16 +194,58 @@ class ProjectListScreen(Screen):
                 yield Static("", id="summary-stats")
         yield Footer()
 
+    # Marquee cadence + window. ~7 cells/sec reads as moving without
+    # overwhelming — slow enough to track a glyph, fast enough not to
+    # feel stalled. _DETAIL_WIDTH is the visible window; the underlying
+    # ticker can be much longer and scrolls into view a column at a
+    # time. _DETAIL_GAP is whitespace inserted between the end of the
+    # ticker and the start so the loop "feels" continuous rather than
+    # snapping.
+    _DETAIL_TICK_SECONDS = 0.15
+    _DETAIL_WIDTH = 36
+    _DETAIL_GAP = 6
+    # Dwell ticks the marquee holds at offset=0 before scrolling begins,
+    # so the start of the ticker (most important info: what's running)
+    # gets ~2.5s of stable reading time. Re-applies on every wrap.
+    _DETAIL_DWELL_TICKS = 17
+
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
-        # Trimmed columns — size/length/created move to the right-pane summary.
-        table.add_columns("Name", "Target", "Status")
+        # Sorted by recency by default; the `Updated` column makes the
+        # ordering legible (relative timestamps — "2h", "3d", "5w").
+        # `Detail` is a per-row carousel — content cycles every
+        # `_DETAIL_TICK_SECONDS` so multi-job projects can show every
+        # active piece without a wide column.
+        keys = table.add_columns(
+            "Name", "Target", "Status", "Updated", "Detail"
+        )
+        self._detail_col_key = keys[-1] if keys else None
         self._populate()
+        self.set_interval(self._DETAIL_TICK_SECONDS, self._tick_details)
+
+    @staticmethod
+    def _project_mtime(proj: BeakProject) -> float:
+        """Manifest mtime — proxy for "most recent activity".
+
+        Every beak code path that records progress (job submit / pull
+        completion / reset / rename) goes through `BeakProject.write`
+        or `mutate()`, both of which advance the manifest TOML's mtime.
+        Sorting by this descending puts whichever project the user
+        last touched (or the system last completed work for) at the
+        top of the list.
+        """
+        try:
+            return proj.manifest_path.stat().st_mtime
+        except OSError:
+            return 0.0
 
     def _populate(self) -> None:
         table = self.query_one(DataTable)
         table.clear()
-        self._projects = BeakProject.list_projects()
+        projects = BeakProject.list_projects()
+        # Sort: most recent activity first. Stable on ties.
+        projects.sort(key=self._project_mtime, reverse=True)
+        self._projects = projects
         if not self._projects:
             self._update_summary(None)
             self.notify(
@@ -139,36 +257,202 @@ class ProjectListScreen(Screen):
         live_names = set()
         for proj in self._projects:
             row = self._row_for(proj)
+            updated = _relative_age(self._project_mtime(proj))
+            text, color = self._compute_detail_ticker(proj)
+            self._detail_text[proj.name] = text
+            self._detail_color[proj.name] = color
+            # Reset offset + dwell when the ticker text changes so a
+            # new in-flight job lands at the start of the visible
+            # window with a full reading-pause before scrolling.
+            prev = getattr(self, "_detail_text_seen", {}).get(proj.name)
+            if prev != text:
+                self._detail_offset[proj.name] = 0
+                self._detail_dwell[proj.name] = self._DETAIL_DWELL_TICKS
+            else:
+                self._detail_offset.setdefault(proj.name, 0)
+                self._detail_dwell.setdefault(proj.name, self._DETAIL_DWELL_TICKS)
+            detail = self._render_marquee(proj.name)
             table.add_row(
-                row["name"], row["target"], row["status"], key=row["name"]
+                row["name"], row["target"], row["status"], updated, detail,
+                key=row["name"],
             )
             live_names.add(proj.name)
+        # Stash the current ticker strings so the next _populate can
+        # detect content changes (new job, completed job, etc.) and
+        # reset the offset to 0 with a fresh dwell.
+        self._detail_text_seen = dict(self._detail_text)
         # Drop cache entries for projects that no longer exist.
         for stale in list(self._row_cache.keys() - live_names):
             self._row_cache.pop(stale, None)
+            self._detail_text.pop(stale, None)
+            self._detail_color.pop(stale, None)
+            self._detail_offset.pop(stale, None)
+            self._detail_dwell.pop(stale, None)
         # Seed the summary with the first row.
         if self._projects:
             self._update_summary(self._projects[0])
 
+    def _compute_detail_ticker(self, proj: BeakProject) -> tuple:
+        """Build the per-project ticker string + color.
+
+        Returns `(plain_text, color_tag)`. The text is plain (no inline
+        markup) so we can slice it for the marquee window without
+        breaking rich's tag pairs. Color is applied to the whole
+        visible window — yellow when any job is in flight, dim when
+        the project is settled.
+        """
+        m = proj.manifest()
+        sets = (m.get("homologs") or {}).get("sets") or []
+        active_set_name = (m.get("homologs") or {}).get("active") or "default"
+
+        chunks: List[str] = []
+        any_inflight = False
+
+        for s in sets:
+            remote = s.get("remote") or {}
+            sname = s.get("name") or "?"
+            tag = "" if sname == active_set_name else f" {sname}"
+            if remote.get("search_job_id") and not s.get("n_homologs"):
+                db = remote.get("search_database") or "?"
+                chunks.append(f"⊳ search {db}{tag}")
+                any_inflight = True
+            if (remote.get("align_job_id")
+                    and s.get("n_homologs")
+                    and not s.get("n_aligned")):
+                chunks.append(f"⊳ aligning{tag}")
+                any_inflight = True
+
+        tax = m.get("taxonomy") or {}
+        if (tax.get("remote") or {}).get("job_id") and not tax.get("n_assigned"):
+            chunks.append("⊳ taxonomy")
+            any_inflight = True
+
+        for e in (m.get("embeddings") or {}).get("sets") or []:
+            remote = e.get("remote") or {}
+            if remote.get("job_id") and not e.get("n_embeddings"):
+                model = (e.get("model") or "?").split("/")[-1]
+                src = e.get("source_homologs_set") or "?"
+                tag = "" if src == active_set_name else f" / {src}"
+                chunks.append(f"⊳ embed {model}{tag}")
+                any_inflight = True
+
+        # Settled summary always tails the in-flight items so a project
+        # with no jobs running shows a stationary "451 hits · 2 models"
+        # in the column rather than nothing.
+        active_set = next(
+            (s for s in sets if s.get("name") == active_set_name), None,
+        )
+        settled: List[str] = []
+        if active_set and active_set.get("n_homologs"):
+            n = active_set["n_homologs"]
+            n_aligned = active_set.get("n_aligned") or 0
+            settled.append(f"{n_aligned:,}/{n:,} aln" if n_aligned else f"{n:,} hits")
+        n_models = sum(
+            1 for e in (m.get("embeddings") or {}).get("sets") or []
+            if e.get("n_embeddings")
+        )
+        if n_models:
+            settled.append(f"{n_models} model{'s' if n_models > 1 else ''}")
+        n_exp = len(m.get("experiments") or [])
+        if n_exp:
+            settled.append(f"{n_exp} exp")
+        if settled:
+            chunks.append(" · ".join(settled))
+
+        if not chunks:
+            return ("—", "dim")
+
+        text = "   ·   ".join(chunks)
+        # Palette parity with the status column: amber when work is in
+        # flight (matches the in-flight pill / "embed"/"running"
+        # statuses), dim when the project is settled.
+        color = _BEAK_AMBER if any_inflight else "dim"
+        return (text, color)
+
+    def _render_marquee(self, name: str) -> str:
+        """Return the colored window slice for `name`'s ticker."""
+        text = self._detail_text.get(name) or ""
+        color = self._detail_color.get(name) or "dim"
+        if not text:
+            return ""
+        # If the text fits without wrapping, render it static — no
+        # point scrolling something that already fits.
+        if len(text) <= self._DETAIL_WIDTH:
+            return f"[{color}]{text}[/{color}]"
+        offset = self._detail_offset.get(name, 0)
+        loop = text + " " * self._DETAIL_GAP + text
+        slice_ = loop[offset:offset + self._DETAIL_WIDTH]
+        return f"[{color}]{slice_}[/{color}]"
+
+    def _tick_details(self) -> None:
+        """Advance each long-text project's offset by one cell.
+
+        The marquee dwells at offset=0 for `_DETAIL_DWELL_TICKS` ticks
+        before the slide starts — so the lead item (whatever's in
+        flight) gets a couple seconds of stable reading time. After
+        the offset wraps back to 0, the dwell counter resets and the
+        pause repeats. No animation work happens for tickers whose
+        text already fits the column width.
+        """
+        if not self._detail_col_key or not self._projects:
+            return
+        try:
+            table = self.query_one(DataTable)
+        except Exception:
+            return
+        for proj in self._projects:
+            text = self._detail_text.get(proj.name) or ""
+            if len(text) <= self._DETAIL_WIDTH:
+                continue
+
+            # Burn dwell ticks at offset 0 — no cell update needed
+            # since the rendered slice doesn't change.
+            if self._detail_dwell.get(proj.name, 0) > 0:
+                self._detail_dwell[proj.name] -= 1
+                continue
+
+            loop_len = len(text) + self._DETAIL_GAP
+            offset = (self._detail_offset.get(proj.name, 0) + 1) % loop_len
+            self._detail_offset[proj.name] = offset
+            # On wrap, re-arm the dwell so the next loop pauses too.
+            if offset == 0:
+                self._detail_dwell[proj.name] = self._DETAIL_DWELL_TICKS
+
+            try:
+                table.update_cell(
+                    proj.name,
+                    self._detail_col_key,
+                    self._render_marquee(proj.name),
+                )
+            except Exception:
+                pass
+
     def _row_for(self, proj: BeakProject) -> dict:
-        """Mtime-cached row data. Re-reads the manifest only when the
-        TOML file's mtime has advanced since the last cached read."""
+        """Mtime-cached row data with always-fresh status.
+
+        Manifest-derived fields (name, target_id) are cached by the
+        manifest TOML's mtime so 50-project refreshes are cheap. The
+        `status` column ignores the cache: a job's lifecycle updates
+        `~/.beak/jobs.json` without touching the project manifest, so
+        a cached status would go stale. `status_summary` is also
+        manifest-cheap (one TOML read + one JSON read), making the
+        per-row cost acceptable on every refresh.
+        """
         try:
             mtime = proj.manifest_path.stat().st_mtime
         except OSError:
             mtime = -1.0
         cached = self._row_cache.get(proj.name)
         if cached is not None and cached[0] == mtime:
-            return cached[1]
+            row = dict(cached[1])
+            row["status"] = _format_status(proj.status_summary())
+            return row
         m = proj.manifest()
         target = m.get("target", {}) or {}
         target_id = target.get("uniprot_id") or target.get("uniprot_name") or "-"
-        # `status_summary` reads the manifest itself; we can't easily
-        # avoid that second read without refactoring the API, but it's
-        # cheap and only fires on the slow path (cache miss).
         status_str = _format_status(proj.status_summary())
         row = {"name": proj.name, "target": target_id, "status": status_str}
-        self._row_cache[proj.name] = (mtime, row)
+        self._row_cache[proj.name] = (mtime, dict(row))
         return row
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -229,10 +513,17 @@ class ProjectListScreen(Screen):
         else:
             rows.append("[dim]○ no homologs[/dim]")
 
-        emb = m.get("embeddings") or {}
-        n_emb = emb.get("n_embeddings", 0)
+        # Sum embeddings across every homolog set so the project list
+        # reflects total work, not just the active set's slice.
+        n_emb = sum(
+            (s.get("n_embeddings") or 0) for s in proj.embeddings_sets()
+        )
+        n_emb_sets = sum(
+            1 for s in proj.embeddings_sets() if s.get("n_embeddings")
+        )
         if n_emb:
-            rows.append(f"[green]✓[/green] {n_emb:,} embeddings")
+            suffix = f" · {n_emb_sets} sets" if n_emb_sets > 1 else ""
+            rows.append(f"[green]✓[/green] {n_emb:,} embeddings{suffix}")
         else:
             rows.append("[dim]○ no embeddings[/dim]")
 
