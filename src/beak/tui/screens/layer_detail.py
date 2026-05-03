@@ -3,6 +3,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from textual import work
 from textual.app import ComposeResult
@@ -75,20 +76,31 @@ class LayerDetailModal(ModalScreen):
         self._selected_set: str | None = None
         # Two-step delete: first click arms, second click commits.
         self._delete_armed: bool = False
+        # Same two-step pattern for the embeddings-Remove button.
+        # Bulk-clearing all models for a set was a footgun; the
+        # row-targeted Remove still warrants a confirm because each
+        # row may represent hours of compute on the remote.
+        self._remove_embed_armed: bool = False
+        # Cache of per-set sequence lengths for the length histogram —
+        # populated by `_compute_lengths_worker` so tabbing between sets
+        # only pays the parse cost on first view of each.
+        self._length_cache: dict[str, list[int]] = {}
+        self._length_pending: set[str] = set()
+        # Set when an in-modal action mutates a set (filter, rename, …)
+        # without dismissing the modal. On close we surface a marker to
+        # the parent so the layers panel + views refresh.
+        self._dirty: bool = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-body"):
             yield Label(f"[bold]Layer · {self._layer}[/bold]", id="layer-detail-title")
             if self._layer == "homologs":
                 yield from self._compose_homologs()
+            elif self._layer == "embeddings":
+                yield from self._compose_embeddings()
             else:
                 yield Static(self._render_text(), id="layer-detail-content")
                 with Horizontal(id="modal-buttons"):
-                    m = self._project.manifest()
-                    if self._layer == "embeddings":
-                        if (m.get("embeddings") or {}).get("n_embeddings"):
-                            yield Button("Reset", id="reset-embeddings-btn",
-                                         variant="warning")
                     yield Button("Close", id="close-btn")
 
     def _compose_homologs(self) -> ComposeResult:
@@ -133,29 +145,93 @@ class LayerDetailModal(ModalScreen):
                 active_row = i
         yield table
 
-        # Per-row details panel lives in a scroller so the modal's overall
-        # height doesn't shift when the highlighted set's content gets
-        # longer/shorter (taxonomy / files / job blocks vary). The
-        # scroller takes the remaining vertical space inside #modal-body.
-        with VerticalScroll(id="set-details-scroll"):
-            yield Static("", id="set-details", classes="set-details")
+        # Two-column row: the per-row details on the left (scrollable so
+        # the modal height stays put), the length histogram on the right.
+        # The histogram pane gets its own border so it reads as a chart
+        # widget rather than a text continuation.
+        with Horizontal(id="set-detail-row"):
+            with VerticalScroll(id="set-details-scroll"):
+                yield Static("", id="set-details", classes="set-details")
+            yield Static("", id="length-hist-panel")
 
-        # Action buttons. Compact so all seven fit a 120-cell modal
-        # without overflowing into the right border.
+        # Action buttons grouped by intent. Each group lives in its own
+        # Horizontal so a thin spacer can sit between groups without
+        # collapsing the buttons together. Layout:
+        #
+        #   [Activate] | [Rename Filter] | [Align Taxonomy Drop align]
+        #     | [Delete set]                   <spacer>     [Search] | [Close]
+        #
+        # — primary action on the left, edits and computes in the middle,
+        # destructive on the right of the contextual group, then the
+        # orthogonal "new search" + "close" pinned to the modal's right
+        # edge. Tooltips still spell out the full effect on hover.
         with Horizontal(id="modal-buttons"):
-            yield Button("New search", id="new-search-btn", compact=True)
-            yield Button(
-                "Make active", id="make-active-btn",
-                variant="primary", compact=True,
-            )
-            yield Button("Rename", id="rename-set-btn", compact=True)
-            yield Button("Build taxonomy", id="build-tax-btn", compact=True)
-            yield Button("Reset align", id="reset-align-btn", compact=True)
-            yield Button(
-                "Delete set", id="delete-set-btn",
-                variant="warning", compact=True,
-            )
-            yield Button("Close", id="close-btn", compact=True)
+            with Horizontal(classes="btn-group"):
+                yield Button(
+                    "Activate", id="make-active-btn",
+                    variant="primary", compact=True,
+                    tooltip=(
+                        "Use this set's hits and alignment in the project views."
+                    ),
+                )
+            with Horizontal(classes="btn-group"):
+                yield Button(
+                    "Rename", id="rename-set-btn", compact=True,
+                    tooltip="Rename this set.",
+                )
+                yield Button(
+                    "Filter", id="filter-length-btn", compact=True,
+                    tooltip=(
+                        "Trim hits by sequence length — clears the alignment "
+                        "for this set so you can re-align the trimmed FASTA."
+                    ),
+                )
+                yield Button(
+                    "Dedupe", id="dedupe-set-btn", compact=True,
+                    tooltip=(
+                        "Drop exact-duplicate sequences (case-insensitive). "
+                        "Clears the existing alignment if anything is removed."
+                    ),
+                )
+            with Horizontal(classes="btn-group"):
+                yield Button(
+                    "Align", id="submit-align-btn", compact=True,
+                    tooltip=(
+                        "Submit a Clustal Omega alignment for this set's hits. "
+                        "Replaces any existing alignment."
+                    ),
+                )
+                yield Button(
+                    "Taxonomy", id="build-tax-btn", compact=True,
+                    tooltip="Re-fetch UniProt taxonomy for this set's hits.",
+                )
+                yield Button(
+                    "Drop align", id="reset-align-btn", compact=True,
+                    tooltip=(
+                        "Delete the alignment but keep the hits. "
+                        "Re-aligning replaces it."
+                    ),
+                )
+            with Horizontal(classes="btn-group"):
+                yield Button(
+                    "Delete set", id="delete-set-btn",
+                    variant="warning", compact=True,
+                    tooltip=(
+                        "Permanently delete this set's hits, alignment, "
+                        "and metadata."
+                    ),
+                )
+            # Pushes the modal-level actions to the right edge.
+            yield Static("", id="btn-spacer-grow")
+            with Horizontal(classes="btn-group"):
+                yield Button(
+                    "Search", id="new-search-btn", compact=True,
+                    tooltip="Run a new database search — creates another set.",
+                )
+                yield Button(
+                    "Close", id="close-btn", compact=True,
+                    tooltip="Close this dialog (Esc).",
+                )
 
         # Seed cursor on the active row so the details panel and the
         # button states match the dropdown's old default.
@@ -377,30 +453,197 @@ class LayerDetailModal(ModalScreen):
 
         return "\n".join(rows)
 
-    def _render_embeddings(self, m: dict) -> str:
-        e = m.get("embeddings") or {}
-        remote = e.get("remote") or {}
-        rows = []
-        rows.append(self._kv("Model", e.get("model", "-") or "-"))
-        n = e.get("n_embeddings", 0)
-        rows.append(self._kv("Files", f"{n:,}" if n else "-"))
-        last = e.get("last_updated")
-        if last is not None:
-            rows.append(self._kv("Last updated", _format_dt(last)))
-        jid = remote.get("job_id")
-        if jid:
-            rows.append("")
-            rows.append(self._kv("Job", f"{jid}  -  {_job_status(jid)}"))
+    def _compose_embeddings(self) -> ComposeResult:
+        """DataTable of (set, model) entries with per-row job status.
 
-        emb_dir = self._project.path / "embeddings"
-        if emb_dir.exists():
-            files = sorted(p for p in emb_dir.rglob("*") if p.is_file())[:8]
-            if files:
+        Each row is one (homolog set, model) pair. Selecting a row +
+        clicking Status opens the JobStatusModal for that entry's job
+        — gives users a way to check on jobs that aren't currently
+        the active set's most-recent (the layers-panel pill only
+        surfaces the latter).
+        """
+        entries = self._project.embeddings_sets()
+
+        if not entries:
+            yield Static(
+                "[dim]No embeddings yet — submit one with the "
+                "[b]New embedding[/b] button below.[/dim]",
+                id="layer-detail-content",
+            )
+            with Horizontal(id="modal-buttons"):
+                hits_fasta = (
+                    self._project.active_homologs_dir() / "sequences.fasta"
+                )
+                if hits_fasta.exists():
+                    yield Button(
+                        "New embedding",
+                        id="new-embed-btn",
+                        variant="primary",
+                    )
+                yield Button("Close", id="close-btn")
+            return
+
+        # Active set first; within a set, most-recently-updated first
+        # so the row order matches what the user just submitted.
+        active_name = self._project.active_set_name()
+
+        from datetime import datetime, timezone
+
+        def _ts(entry):
+            v = entry.get("last_updated")
+            if isinstance(v, datetime):
+                return (v if v.tzinfo else v.replace(tzinfo=timezone.utc)).timestamp()
+            try:
+                return datetime.fromisoformat(str(v)).timestamp()
+            except (ValueError, TypeError):
+                return 0.0
+
+        def _key(e):
+            return (
+                e.get("source_homologs_set") != active_name,
+                -_ts(e),
+            )
+
+        entries = sorted(entries, key=_key)
+        # Stash the entry list on the modal so handlers can map a
+        # selected key back to its remote.job_id without re-reading
+        # the manifest.
+        self._embed_entries: List[Dict[str, Any]] = entries
+
+        yield Label("[bold]Embeddings[/bold]", classes="section-label")
+        table = DataTable(
+            id="embeddings-table", cursor_type="row", zebra_stripes=True,
+        )
+        table.add_columns(
+            " ", "Set", "Model", "Files", "Last updated", "Status",
+        )
+        for i, e in enumerate(entries):
+            src = e.get("source_homologs_set") or "?"
+            marker = "★" if src == active_name else ""
+            # Strip HF org prefixes for compactness.
+            model = (e.get("model") or "-").split("/")[-1]
+            n = e.get("n_embeddings") or 0
+            n_str = f"{n:,}" if n else "—"
+            last = _format_dt(e.get("last_updated")) or "—"
+            jid = (e.get("remote") or {}).get("job_id") or ""
+            status = _job_status(jid).lower() if jid else "—"
+            # Row key = job id when present (for status modal lookup),
+            # else a unique synthetic so duplicate (set, no-job) rows
+            # don't collide.
+            row_key = jid or f"row-{i}"
+            table.add_row(marker, src, model, n_str, last, status, key=row_key)
+        yield table
+
+        # Action row. The selected row's job_id drives `Status`; the
+        # active set's hits drive `New embedding`; `Reset` always
+        # operates on the active set (consistent with the previous
+        # semantics and the homologs pane's bulk reset).
+        with Horizontal(id="modal-buttons"):
+            hits_fasta = (
+                self._project.active_homologs_dir() / "sequences.fasta"
+            )
+            if hits_fasta.exists():
+                yield Button(
+                    "New embedding",
+                    id="new-embed-btn",
+                    variant="primary",
+                )
+            yield Button("Status", id="embed-status-btn")
+            # Row-targeted Remove. Operates on the (set, model) pair
+            # of whichever row is selected — including failed rows
+            # with no `n_embeddings`. The previous bulk "Reset" wiped
+            # *every* model for the active set, which made it easy to
+            # accidentally trash working models alongside a failed
+            # one. The button is always shown when entries exist; the
+            # handler validates row selection and shows a notify if
+            # nothing is highlighted.
+            yield Button(
+                "Remove", id="remove-embedding-btn", variant="warning",
+            )
+            yield Button("Close", id="close-btn")
+
+    def _selected_embed_job_id(self) -> Optional[str]:
+        """Return the job_id under the embeddings table cursor, or None."""
+        try:
+            table = self.query_one("#embeddings-table", DataTable)
+        except Exception:
+            return None
+        try:
+            row_key = table.coordinate_to_cell_key(
+                table.cursor_coordinate
+            ).row_key
+        except Exception:
+            return None
+        key = row_key.value if row_key else None
+        if not key or str(key).startswith("row-"):
+            return None
+        return str(key)
+
+    def _selected_embed_entry(self) -> Optional[Dict[str, Any]]:
+        """Return the embeddings entry dict under the cursor.
+
+        Works for any row, including failed entries that have no
+        `n_embeddings` and synthetic-keyed rows for entries with no
+        `remote.job_id`. We map by cursor *index* into
+        `self._embed_entries` so the lookup doesn't depend on the row
+        key being a real job_id.
+        """
+        try:
+            table = self.query_one("#embeddings-table", DataTable)
+        except Exception:
+            return None
+        entries = getattr(self, "_embed_entries", None) or []
+        try:
+            row_idx = table.cursor_coordinate.row
+        except Exception:
+            return None
+        if row_idx < 0 or row_idx >= len(entries):
+            return None
+        return entries[row_idx]
+
+    def _render_embeddings(self, m: dict) -> str:
+        # Render one block per embeddings set; the active set comes
+        # first and is marked. This makes the "I have embeddings for
+        # multiple homolog sets" state legible at a glance.
+        sets = self._project.embeddings_sets()
+        active_name = self._project.active_set_name()
+        if not sets:
+            return "No embeddings yet."
+
+        def _set_sort_key(s):
+            return (s.get("source_homologs_set") != active_name,
+                    s.get("source_homologs_set") or "")
+        sets = sorted(sets, key=_set_sort_key)
+
+        rows = []
+        for i, e in enumerate(sets):
+            src = e.get("source_homologs_set") or "?"
+            tag = " [dim](active)[/dim]" if src == active_name else ""
+            if i > 0:
                 rows.append("")
-                rows.append("  Sample files:")
-                for p in files:
-                    rows.append(f"    - {p.relative_to(emb_dir)}  ({_human_size(p.stat().st_size)})")
-        return "\n".join(rows) if rows else "No embeddings yet."
+            rows.append(f"[bold]Set: {src}[/bold]{tag}")
+            remote = e.get("remote") or {}
+            rows.append(self._kv("Model", e.get("model", "-") or "-"))
+            n = e.get("n_embeddings", 0)
+            rows.append(self._kv("Files", f"{n:,}" if n else "-"))
+            last = e.get("last_updated")
+            if last is not None:
+                rows.append(self._kv("Last updated", _format_dt(last)))
+            jid = remote.get("job_id")
+            if jid:
+                rows.append(self._kv("Job", f"{jid}  -  {_job_status(jid)}"))
+
+            set_dir = self._project.embeddings_set_dir(src)
+            if set_dir.exists():
+                files = sorted(p for p in set_dir.rglob("*") if p.is_file())[:6]
+                if files:
+                    rows.append("  Sample files:")
+                    for p in files:
+                        rows.append(
+                            f"    - {p.relative_to(set_dir)}  "
+                            f"({_human_size(p.stat().st_size)})"
+                        )
+        return "\n".join(rows)
 
     def _render_structures(self, m: dict) -> str:
         d = self._project.path / "structures"
@@ -456,14 +699,18 @@ class LayerDetailModal(ModalScreen):
         # Any button click other than the delete arming itself disarms it.
         if bid != "delete-set-btn" and self._delete_armed:
             self._disarm_delete()
+        # Same disarm pattern for the embeddings-Remove confirm — any
+        # other button click cancels the pending remove.
+        if bid != "remove-embedding-btn" and self._remove_embed_armed:
+            self._disarm_remove_embed()
         if bid == "close-btn":
-            self.dismiss(None)
+            self.dismiss("set-mutated" if self._dirty else None)
         elif bid == "reset-align-btn":
             self._reset_alignment_for(self._selected_set)
         elif bid == "reset-homologs-btn":
             self._reset_homologs()
-        elif bid == "reset-embeddings-btn":
-            self._reset_embeddings()
+        elif bid == "remove-embedding-btn":
+            self._remove_embedding_clicked(event.button)
         elif bid == "build-tax-btn":
             self._build_taxonomy_now(event.button)
         elif bid == "make-active-btn":
@@ -472,12 +719,125 @@ class LayerDetailModal(ModalScreen):
             self._delete_set_clicked(event.button)
         elif bid == "new-search-btn":
             self._open_new_search()
+        elif bid == "new-embed-btn":
+            self.dismiss("open-embed")
+        elif bid == "embed-status-btn":
+            self._open_embed_status()
         elif bid == "rename-set-btn":
             self._open_rename_set()
+        elif bid == "filter-length-btn":
+            self._open_filter_length()
+        elif bid == "dedupe-set-btn":
+            self._open_dedupe_set()
+        elif bid == "submit-align-btn":
+            self._submit_align_clicked()
+
+    def _open_embed_status(self) -> None:
+        """Open JobStatusModal for the embeddings row under the cursor."""
+        jid = self._selected_embed_job_id()
+        if not jid:
+            self.notify(
+                "Select a row with a tracked job (status column ≠ —).",
+                timeout=4,
+            )
+            return
+        from .job_status import JobStatusModal
+        self.app.push_screen(JobStatusModal(jid))
 
     def _open_new_search(self) -> None:
         """Dismiss with a marker so the detail screen opens the search modal."""
         self.dismiss("open-search")
+
+    def _submit_align_clicked(self) -> None:
+        """Hand the parent screen the (re-)align request for the highlighted set.
+
+        Reuses `LayersPanel.submit_alignment(set_name)` over there, which
+        owns the SSH manager + worker + status pill — rather than spawning
+        a parallel submit path inside the modal. The marker carries the
+        set name so the parent can target the right one even when it
+        isn't the active set.
+        """
+        if not self._selected_set:
+            return
+        # Cheap sanity: there has to be a hits FASTA to align.
+        hits = self._project.homologs_set_dir(self._selected_set) / "sequences.fasta"
+        if not hits.exists():
+            self.notify(
+                f"No sequences.fasta in '{self._selected_set}' — "
+                "search first.", severity="warning", timeout=6,
+            )
+            return
+        self.dismiss(f"submit-align:{self._selected_set}")
+
+    def _open_dedupe_set(self) -> None:
+        """Push the dedupe confirmation modal for the highlighted set."""
+        if not self._selected_set:
+            return
+        set_name = self._selected_set
+        from .dedupe_set import DedupeSetModal
+
+        def _on_deduped(result) -> None:
+            if not result:
+                return
+            n_kept, n_dropped = result
+            if n_dropped == 0:
+                self.notify(
+                    f"'{set_name}' had no exact duplicates "
+                    f"({n_kept:,} sequences).",
+                    timeout=6,
+                )
+                return
+            # Mirror the filter path: cached lengths and any in-flight
+            # length parse are stale; mark the modal dirty so the
+            # parent refreshes layers/views on close.
+            self._length_cache.pop(set_name, None)
+            self._length_pending.discard(set_name)
+            self._refresh_set_actions()
+            self._dirty = True
+            self.notify(
+                f"Removed {n_dropped:,} duplicate(s) from '{set_name}' · "
+                f"{n_kept:,} unique sequences remain.",
+                timeout=6,
+            )
+
+        self.app.push_screen(DedupeSetModal(self._project, set_name), _on_deduped)
+
+    def _open_filter_length(self) -> None:
+        """Push the length-filter modal for the highlighted set."""
+        if not self._selected_set:
+            return
+        set_name = self._selected_set
+        # Seed the inputs with the set's actual length range when we
+        # know it; fall back to a wide default so the user always has
+        # something sensible to edit.
+        lengths = self._length_cache.get(set_name) or []
+        cur_min = min(lengths) if lengths else 0
+        cur_max = max(lengths) if lengths else 1000
+        from .filter_length import FilterLengthModal
+
+        def _on_filtered(result) -> None:
+            if not result:
+                return
+            mn, mx, n_kept = result
+            # Invalidate cached lengths so the histogram re-parses the
+            # trimmed FASTA on the next refresh.
+            self._length_cache.pop(set_name, None)
+            self._length_pending.discard(set_name)
+            self._refresh_set_actions()
+            # Mark dirty so the parent screen refreshes when the modal
+            # closes — the layers panel needs to pick up the new
+            # n_homologs and the cleared alignment.
+            self._dirty = True
+            self.notify(
+                f"Filtered '{set_name}' to {n_kept:,} sequences in "
+                f"[{mn}, {mx}] aa.",
+                timeout=6,
+            )
+
+        self.app.push_screen(
+            FilterLengthModal(self._project, set_name, cur_min, cur_max),
+            _on_filtered,
+        )
 
     def _open_rename_set(self) -> None:
         """Push the rename modal for the highlighted set; refresh on success."""
@@ -547,8 +907,10 @@ class LayerDetailModal(ModalScreen):
             return
         if not self._selected_set:
             details.update("")
+            self._update_length_panel("")
             return
         details.update(self._render_set_details(self._selected_set))
+        self._refresh_length_panel(self._selected_set)
 
         active = self._project.active_set_name()
         sets = self._project.homologs_sets()
@@ -575,6 +937,21 @@ class LayerDetailModal(ModalScreen):
         try:
             align_btn = self.query_one("#reset-align-btn", Button)
             align_btn.disabled = not bool(set_dict.get("n_aligned"))
+        except Exception:
+            pass
+
+        # The "Align" button (re-align too) — enabled when:
+        #   - the set has hits to align,
+        #   - no alignment job is currently in flight for it.
+        # Label flips to "Re-align" when an alignment already exists, so
+        # the destructive intent is obvious.
+        try:
+            submit_align_btn = self.query_one("#submit-align-btn", Button)
+            has_hits = bool(set_dict.get("n_homologs"))
+            in_flight = bool((set_dict.get("remote") or {}).get("align_job_id"))
+            already_aligned = bool(set_dict.get("n_aligned"))
+            submit_align_btn.disabled = not has_hits or in_flight
+            submit_align_btn.label = "Re-align" if already_aligned else "Align"
         except Exception:
             pass
 
@@ -630,9 +1007,22 @@ class LayerDetailModal(ModalScreen):
 
     @work(thread=True, exclusive=True, group="tax-rebuild")
     def _taxonomy_worker(self) -> None:
+        def _on_progress(done: int, total: int) -> None:
+            # Live-update the button label so the user can see the
+            # build progressing through several minutes of UniProt
+            # round-trips on a 25k+-hit set.
+            try:
+                self.app.call_from_thread(
+                    self._update_tax_button_progress, done, total
+                )
+            except Exception:
+                pass
+
         try:
             from ..taxonomy import build_taxonomy_table
-            df = build_taxonomy_table(self._project, force=True)
+            df = build_taxonomy_table(
+                self._project, force=True, progress_cb=_on_progress
+            )
             n = len(df) if df is not None else 0
             n_resolved = (
                 int(df["organism"].notna().sum())
@@ -653,6 +1043,18 @@ class LayerDetailModal(ModalScreen):
         # layers panel refreshes the homolog row.
         self.app.call_from_thread(self.dismiss, "tax-rebuilt")
 
+    def _update_tax_button_progress(self, done: int, total: int) -> None:
+        """UI-thread label update for the Taxonomy button."""
+        try:
+            btn = self.query_one("#build-tax-btn", Button)
+        except Exception:
+            return
+        if total <= 0:
+            btn.label = "Building…"
+            return
+        pct = int(min(100, max(0, done / total * 100))) if total else 0
+        btn.label = f"{done:,}/{total:,} · {pct}%"
+
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "active-set-select":
             new_name = str(event.value)
@@ -661,19 +1063,34 @@ class LayerDetailModal(ModalScreen):
                 self.dismiss("set-switched")
 
     def action_close(self) -> None:
-        self.dismiss(None)
+        self.dismiss("set-mutated" if self._dirty else None)
 
     # ---- reset helpers ----
 
     def _reset_alignment_for(self, set_name: str | None) -> None:
-        """Clear alignment artefacts of `set_name`; keep hits + search."""
+        """Clear alignment artefacts of `set_name`; keep hits + search.
+
+        Cascades to the remote: any align_job_id recorded for the set
+        gets its `~/beak_jobs/<id>/` rm'd as part of the reset.
+        """
         if not set_name:
             set_name = self._project.active_set_name()
         h_dir = self._project.homologs_set_dir(set_name)
+        from ...alignments.cache import invalidate_cache
         for name in ("alignment.fasta", "conservation.npy"):
             f = h_dir / name
             if f.exists():
+                if name == "alignment.fasta":
+                    invalidate_cache(f)
                 f.unlink()
+
+        # Snapshot align_job_id before the mutate clears it.
+        align_jids: List[str] = []
+        for s in self._project.homologs_sets():
+            if s.get("name") == set_name:
+                jid = (s.get("remote") or {}).get("align_job_id")
+                if jid:
+                    align_jids.append(jid)
 
         with self._project.mutate() as m:
             homologs = m.setdefault("homologs", {})
@@ -686,15 +1103,41 @@ class LayerDetailModal(ModalScreen):
                     s["remote"] = remote
                     sets[i] = s
                     break
+
+        if align_jids:
+            self._cleanup_remote_jobs(align_jids)
         self.dismiss("reset-align")
 
     def _reset_homologs(self) -> None:
-        """Wipe the active set entirely — hits, alignment, taxonomy cache."""
+        """Wipe the active set entirely — hits, alignment, taxonomy cache.
+
+        Cascades to the remote: search/align job dirs for the set get
+        nuked, plus any embedding job dirs that were computed against
+        this set (since the embeddings entries are also discarded).
+        """
         import shutil
         active_name = self._project.active_set_name()
         h_dir = self._project.active_homologs_dir()
         if h_dir.exists():
             shutil.rmtree(h_dir)
+
+        # Collect every job_id we're about to orphan — search, align,
+        # and any embedding model computed against this homolog set.
+        cleanup_jids: List[str] = []
+        for s in self._project.homologs_sets():
+            if s.get("name") != active_name:
+                continue
+            remote = s.get("remote") or {}
+            for k in ("search_job_id", "align_job_id"):
+                jid = remote.get(k)
+                if jid:
+                    cleanup_jids.append(jid)
+        for e in self._project.embeddings_sets():
+            if e.get("source_homologs_set") != active_name:
+                continue
+            jid = (e.get("remote") or {}).get("job_id")
+            if jid:
+                cleanup_jids.append(jid)
 
         with self._project.mutate() as m:
             homologs = m.get("homologs") or {}
@@ -707,14 +1150,324 @@ class LayerDetailModal(ModalScreen):
                 m["homologs"] = homologs
             else:
                 m.pop("homologs", None)
+
+            # Drop embeddings tied to the dead set too — keeping them
+            # would leave dangling source_homologs_set references.
+            emb = m.get("embeddings") or {}
+            emb_sets = emb.get("sets") or []
+            emb_sets = [
+                e for e in emb_sets
+                if e.get("source_homologs_set") != active_name
+            ]
+            if emb_sets:
+                emb["sets"] = emb_sets
+                m["embeddings"] = emb
+            elif "embeddings" in m:
+                m.pop("embeddings", None)
+
+        if cleanup_jids:
+            self._cleanup_remote_jobs(cleanup_jids)
         self.dismiss("reset-homologs")
 
-    def _reset_embeddings(self) -> None:
-        """Wipe the embeddings layer."""
-        import shutil
-        e_dir = self._project.path / "embeddings"
-        if e_dir.exists():
-            shutil.rmtree(e_dir)
-        with self._project.mutate() as m:
-            m.pop("embeddings", None)
+    # ---- length histogram ----
+
+    # Vertical block ramp — each cell carries 1/8 of a row's worth of
+    # bar height, so a `height`-row chart resolves `height * 8` discrete
+    # bin levels.
+    _HIST_BLOCKS = " ▁▂▃▄▅▆▇█"
+    # Bins are sized to the chart pane on first paint; this is the
+    # fallback when the pane hasn't been measured yet.
+    _HIST_DEFAULT_BINS = 36
+    _HIST_DEFAULT_HEIGHT = 8
+
+    def _refresh_length_panel(self, set_name: str) -> None:
+        """Push the length-histogram chart for `set_name` into its pane."""
+        fasta = self._project.homologs_set_dir(set_name) / "sequences.fasta"
+        if not fasta.exists():
+            self._update_length_panel("[dim]No sequences yet.[/dim]")
+            return
+
+        if set_name not in self._length_cache:
+            if set_name not in self._length_pending:
+                self._length_pending.add(set_name)
+                self._compute_lengths_worker(set_name)
+            self._update_length_panel("[dim]Computing length distribution…[/dim]")
+            return
+
+        lengths = self._length_cache[set_name]
+        if not lengths:
+            self._update_length_panel("[dim]No sequences in FASTA.[/dim]")
+            return
+
+        # Scale bins/height to the available chart pane so the bars
+        # actually use the corner the user just dedicated to them.
+        bins, height = self._chart_dims()
+        chart = self._render_histogram(lengths, bins=bins, height=height)
+        header = (
+            f"[bold]Length distribution[/bold]  "
+            f"[dim](n={len(lengths):,})[/dim]"
+        )
+        stats = self._length_stats_line(lengths)
+        self._update_length_panel(f"{header}\n{stats}\n\n{chart}")
+
+    def _update_length_panel(self, content: str) -> None:
+        try:
+            panel = self.query_one("#length-hist-panel", Static)
+        except Exception:
+            return
+        panel.update(content)
+
+    def _chart_dims(self) -> tuple[int, int]:
+        """Return (n_bins, height) sized to the histogram pane."""
+        try:
+            panel = self.query_one("#length-hist-panel", Static)
+            w = max(20, panel.size.width - 4)  # 2 padding on each side
+            h = max(4, panel.size.height - 6)  # header + stats + axis labels
+        except Exception:
+            return self._HIST_DEFAULT_BINS, self._HIST_DEFAULT_HEIGHT
+        return min(60, w), min(16, h)
+
+    @staticmethod
+    def _length_stats_line(lengths: list[int]) -> str:
+        sorted_l = sorted(lengths)
+        lo, hi = sorted_l[0], sorted_l[-1]
+        median = sorted_l[len(sorted_l) // 2]
+        mean = sum(sorted_l) / len(sorted_l)
+        return (
+            f"[dim]min[/dim] {lo}  "
+            f"[dim]median[/dim] {median}  "
+            f"[dim]mean[/dim] {mean:.0f}  "
+            f"[dim]max[/dim] {hi}  [dim]aa[/dim]"
+        )
+
+    def _render_histogram(
+        self, lengths: list[int], bins: int, height: int
+    ) -> str:
+        # Defensive: callers gate on `lengths` truthiness, but if they
+        # ever slip through with [] we'd crash on `min([])` / `max([])`.
+        if not lengths:
+            return "[dim]no length data[/dim]"
+        lo = min(lengths)
+        hi = max(lengths)
+        if hi == lo:
+            return f"[dim]all {lo} aa[/dim]"
+        span = hi - lo
+        counts = [0] * bins
+        for L in lengths:
+            idx = int((L - lo) / span * bins)
+            if idx >= bins:
+                idx = bins - 1
+            counts[idx] += 1
+        peak = max(counts) or 1
+
+        # For each row from the top down, decide how full each column is.
+        # `height * 8` total sub-cells per column — block ramp resolves
+        # 8 levels per cell, giving a smooth bar even at small `height`.
+        total_units = height * 8
+        rows: list[str] = []
+        for r in range(height - 1, -1, -1):
+            cells = []
+            for c in counts:
+                col_units = c / peak * total_units
+                cell_units = int(round(col_units - r * 8))
+                cell_units = max(0, min(8, cell_units))
+                cells.append(self._HIST_BLOCKS[cell_units])
+            rows.append(f"[#65CBF3]{''.join(cells)}[/#65CBF3]")
+
+        # X-axis: min on the left, max on the right, padded to bar width.
+        left = str(lo)
+        right = f"{hi} aa"
+        gap = max(1, bins - len(left) - len(right))
+        rows.append(f"[dim]{left}{' ' * gap}{right}[/dim]")
+        return "\n".join(rows)
+
+    @work(thread=True, group="length-hist")
+    def _compute_lengths_worker(self, set_name: str) -> None:
+        """Parse hit FASTA into a list of sequence lengths.
+
+        Streams line-by-line so a 40 MB hits file doesn't pull into
+        memory all at once; only the integer lengths are kept.
+        """
+        fasta = self._project.homologs_set_dir(set_name) / "sequences.fasta"
+        lengths: list[int] = []
+        try:
+            cur = 0
+            with open(fasta) as f:
+                for line in f:
+                    if line.startswith(">"):
+                        if cur:
+                            lengths.append(cur)
+                        cur = 0
+                    else:
+                        cur += len(line.strip())
+                if cur:
+                    lengths.append(cur)
+        except Exception:
+            lengths = []
+
+        self._length_cache[set_name] = lengths
+        self._length_pending.discard(set_name)
+        # Refresh only if the user is still on this row — otherwise the
+        # cached entry will be picked up the next time they tab back.
+        try:
+            self.app.call_from_thread(self._refresh_if_selected, set_name)
+        except Exception:
+            pass
+
+    def _refresh_if_selected(self, set_name: str) -> None:
+        if self._selected_set == set_name:
+            # Only the histogram pane needs an update — the text details
+            # don't carry the histogram anymore, so this avoids a
+            # redundant re-render of the file/taxonomy block.
+            self._refresh_length_panel(set_name)
+
+    def _disarm_remove_embed(self) -> None:
+        """Reset the Remove button label after a context switch."""
+        self._remove_embed_armed = False
+        try:
+            btn = self.query_one("#remove-embedding-btn", Button)
+            btn.label = "Remove"
+        except Exception:
+            pass
+
+    def _remove_embedding_clicked(self, button: Button) -> None:
+        """Two-click confirm for the row-targeted Remove.
+
+        First click arms the button (label flips to 'Confirm remove')
+        and validates that a row is selected. Second click reads the
+        selected row's (set, model) entry, kicks off remote cleanup
+        for *just that row's* job_id, drops the manifest entry +
+        per-(set, model) directory, then dismisses so the parent
+        layers panel refreshes.
+        """
+        entry = self._selected_embed_entry()
+        if entry is None:
+            self.notify(
+                "Select a row to remove. Use ↑/↓ to highlight one.",
+                severity="warning", timeout=4,
+            )
+            return
+
+        if not self._remove_embed_armed:
+            set_name = entry.get("source_homologs_set") or "?"
+            model = (entry.get("model") or "-").split("/")[-1]
+            self._remove_embed_armed = True
+            button.label = "Confirm remove"
+            self.notify(
+                f"Click again to remove · set={set_name} · model={model}",
+                timeout=5,
+            )
+            return
+
+        # Second click: do it.
+        self._remove_embed_armed = False
+        set_name = entry.get("source_homologs_set")
+        model = entry.get("model")
+        job_id = (entry.get("remote") or {}).get("job_id")
+
+        if not set_name:
+            self.notify(
+                "Selected row has no source_homologs_set — manifest "
+                "is malformed; close and reopen.",
+                severity="error", timeout=8,
+            )
+            return
+
+        # Kick off remote cleanup *before* the local delete so the
+        # worker is registered while the modal is still alive.
+        if job_id:
+            self._cleanup_remote_jobs([job_id])
+
+        self._project.delete_embeddings_set(set_name, model=model)
         self.dismiss("reset-embeddings")
+
+    def _reset_embeddings(self) -> None:
+        """Wipe the active set's embeddings — local files + manifest +
+        remote job dirs.
+
+        Remote cleanup runs in a background worker so the modal closes
+        immediately. Best-effort: if SSH is unreachable, the local delete
+        still completes and the user sees a warning toast pointing at
+        the remote dirs they'd need to remove by hand.
+        """
+        # Snapshot the job ids about to be removed *before* the local
+        # delete clears them from the manifest.
+        active = self._project.active_set_name()
+        job_ids = [
+            (e.get("remote") or {}).get("job_id")
+            for e in self._project.embeddings_sets()
+            if e.get("source_homologs_set") == active
+        ]
+        job_ids = [j for j in job_ids if j]
+
+        # Kick off remote cleanup before the local delete so the worker
+        # is registered while this modal is still alive — Textual
+        # workers belong to the app, not the modal, so it'll continue
+        # running after dismiss.
+        if job_ids:
+            self._cleanup_remote_jobs(job_ids)
+
+        self._project.delete_active_embeddings_set()
+        self.dismiss("reset-embeddings")
+
+    @work(thread=True, exclusive=True, group="cleanup-jobs")
+    def _cleanup_remote_jobs(self, job_ids: List[str]) -> None:
+        """rm -rf each job's remote dir and remove its jobs.json entry.
+
+        Works for any job kind (search / align / embed / tax) — the
+        `cleanup()` method on `RemoteJobManager` only relies on the
+        per-job `remote_path` recorded in jobs.json, and that path is
+        validated against the manager's `remote_job_dir` server-side.
+        Picking ESMEmbeddings as the carrier is convenient (it
+        verifies docker on init, but the cleanup itself is generic).
+        """
+        if not job_ids:
+            return
+        from ...remote.embeddings import ESMEmbeddings
+
+        mgr = None
+        failed: List[str] = []
+        try:
+            try:
+                mgr = ESMEmbeddings()
+            except Exception as e:  # noqa: BLE001
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Remote cleanup skipped — can't reach the server "
+                    f"({type(e).__name__}). {len(job_ids)} job dir(s) "
+                    f"left on remote.",
+                    severity="warning",
+                    timeout=12,
+                )
+                return
+
+            for jid in job_ids:
+                try:
+                    mgr.cleanup(jid, keep_results=False)
+                except Exception:  # noqa: BLE001
+                    failed.append(jid)
+
+            if failed:
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Remote cleanup partial: {len(failed)}/{len(job_ids)} "
+                    f"job dir(s) left behind ({', '.join(failed[:3])}"
+                    f"{'…' if len(failed) > 3 else ''}).",
+                    severity="warning",
+                    timeout=10,
+                )
+            elif job_ids:
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Cleaned up {len(job_ids)} remote job dir"
+                    f"{'s' if len(job_ids) > 1 else ''}.",
+                    timeout=4,
+                )
+        finally:
+            if mgr is not None:
+                try:
+                    conn = getattr(mgr, "conn", None)
+                    if conn is not None:
+                        conn.close()
+                except Exception:  # noqa: BLE001
+                    pass

@@ -290,8 +290,28 @@ class ProjectDetailScreen(Screen):
             self.query_one(SequenceView).reload()
             self.query_one(StructureView).reload_set_data()
             return
+        if action_str == "set-mutated":
+            # In-modal mutations (filter, etc.) flushed dirty state on
+            # close — refresh the same surfaces a switch/rename would.
+            self.query_one(LayersPanel).refresh_state()
+            self.query_one(SequenceView).reload()
+            self.query_one(StructureView).reload_set_data()
+            return
+        if action_str.startswith("submit-align:"):
+            # Modal asked us to (re-)submit alignment for a specific set.
+            # `LayersPanel.submit_alignment` already owns the worker +
+            # status pill; we just hand off the set name.
+            target_set = action_str.split(":", 1)[1]
+            self.query_one(LayersPanel).submit_alignment(target_set)
+            return
         if action_str == "open-search":
             self.action_submit_search()
+            return
+        if action_str == "open-embed":
+            from .submit_embed import SubmitEmbedModal
+            self.app.push_screen(
+                SubmitEmbedModal(self._project), self._on_embed_submitted
+            )
             return
         if action_str.startswith("reset"):
             self.query_one(LayersPanel).refresh_state()

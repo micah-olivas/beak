@@ -107,9 +107,17 @@ class BeakApp(App):
         min-height: 8;
     }}
 
+    /* Every modal gets the centered/panel/right-aligned-button chrome
+       defined below. Adding a new modal class to this allowlist is
+       the only thing required to make it stylistically consistent
+       with the rest — without it, the modal renders top-left with
+       no border, no panel background, and no button spacing. */
+
     SubmitSearchModal, JobStatusModal, LayerDetailModal,
     SubmitEmbedModal, ImportExperimentModal, RemoteSetupModal,
-    NewProjectModal, RenameProjectModal, SubmitTaxonomyModal {{
+    NewProjectModal, RenameProjectModal, SubmitTaxonomyModal,
+    SubmitComparativeModal, FilterLengthModal, RenameSetModal,
+    DedupeSetModal, ServerStatusModal {{
         align: center middle;
     }}
 
@@ -120,7 +128,12 @@ class BeakApp(App):
     RemoteSetupModal #modal-body,
     NewProjectModal #modal-body,
     RenameProjectModal #modal-body,
-    SubmitTaxonomyModal #modal-body {{
+    SubmitTaxonomyModal #modal-body,
+    SubmitComparativeModal #modal-body,
+    FilterLengthModal #modal-body,
+    RenameSetModal #modal-body,
+    DedupeSetModal #modal-body,
+    ServerStatusModal #modal-body {{
         width: 64;
         height: auto;
         border: thick {BEAK_BLUE};
@@ -135,7 +148,7 @@ class BeakApp(App):
        around the cursor. The details panel lives inside a scroller that
        absorbs the variable height. */
     LayerDetailModal #modal-body {{
-        width: 120;
+        width: 140;
         height: 90%;
         min-height: 30;
     }}
@@ -144,16 +157,43 @@ class BeakApp(App):
         max-height: 12;
         margin-top: 1;
     }}
-    LayerDetailModal #set-details-scroll {{
+    LayerDetailModal #set-detail-row {{
         height: 1fr;
-        min-height: 10;
+        min-height: 12;
         margin-top: 1;
+    }}
+    LayerDetailModal #set-details-scroll {{
+        width: 60%;
+        height: 1fr;
+    }}
+    LayerDetailModal #length-hist-panel {{
+        width: 40%;
+        height: 1fr;
+        padding: 1 2;
+        margin-left: 1;
+        border: round $surface-lighten-1;
     }}
     LayerDetailModal .set-details {{
         padding: 0 1;
     }}
     LayerDetailModal .section-label {{
         margin-top: 1;
+    }}
+
+    /* Override the right-aligned default for this modal so the button
+       groups can flow left-to-right with a flexible spacer pushing the
+       modal-level actions (Search / Close) to the right edge. */
+    LayerDetailModal #modal-buttons {{
+        align: left middle;
+    }}
+    LayerDetailModal .btn-group {{
+        width: auto;
+        height: 3;
+        padding-right: 3;
+    }}
+    LayerDetailModal #btn-spacer-grow {{
+        width: 1fr;
+        height: 1;
     }}
 
     /* Import modal needs more room for the CSV preview table. */
@@ -174,7 +214,12 @@ class BeakApp(App):
     RemoteSetupModal #modal-buttons,
     NewProjectModal #modal-buttons,
     RenameProjectModal #modal-buttons,
-    SubmitTaxonomyModal #modal-buttons {{
+    SubmitTaxonomyModal #modal-buttons,
+    SubmitComparativeModal #modal-buttons,
+    FilterLengthModal #modal-buttons,
+    RenameSetModal #modal-buttons,
+    DedupeSetModal #modal-buttons,
+    ServerStatusModal #modal-buttons {{
         height: 3;
         align: right middle;
         margin-top: 1;
@@ -188,7 +233,12 @@ class BeakApp(App):
     RemoteSetupModal Button,
     NewProjectModal Button,
     RenameProjectModal Button,
-    SubmitTaxonomyModal Button {{
+    SubmitTaxonomyModal Button,
+    SubmitComparativeModal Button,
+    FilterLengthModal Button,
+    RenameSetModal Button,
+    DedupeSetModal Button,
+    ServerStatusModal Button {{
         margin-left: 1;
     }}
     """

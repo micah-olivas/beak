@@ -17,7 +17,7 @@ Status sources, in priority order:
 
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 from textual import work
 from textual.app import ComposeResult
@@ -74,6 +74,20 @@ def _close_mgr(mgr) -> None:
         pass
 
 
+def _scratch_cleanup(mgr, job_id: str) -> None:
+    """rm -rf the remote job dir + drop the local jobs.json entry.
+
+    `~/beak_jobs/<id>/` is treated as scratch — once the artifact has
+    landed in a project's local directory, the remote copy is
+    redundant. Best-effort: SSH errors are swallowed so a flaky
+    connection doesn't roll back a successful pull.
+    """
+    try:
+        mgr.cleanup(job_id, keep_results=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _human_size(n: float) -> str:
     if n < 1024:
         return f"{int(n)} B"
@@ -97,28 +111,98 @@ class Pill(Label):
             self.pill_id = pill_id
             self.value = value
 
+    # Marquee budget for the body text inside the pill caps. Anything
+    # longer scrolls instead of overflowing the row's slot, so the
+    # pill width is stable regardless of label length and a long
+    # status string ("aligning · running · queued") doesn't push
+    # neighbouring columns around.
+    BODY_MAX_W = 14
+    # Ticks at offset=0 before scrolling resumes. Same cadence as the
+    # project-list ticker (0.15s tick → ~2.5s pause).
+    DWELL_TICKS = 17
+
     def __init__(self, **kwargs) -> None:
         super().__init__("", **kwargs)
         self._active: bool = False
         self._value: str = ""
+        # Marquee state — full body text, color, and current scroll
+        # offset. `_dwell` counts down at offset=0 so the start of the
+        # text gets a beat to be readable before scrolling resumes.
+        self._full_text: str = ""
+        self._color: str = "yellow"
+        self._offset: int = 0
+        self._dwell: int = 0
+        # Start invisible — `display = False` drops the widget out of
+        # layout so it consumes zero cells until `show()` swaps it in.
+        # Without this, hidden pills still claim their padding budget,
+        # which would push the visible pill far to the right when most
+        # of the row's pills aren't active.
+        self.display = False
 
     def show(self, text: str, color: str = "yellow", value: str = "") -> None:
         self._active = True
         self._value = value
-        # Pill-style render: bold colored text on a subtle dark fill,
-        # framed by parenthesis caps. Reads as a small button without
-        # needing a per-line border.
+        # Reset marquee position whenever the underlying text changes,
+        # so a fresh status starts at offset 0 with a full reading
+        # pause rather than wherever the previous text was scrolled to.
+        if text != self._full_text:
+            self._full_text = text
+            self._offset = 0
+            self._dwell = self.DWELL_TICKS
+        self._color = color
+        self._repaint()
+        self.display = True
+
+    def _repaint(self) -> None:
+        """Push the pill's current marquee frame to the underlying Label.
+
+        Named `_repaint` (not `_render`) because Textual's Widget base
+        class has its own `_render()` in the rendering pipeline; shadowing
+        it returns None where a Visual is expected and crashes
+        `get_content_width` on first paint.
+        """
         bg = "#1F2A3A"
+        full = self._full_text
+        if len(full) > self.BODY_MAX_W:
+            # Loop the text with a small gap so the wrap doesn't snap.
+            loop = full + "   " + full
+            body = loop[self._offset:self._offset + self.BODY_MAX_W]
+        else:
+            body = full
+        c = self._color
         self.update(
-            f"[{color}]([/{color}]"
-            f"[bold {color} on {bg}] {text} [/bold {color} on {bg}]"
-            f"[{color}])[/{color}]"
+            f"[{c}]([/{c}]"
+            f"[bold {c} on {bg}] {body} [/bold {c} on {bg}]"
+            f"[{c}])[/{c}]"
         )
+
+    def tick(self) -> None:
+        """Advance the marquee one cell. Called by the panel's interval.
+
+        No-op for inactive pills and for pills whose body fits the
+        budget — short labels like "Search" or "running" stay
+        stationary; only the "aligning · running" / "embedding ·
+        queued" combos scroll.
+        """
+        if not self._active or len(self._full_text) <= self.BODY_MAX_W:
+            return
+        if self._dwell > 0:
+            self._dwell -= 1
+            return
+        loop_len = len(self._full_text) + 3  # +3 for the gap segment
+        self._offset = (self._offset + 1) % loop_len
+        if self._offset == 0:
+            self._dwell = self.DWELL_TICKS
+        self._repaint()
 
     def hide_pill(self) -> None:
         self._active = False
         self._value = ""
+        self._full_text = ""
+        self._offset = 0
+        self._dwell = 0
         self.update("")
+        self.display = False
 
     def on_click(self, event) -> None:
         if self._active:
@@ -164,7 +248,14 @@ class LayersPanel(Vertical):
         overflow-x: hidden;
     }
     LayersPanel Pill { width: auto; padding: 0 1; }
-    LayersPanel .layer-count { width: 22; }
+    /* `padding-right: 2` keeps the count column from butting right up
+       against the size column on rows where the count text fills the
+       width budget — previously `18,834 seqs (aligned)` ran straight
+       into the size string with no breathing room. */
+    LayersPanel .layer-count {
+        width: 24;
+        padding-right: 2;
+    }
     LayersPanel .layer-size { width: 12; }
     LayersPanel Pill { width: auto; padding-right: 2; }
     """
@@ -180,6 +271,11 @@ class LayersPanel(Vertical):
         self._pulling_kinds: set = set()
         self._submitting_align: bool = False  # gate against double-submit
         self._submitting_embed: bool = False
+        # Live (done, total) for the current UniProt taxonomy auto-build,
+        # set by `_build_taxonomy`'s progress callback so the homologs
+        # row's status pill can render a counter. None when no build is
+        # running.
+        self._tax_progress: Optional[tuple] = None
 
     def compose(self) -> ComposeResult:
         for layer in _LAYER_ORDER:
@@ -204,10 +300,24 @@ class LayersPanel(Vertical):
                 yield Label("", classes="layer-count", id=f"count-{layer}")
                 yield Label("", classes="layer-size", id=f"size-{layer}")
 
+    # Pill marquee tick. Same cadence as the project-list ticker so
+    # the two animations feel like one system. Cheap: each tick
+    # iterates the panel's <= 25 Pill widgets and most early-return
+    # because their text fits the budget or they're inactive.
+    _PILL_MARQUEE_TICK_SECONDS = 0.15
+
     def on_mount(self) -> None:
         self.border_title = "Layers"
         self.refresh_state()
         self.set_interval(_POLL_SECONDS, self._maybe_poll)
+        self.set_interval(
+            self._PILL_MARQUEE_TICK_SECONDS, self._tick_pill_marquees
+        )
+
+    def _tick_pill_marquees(self) -> None:
+        """Advance every active long-text pill by one cell."""
+        for pill in self.query(Pill):
+            pill.tick()
 
     def refresh_state(self) -> None:
         """Re-render rows from manifest + cached remote status. Cheap; no I/O."""
@@ -233,7 +343,14 @@ class LayersPanel(Vertical):
         )
 
     def _layer_count(self, layer: str, manifest: dict) -> str:
-        """Count cell text. Homologs shows hit count + '(aligned)' tag."""
+        """Count cell text.
+
+        Homologs uses a ratio when aligned (`17,234/18,834 aln`) so
+        the count + alignment state collapse into a single phrase.
+        Earlier versions had a separate green-parenthesized
+        `(aligned)` tag that visually mimicked the clickable pills
+        even though it wasn't interactive — confusing affordance.
+        """
         data = manifest.get(layer) or {}
         if layer == "homologs":
             active = self._project.active_set() or {}
@@ -242,19 +359,48 @@ class LayersPanel(Vertical):
                 return ""
             sets = data.get("sets") or []
             n_sets = len(sets)
-            label = f"[dim]{n:,} seqs[/dim]"
-            if active.get("n_aligned"):
-                label += "  [green](aligned)[/green]"
+            n_aln = active.get("n_aligned") or 0
+            if n_aln:
+                # Aligned ratio reads naturally and matches the
+                # project-list marquee phrasing.
+                label = f"[dim]{n_aln:,}/{n:,} aln[/dim]"
             elif (active.get("remote") or {}).get("align_job_id"):
-                label += "  [yellow](aligning)[/yellow]"
+                label = f"[dim]{n:,} hits · [/dim][yellow]aligning…[/yellow]"
+            else:
+                label = f"[dim]{n:,} hits[/dim]"
             if n_sets > 1:
                 label += f"  [dim]· {n_sets} sets[/dim]"
             return label
         if layer == "embeddings":
-            n = data.get("n_embeddings")
-            if not n:
+            # Show every model embedded for the *active* homolog set,
+            # plus a count of how many additional sets have embeddings.
+            # Per-set / per-model totals live in the layer-detail modal
+            # so this row stays compact.
+            active_set = self._project.active_set_name()
+            active_models = self._project.embeddings_models_for_set(active_set)
+            active_models = [
+                e for e in active_models if e.get("n_embeddings")
+            ]
+            if not active_models:
                 return ""
-            return f"[dim]{n:,} vecs[/dim]"
+            # Most-recently-updated first (per `embeddings_models_for_set`),
+            # so the user sees the freshest model first when models pile up.
+            label_parts = []
+            for entry in active_models[:2]:
+                m = entry.get("model") or "?"
+                short = m.split("/")[-1]  # strip HF org prefix if any
+                label_parts.append(f"{entry['n_embeddings']:,} {short}")
+            label = "[dim]" + "  ·  ".join(label_parts) + "[/dim]"
+            if len(active_models) > 2:
+                label += f"  [dim]+{len(active_models) - 2}[/dim]"
+            n_other = sum(
+                1 for s in self._project.embeddings_sets()
+                if s.get("n_embeddings")
+                and s.get("source_homologs_set") != active_set
+            )
+            if n_other:
+                label += f"  [dim]· +{n_other} other set{'s' if n_other > 1 else ''}[/dim]"
+            return label
         if layer == "structures":
             d = self._project.path / "structures"
             if d.exists():
@@ -277,7 +423,10 @@ class LayersPanel(Vertical):
             active = self._project.active_set() or {}
             return bool(active.get("n_homologs")) and bool(active.get("n_aligned"))
         if layer == "embeddings":
-            return bool(data.get("n_embeddings"))
+            # ✓ icon when the *active* homolog set has embeddings —
+            # other sets' embeddings don't count for the row state.
+            active_emb = self._project.active_embeddings_set() or {}
+            return bool(active_emb.get("n_embeddings"))
         if layer == "domains":
             return bool(data.get("n_hits") or data.get("hits"))
         if layer == "structures":
@@ -311,38 +460,42 @@ class LayersPanel(Vertical):
             return
         self._poll_remote_status()
 
-    def _pending_jobs(self) -> Dict[str, str]:
-        """{kind: job_id} for tagged-but-unfulfilled remote jobs.
+    def _pending_jobs(self) -> Dict[str, List[str]]:
+        """{kind: [job_id, ...]} for tagged-but-unfulfilled remote jobs.
 
-        Reads the *active* homolog set; sub-jobs (align, tax) for
-        non-active sets aren't polled until the user switches.
+        Reads the *active* homolog set for search/align/tax — sub-jobs
+        for non-active sets aren't polled until the user switches.
+        Embedding jobs are polled across *every* set, so a job
+        submitted for set A continues to be tracked while the user is
+        on set B; otherwise the pull would never run for the inactive
+        set and the job would silently sit on the remote forever.
         """
         manifest = self._project.manifest()
-        pending: Dict[str, str] = {}
+        pending: Dict[str, List[str]] = {}
         active = self._project.active_set() or {}
         h_remote = active.get("remote") or {}
         if not active.get("n_homologs"):
             jid = h_remote.get("search_job_id")
             if jid:
-                pending["search"] = jid
+                pending.setdefault("search", []).append(jid)
         else:
             if not active.get("n_aligned"):
                 jid = h_remote.get("align_job_id")
                 if jid:
-                    pending["align"] = jid
+                    pending.setdefault("align", []).append(jid)
             tax = manifest.get("taxonomy") or {}
             t_remote = tax.get("remote") or {}
             if not tax.get("n_assigned"):
                 jid = t_remote.get("job_id")
                 if jid:
-                    pending["tax"] = jid
+                    pending.setdefault("tax", []).append(jid)
 
-        embeddings = manifest.get("embeddings") or {}
-        e_remote = embeddings.get("remote") or {}
-        if not embeddings.get("n_embeddings"):
-            jid = e_remote.get("job_id")
+        for s in self._project.embeddings_sets():
+            if s.get("n_embeddings"):
+                continue
+            jid = (s.get("remote") or {}).get("job_id")
             if jid:
-                pending["embed"] = jid
+                pending.setdefault("embed", []).append(jid)
         return pending
 
     def _refresh_homologs_action(self, manifest: dict) -> None:
@@ -410,8 +563,23 @@ class LayersPanel(Vertical):
             tax_pill.hide_pill()
             return
 
-        # No remote job in flight — offer the next available actions.
-        status_pill.hide_pill()
+        # No remote job in flight — but the local UniProt-REST taxonomy
+        # build may still be churning through batches. Show its progress
+        # in the status pill while it runs; the regular action pills
+        # take over once it finishes.
+        if self._tax_progress is not None:
+            done, total = self._tax_progress
+            if total > 0:
+                pct = int(min(100, max(0, done / total * 100)))
+                status_pill.show(
+                    f"tax · {done:,}/{total:,} · {pct}%",
+                    color="cyan",
+                    value="",
+                )
+            else:
+                status_pill.show("tax · starting…", color="cyan", value="")
+        else:
+            status_pill.hide_pill()
         if not n_aligned:
             align_pill.show("Align", color=_BEAK_BLUE, value="align")
         else:
@@ -450,33 +618,22 @@ class LayersPanel(Vertical):
         embed_pill = self.query_one("#embed-pill", Pill)
         status_pill = self.query_one("#embeddings-status-pill", Pill)
 
-        embeddings = manifest.get("embeddings") or {}
-        remote = embeddings.get("remote") or {}
-        n_embed = embeddings.get("n_embeddings", 0)
-        homologs = manifest.get("homologs") or {}
-        n_homologs = (
-            self._project.active_set() or {}
-        ).get("n_homologs", 0) or homologs.get("n_homologs", 0)
+        # Embeddings are now per-homolog-set: the row reflects whichever
+        # set is currently active. Switching active sets shows that
+        # set's embeddings if they exist, or the Embed action if they
+        # don't — even when other sets already have embeddings.
+        active_emb = self._project.active_embeddings_set() or {}
+        remote = active_emb.get("remote") or {}
+        n_embed = active_emb.get("n_embeddings", 0)
+        n_homologs = (self._project.active_set() or {}).get("n_homologs", 0)
 
-        # Stage A: embeddings ready. If they were computed against a
-        # different homolog set than the one currently active, surface
-        # a "stale" pill so the user can rebuild instead of silently
-        # mixing data.
+        # Stage A: this set's embeddings are ready.
         if n_embed:
             embed_pill.hide_pill()
-            source = embeddings.get("source_homologs_set")
-            active = self._project.active_set_name()
-            if source and source != active:
-                status_pill.show(
-                    f"stale · from set {source}",
-                    color="yellow",
-                    value="embed-stale",
-                )
-            else:
-                status_pill.hide_pill()
+            status_pill.hide_pill()
             return
 
-        # Stage B: embedding job in flight.
+        # Stage B: embedding job in flight for this set.
         job_id = remote.get("job_id")
         if job_id:
             embed_pill.hide_pill()
@@ -487,7 +644,7 @@ class LayersPanel(Vertical):
             )
             return
 
-        # Stage C: hits exist, embeddings not started → offer Embed.
+        # Stage C: hits exist for this set, embeddings not started → offer Embed.
         if n_homologs:
             embed_pill.show("Embed", color=_BEAK_BLUE, value="embed")
             status_pill.hide_pill()
@@ -539,7 +696,7 @@ class LayersPanel(Vertical):
             "tax": MMseqsTaxonomy,
         }
         try:
-            for kind, job_id in pending.items():
+            for kind, job_ids in pending.items():
                 factory = mgr_factories.get(kind)
                 if factory and kind not in managers:
                     try:
@@ -548,25 +705,26 @@ class LayersPanel(Vertical):
                         self._mgr_unavailable = True
                         return
 
-            for kind, job_id in pending.items():
+            for kind, job_ids in pending.items():
                 mgr = managers.get(kind)
                 if mgr is None:
                     continue
-                try:
-                    info = mgr.status(job_id)
-                    status = info.get("status", "UNKNOWN")
-                    self._remote_statuses[job_id] = status
-                    if status == "COMPLETED":
-                        if kind == "search":
-                            self._pull_homologs_now(mgr, job_id)
-                        elif kind == "align":
-                            self._pull_alignment_now(mgr, job_id)
-                        elif kind == "embed":
-                            self._pull_embeddings_now(mgr, job_id)
-                        elif kind == "tax":
-                            self._pull_taxonomy_now(mgr, job_id)
-                except Exception:
-                    self._remote_statuses[job_id] = "UNKNOWN"
+                for job_id in job_ids:
+                    try:
+                        info = mgr.status(job_id)
+                        status = info.get("status", "UNKNOWN")
+                        self._remote_statuses[job_id] = status
+                        if status == "COMPLETED":
+                            if kind == "search":
+                                self._pull_homologs_now(mgr, job_id)
+                            elif kind == "align":
+                                self._pull_alignment_now(mgr, job_id)
+                            elif kind == "embed":
+                                self._pull_embeddings_now(mgr, job_id)
+                            elif kind == "tax":
+                                self._pull_taxonomy_now(mgr, job_id)
+                    except Exception:
+                        self._remote_statuses[job_id] = "UNKNOWN"
         finally:
             # Close every SSH connection we opened above. Without this
             # each 15s poll leaks a Paramiko Transport socket and macOS
@@ -581,11 +739,23 @@ class LayersPanel(Vertical):
     @work(thread=True, exclusive=True, group="taxonomy-build")
     def _build_taxonomy(self) -> None:
         """Auto-build the taxonomy table after homologs land. Cheap once
-        cached; the parquet is reused on subsequent project opens."""
+        cached; the parquet is reused on subsequent project opens. For
+        large hit sets this can take minutes — we publish per-batch
+        progress to `_tax_progress` so the homologs row's status pill
+        renders a live counter while we wait."""
+        def _on_progress(done: int, total: int) -> None:
+            self._tax_progress = (done, total)
+            try:
+                self.app.call_from_thread(self.refresh_state)
+            except Exception:
+                pass
+
         try:
             from ..taxonomy import build_taxonomy_table
-            df = build_taxonomy_table(self._project)
+            df = build_taxonomy_table(self._project, progress_cb=_on_progress)
             if df is None or df.empty:
+                self._tax_progress = None
+                self.app.call_from_thread(self.refresh_state)
                 return
             n = len(df)
             n_resolved = int(df["organism"].notna().sum()) if "organism" in df else 0
@@ -599,6 +769,12 @@ class LayersPanel(Vertical):
                 self.notify, f"Taxonomy build failed: {e}",
                 severity="warning", timeout=6,
             )
+        finally:
+            self._tax_progress = None
+            try:
+                self.app.call_from_thread(self.refresh_state)
+            except Exception:
+                pass
 
     @work(thread=True, exclusive=True, group="traits-build")
     def _build_traits(self) -> None:
@@ -655,6 +831,8 @@ class LayersPanel(Vertical):
             self.app.call_from_thread(
                 self.notify, f"Homologs ready · {n} sequences", timeout=8
             )
+            # Local artifact landed → wipe the remote scratch dir.
+            _scratch_cleanup(mgr, job_id)
             # Kick off the taxonomy fetch in parallel — it's UniProt
             # REST only, no SSH, takes seconds for hundreds of hits.
             self._build_taxonomy()
@@ -704,6 +882,7 @@ class LayersPanel(Vertical):
             self.app.call_from_thread(
                 self.notify, f"Alignment ready · {n} sequences", timeout=8
             )
+            _scratch_cleanup(mgr, job_id)
         except Exception as e:  # noqa: BLE001
             self.app.call_from_thread(
                 self.notify,
@@ -715,9 +894,10 @@ class LayersPanel(Vertical):
             self._pulling_kinds.discard("alignment")
 
     @work(thread=True, exclusive=True, group="align-submit")
-    def _submit_alignment(self) -> None:
-        """Submit a Clustal Omega alignment of the active set's hits."""
-        hits_fasta = self._project.active_homologs_dir() / "sequences.fasta"
+    def _submit_alignment(self, set_name: Optional[str] = None) -> None:
+        """Submit a Clustal Omega alignment for the named (or active) set."""
+        target_set = set_name or self._project.active_set_name()
+        hits_fasta = self._project.homologs_set_dir(target_set) / "sequences.fasta"
         if not hits_fasta.exists():
             self._submitting_align = False
             return
@@ -725,18 +905,29 @@ class LayersPanel(Vertical):
         try:
             from ...remote.align import ClustalAlign
             mgr = ClustalAlign()
-            job_name = f"{self._project.name}_{self._project.active_set_name()}_align"
+            job_name = f"{self._project.name}_{target_set}_align"
             job_id = mgr.submit(str(hits_fasta), job_name=job_name)
 
-            # Stamp the active set's remote dict with the new job id.
-            active = self._project.active_set() or {}
-            remote = dict(active.get("remote") or {})
-            remote["align_job_id"] = job_id
-            self._project.update_active_set(remote=remote)
+            # Stamp the named set's remote dict with the new job id —
+            # not just the active one, so re-aligning a non-active set
+            # from the modal records the job against the right entry.
+            with self._project.mutate() as m:
+                homologs = m.setdefault("homologs", {})
+                for s in homologs.get("sets") or []:
+                    if s.get("name") == target_set:
+                        remote = dict(s.get("remote") or {})
+                        remote["align_job_id"] = job_id
+                        s["remote"] = remote
+                        # Stale align artefact bookkeeping — re-align
+                        # invalidates whatever counted as "aligned" before.
+                        s.pop("n_aligned", None)
+                        break
 
             self.app.call_from_thread(self.refresh_state)
             self.app.call_from_thread(
-                self.notify, f"Alignment submitted · {job_id}", timeout=6
+                self.notify,
+                f"Alignment submitted for '{target_set}' · {job_id}",
+                timeout=6,
             )
         except Exception as e:  # noqa: BLE001
             self.app.call_from_thread(
@@ -756,8 +947,9 @@ class LayersPanel(Vertical):
             except Exception:
                 pass
 
-    def submit_alignment(self) -> None:
-        """Public entry point — kicks off the submit worker.
+    def submit_alignment(self, set_name: Optional[str] = None) -> None:
+        """Public entry point — kicks off the submit worker for `set_name`
+        (defaults to the active set).
 
         Re-entrancy is gated synchronously: the flag flips on the UI
         thread before the worker spawns, so a double-click can't sneak
@@ -775,25 +967,39 @@ class LayersPanel(Vertical):
         except Exception:
             pass
 
-        self._submit_alignment()
+        self._submit_alignment(set_name)
 
     def _pull_embeddings_now(self, mgr, job_id: str) -> None:
-        """Download embeddings tarball, extract into project's embeddings/."""
-        if "embeddings" in self._pulling_kinds:
+        """Download embeddings tarball, extract into the per-set dir.
+
+        We resolve the destination from the embeddings entry that owns
+        this job_id rather than from `active_embeddings_dir()` — by the
+        time the poll fires the job, the user may have switched active
+        sets, but the tarball still belongs to the set it was submitted
+        for. Same job-keyed lookup is used to update the manifest so
+        we never write counts into the wrong entry.
+        """
+        # `_pulling_kinds` is a coarse global lock; key by job so two
+        # different sets' pulls can run sequentially without one
+        # blocking the other forever.
+        key = f"embeddings:{job_id}"
+        if key in self._pulling_kinds:
             return
-        self._pulling_kinds.add("embeddings")
+        self._pulling_kinds.add(key)
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling embeddings · {job_id}…"
             )
-            embeddings_dir = self._project.path / "embeddings"
+            embeddings_dir = self._project.embeddings_dir_for_job(job_id)
+            if embeddings_dir is None:
+                # Manifest no longer claims this job — e.g., the user
+                # cleared it from another window. Skip silently rather
+                # than rebuilding orphaned state.
+                return
             embeddings_dir.mkdir(parents=True, exist_ok=True)
             extracted = mgr.download(job_id, local_dir=str(embeddings_dir))
-            # Count vector files in the extracted dir.
             n = sum(1 for _ in Path(extracted).rglob("*") if _.is_file())
 
-            # Pull the model name from jobs.json since download() doesn't
-            # bring it back directly.
             try:
                 with open(_JOBS_DB) as f:
                     jdb = json.load(f)
@@ -802,31 +1008,33 @@ class LayersPanel(Vertical):
                 model = ""
 
             from datetime import datetime
-            with self._project.mutate() as manifest:
-                emb = manifest.setdefault("embeddings", {})
-                emb["n_embeddings"] = n
-                emb["model"] = model
-                emb["last_updated"] = datetime.now()
-                # Stamp the source set on completion too — covers jobs that
-                # were submitted before this tag was introduced.
-                emb.setdefault(
-                    "source_homologs_set", self._project.active_set_name()
-                )
+            self._project.update_embeddings_set_by_job(
+                job_id,
+                n_embeddings=n,
+                model=model,
+                last_updated=datetime.now(),
+            )
 
             self.app.call_from_thread(
                 self.notify, f"Embeddings ready · {n} files", timeout=8
             )
+            _scratch_cleanup(mgr, job_id)
         except Exception as e:  # noqa: BLE001
             self.app.call_from_thread(
                 self.notify, f"Embeddings pull failed: {e}",
                 severity="error", timeout=10,
             )
         finally:
-            self._pulling_kinds.discard("embeddings")
+            self._pulling_kinds.discard(key)
 
     @work(thread=True, exclusive=True, group="embed-submit")
     def _submit_embeddings(self) -> None:
-        """Submit ESM2 embedding job over the active set's hits.fasta."""
+        """Submit ESM2 embedding job over the active set's hits.fasta.
+
+        This is the quick-action path (no modal); it always uses the
+        ESMEmbeddings default model. For multi-model selection, the
+        `SubmitEmbedModal` is the discoverable affordance.
+        """
         hits_fasta = self._project.active_homologs_dir() / "sequences.fasta"
         if not hits_fasta.exists():
             self._submitting_embed = False
@@ -834,18 +1042,24 @@ class LayersPanel(Vertical):
         mgr = None
         try:
             from ...remote.embeddings import ESMEmbeddings
+            # Read the default off the manager class so this stays in
+            # sync if the default ever changes.
+            import inspect
+            default_model = (
+                inspect.signature(ESMEmbeddings.submit)
+                .parameters["model"].default
+            )
             mgr = ESMEmbeddings()
             job_name = f"{self._project.name}_embed"
             job_id = mgr.submit(str(hits_fasta), job_name=job_name)
 
-            with self._project.mutate() as manifest:
-                emb = manifest.setdefault("embeddings", {})
-                # Tag embeddings with the homolog set they were computed
-                # against so we can warn when the user switches active sets
-                # without rebuilding.
-                emb["source_homologs_set"] = self._project.active_set_name()
-                remote = emb.setdefault("remote", {})
-                remote["job_id"] = job_id
+            # Stamp the (active set, default model) entry with this
+            # job. Creates a fresh entry if no embedding for this
+            # (set, model) pair existed yet.
+            self._project.update_active_embeddings_set(
+                model=default_model,
+                remote={"job_id": job_id},
+            )
 
             self.app.call_from_thread(self.refresh_state)
             self.app.call_from_thread(
@@ -889,6 +1103,7 @@ class LayersPanel(Vertical):
             self.app.call_from_thread(
                 self.notify, f"Taxonomy ready · {len(df)} assignments", timeout=8
             )
+            _scratch_cleanup(mgr, job_id)
             # MMseqs LCA may surface organisms the UniProt path missed —
             # rebuild traits to pick them up. Force=True via a stale cache:
             # _pull_taxonomy_now writes taxonomy_mmseqs.parquet, not the
