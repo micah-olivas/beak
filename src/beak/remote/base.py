@@ -2,14 +2,25 @@
 
 import re
 import json
+import os
+import threading
 import time
 import shutil
 import pandas as pd
 from pathlib import Path
 
+from contextlib import contextmanager
 from fabric import Connection
 from datetime import datetime
 from typing import Dict, Optional
+
+
+# Per-process lock guarding `~/.beak/jobs.json`. Multiple worker threads
+# (status polls, submits, pulls) all read-modify-write this file; without
+# serialization two writers could clobber each other's updates. Module-
+# level + RLock so an outer mutate-style helper can call the same db
+# inside the same thread without deadlocking.
+_JOB_DB_LOCK = threading.RLock()
 
 
 class RemoteJobManager:
@@ -263,14 +274,56 @@ class RemoteJobManager:
     # ── Job database ────────────────────────────────────────────────
 
     def _load_job_db(self) -> Dict:
-        """Load local job database"""
-        with open(self.local_job_db, 'r') as f:
-            return json.load(f)
+        """Load local job database, tolerating a partially-written file.
+
+        A SIGKILL or disk-full mid-`_save_job_db` could leave the file
+        truncated; `json.JSONDecodeError` is treated as "no jobs yet"
+        rather than crashing the whole TUI. Holds the lock so a
+        concurrent writer can't move the file out from under us.
+        """
+        with _JOB_DB_LOCK:
+            try:
+                with open(self.local_job_db, 'r') as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, FileNotFoundError):
+                return {}
 
     def _save_job_db(self, db: Dict):
-        """Save local job database"""
-        with open(self.local_job_db, 'w') as f:
-            json.dump(db, f, indent=2)
+        """Save local job database via temp + atomic rename.
+
+        Without this, two workers writing the file simultaneously could
+        interleave their writes (last-writer-wins, lost updates), and a
+        crash mid-write would corrupt jobs.json. The lock + tmp+replace
+        pattern eliminates both classes of bug — readers always see a
+        complete file, writers never lose updates.
+        """
+        with _JOB_DB_LOCK:
+            tmp = self.local_job_db.with_suffix(self.local_job_db.suffix + '.tmp')
+            with open(tmp, 'w') as f:
+                json.dump(db, f, indent=2)
+                # fsync the data to disk before the rename so a power
+                # loss can't leave a renamed-but-zero-byte file.
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, self.local_job_db)
+
+    @contextmanager
+    def _mutate_job_db(self):
+        """Atomic read-modify-write of the job database.
+
+            with self._mutate_job_db() as db:
+                db[job_id]['status'] = 'COMPLETED'
+
+        Holds `_JOB_DB_LOCK` for the whole block so no other writer can
+        race a stale read with a fresh write.
+        """
+        with _JOB_DB_LOCK:
+            db = self._load_job_db()
+            yield db
+            self._save_job_db(db)
 
     def _write_temp_script(self, content: str) -> str:
         """Write script to temporary file and return path"""
@@ -428,34 +481,51 @@ class RemoteJobManager:
                       status_lines: list) -> str:
         """Classify a job based on remote state.
 
-        Handles the ambiguous "no status.txt yet" case: within a short grace
-        window right after submission it's a genuine SUBMITTED (script
-        staging); past that, if the PID is dead too, the submission script
-        died before writing any status and we surface it as FAILED rather
-        than leave it stuck as SUBMITTED forever.
+        Order matters here. The submit script appends to status.txt
+        (`echo X >> status.txt`), so a finished job's file looks like
+        `Job started: ... \n RUNNING \n COMPLETED`. We have to check
+        terminal markers (COMPLETED / FAILED / CANCELLED) first, since
+        the literal string `RUNNING` is *always* present once the
+        script started.
+
+        The other subtle case: a job whose script was kill -9'd, OOM'd,
+        or interrupted by a server reboot leaves status.txt at
+        `... RUNNING` forever — no terminal marker ever gets written.
+        Combined with a dead PID, that's a crashed job, not a live one.
+        We surface it as FAILED past the launch grace window so the UI
+        offers a Clear path instead of pretending it's still in flight.
         """
+        # Terminal states win unambiguously.
         if 'COMPLETED' in status_lines:
             return 'COMPLETED'
         if 'FAILED' in status_lines:
             return 'FAILED'
-        if 'RUNNING' in status_lines or is_running:
+        if 'CANCELLED' in status_lines:
+            return 'CANCELLED'
+
+        # Live PID → genuinely running, regardless of what status.txt says.
+        if is_running:
             return 'RUNNING'
 
-        if status_lines and status_lines[0] == 'NO_STATUS':
-            submitted_at_str = job_info.get('submitted_at')
-            if submitted_at_str:
-                try:
-                    submitted_at = datetime.fromisoformat(submitted_at_str)
-                    age = (datetime.now() - submitted_at).total_seconds()
-                    if age > self._LAUNCH_GRACE_SECONDS:
-                        # PID dead + no status file + past grace window ⇒
-                        # the launch script itself crashed.
-                        return 'FAILED'
-                except ValueError:
-                    pass
-            return 'SUBMITTED'
-
-        return 'UNKNOWN'
+        # PID dead, no terminal marker. Two sub-cases handled together:
+        # (a) status.txt has RUNNING but no terminal marker → script
+        #     crashed mid-run.
+        # (b) status.txt is missing entirely → submit script died
+        #     before it could write anything.
+        # In both cases, past the launch grace window we surface FAILED
+        # so the user can clear the lingering job. Within the grace
+        # window we keep it as SUBMITTED — the script may still be
+        # spinning up.
+        submitted_at_str = job_info.get('submitted_at')
+        if submitted_at_str:
+            try:
+                submitted_at = datetime.fromisoformat(submitted_at_str)
+                age = (datetime.now() - submitted_at).total_seconds()
+                if age > self._LAUNCH_GRACE_SECONDS:
+                    return 'FAILED'
+            except ValueError:
+                pass
+        return 'SUBMITTED'
 
     def status(self, job_id: str, verbose: bool = False) -> Dict:
         """
@@ -494,10 +564,14 @@ class RemoteJobManager:
         submitted_at = datetime.fromisoformat(job_info['submitted_at'])
         runtime = str(datetime.now() - submitted_at).split('.')[0]
 
-        # Update local DB
-        job_info['status'] = status
-        job_info['last_checked'] = datetime.now().isoformat()
-        self._save_job_db(job_db)
+        # Update local DB. Lock held only over the in-memory mutation
+        # — not over the SSH round-trip above — so concurrent polls
+        # don't serialize on each other's network latency.
+        with self._mutate_job_db() as db:
+            entry = db.get(job_id)
+            if entry is not None:
+                entry['status'] = status
+                entry['last_checked'] = datetime.now().isoformat()
 
         return {
             'job_id': job_id,
@@ -584,10 +658,13 @@ class RemoteJobManager:
             )
             last_log_line = self._pick_informative_log_line(log_tail.stdout)
 
-        # Update local DB
-        job_info['status'] = status
-        job_info['last_checked'] = datetime.now().isoformat()
-        self._save_job_db(job_db)
+        # Update local DB. Same locking discipline as `status()` —
+        # lock only the in-memory mutation, not the SSH calls above.
+        with self._mutate_job_db() as db:
+            entry = db.get(job_id)
+            if entry is not None:
+                entry['status'] = status
+                entry['last_checked'] = datetime.now().isoformat()
 
         return {
             'job_id': job_id,
@@ -741,9 +818,10 @@ class RemoteJobManager:
             if set(stripped) <= {'=', '-', ' '}:
                 continue
             return stripped
-        # Everything was a parameter echo — fall back to the latest line
-        # so the user still sees something rather than a blank slot.
-        return candidates[-1].strip()
+        # Everything was a parameter echo — return None and let the
+        # modal render `(idle)` rather than a stale parameter dump that
+        # makes a long-finished job look like it's still echoing config.
+        return None
 
     def print_detailed_status(self, job_id: str, watch: bool = False, animation_frame: int = 0):
         """Print formatted status with optional live updates
@@ -931,28 +1009,81 @@ class RemoteJobManager:
         # Reflect the cancellation locally so the layers panel and
         # `beak jobs` don't continue showing RUNNING until the next poll
         # re-derives status from the remote.
-        job_db[job_id]['status'] = 'CANCELLED'
-        job_db[job_id]['last_checked'] = datetime.now().isoformat()
-        self._save_job_db(job_db)
+        with self._mutate_job_db() as db:
+            entry = db.get(job_id)
+            if entry is not None:
+                entry['status'] = 'CANCELLED'
+                entry['last_checked'] = datetime.now().isoformat()
 
         print(f"✓ Job {job_id} cancelled")
 
     def cleanup(self, job_id: str, keep_results: bool = False):
-        """Clean up remote job files"""
+        """Clean up remote job files.
+
+        Safety invariants — destroying the wrong directory on a
+        workstation is unrecoverable, so the strict checks below run
+        client-side AND the rm itself is gated server-side:
+
+        1. The recorded `remote_path` must equal exactly
+           `f"{self.remote_job_dir}/{job_id}"`. beak's submit codepaths
+           always produce that form; any deviation means the manifest
+           is wrong or has been edited, and we refuse rather than nuke.
+        2. The path is `shlex.quote`d and the rm uses `--` so a
+           tampered path with spaces, leading dashes, or shell
+           metacharacters can't reroute the command.
+        3. Server-side we require `[ -d "$p" ]` (directory exists) AND
+           `[ ! -L "$p" ]` (not a symlink). The symlink check stops
+           `rm -rf` from following a manual symlink to anywhere else
+           on the host.
+
+        These are belt-and-braces — the `remote_path == scratch_root /
+        job_id` invariant alone should be sufficient on its own, but
+        the cost of the extra guards is one shell test per cleanup.
+        """
+        import shlex
+
         job_db = self._load_job_db()
 
         if job_id not in job_db:
             raise ValueError(f"Job {job_id} not found")
 
-        remote_path = job_db[job_id]['remote_path']
+        remote_path = (job_db[job_id] or {}).get('remote_path') or ''
+        if not remote_path:
+            raise ValueError(
+                f"Job {job_id} has no remote_path recorded — refusing "
+                f"to cleanup."
+            )
+
+        # Strict-equality check against the expected scratch path so a
+        # corrupt or hand-edited manifest can't redirect the rm.
+        expected = f"{self.remote_job_dir.rstrip('/')}/{job_id}"
+        if remote_path.rstrip('/') != expected:
+            raise ValueError(
+                f"Refusing to cleanup {remote_path!r}: does not match "
+                f"the expected scratch path {expected!r}. (If this is "
+                f"intentional, run the rm by hand on the remote.)"
+            )
+
+        quoted = shlex.quote(remote_path)
 
         if keep_results:
-            self.conn.run(f'rm -rf {remote_path}/tmp', hide=True, warn=True)
+            # Targeted cleanup of just the per-job `tmp/` subdir.
+            self.conn.run(
+                'set -e; '
+                f'p={quoted}/tmp; '
+                'if [ -d "$p" ] && [ ! -L "$p" ]; then rm -rf -- "$p"; fi',
+                hide=True, warn=True,
+            )
             print(f"✓ Cleaned up temp files for job {job_id}")
         else:
-            self.conn.run(f'rm -rf {remote_path}', hide=True, warn=True)
-            del job_db[job_id]
-            self._save_job_db(job_db)
+            self.conn.run(
+                'set -e; '
+                f'p={quoted}; '
+                'if [ -d "$p" ] && [ ! -L "$p" ]; then rm -rf -- "$p"; fi',
+                hide=True, warn=True,
+            )
+            with self._mutate_job_db() as db:
+                db.pop(job_id, None)
             print(f"✓ Cleaned up job {job_id}")
 
     def get_log(self, job_id: str, lines: int = 50):

@@ -257,21 +257,20 @@ rm -rf {remote_job_path}/tmp
 
         self.conn.run(f'echo {pid} > {remote_job_path}/pid.txt', hide=True)
 
-        job_db = self._load_job_db()
-        job_db[job_id] = {
-            'job_type': 'search',
-            'name': job_name,
-            'database': database,
-            'database_path': db_path,
-            'input_file': str(query_file),
-            'remote_path': remote_job_path,
-            'submitted_at': datetime.now().isoformat(),
-            'status': 'SUBMITTED',
-            'pid': pid,
-            'preset': preset,
-            'parameters': final_params
-        }
-        self._save_job_db(job_db)
+        with self._mutate_job_db() as db:
+            db[job_id] = {
+                'job_type': 'search',
+                'name': job_name,
+                'database': database,
+                'database_path': db_path,
+                'input_file': str(query_file),
+                'remote_path': remote_job_path,
+                'submitted_at': datetime.now().isoformat(),
+                'status': 'SUBMITTED',
+                'pid': pid,
+                'preset': preset,
+                'parameters': final_params,
+            }
 
         print(f"✓ Submitted {job_name} → {database} ({job_id})")
 

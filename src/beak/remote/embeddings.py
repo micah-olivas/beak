@@ -13,13 +13,25 @@ class ESMEmbeddings(RemoteJobManager):
     JOB_TYPE = 'embeddings'
     LOG_FILE = 'esm.log'
 
+    # Structured fields used by `estimate_peak_vram_gb` to model
+    # activation memory. `flash_attn` is what flips the formula from
+    # O(L²) (original PyTorch attention) to O(L) (FlashAttention) —
+    # fair-esm in the embedding container does *not* enable
+    # FlashAttention for ESM-2 [1]; the `esm` package's ESM-C path
+    # does. This drives most of the practical OOM differences at
+    # long sequences.
+    #
+    # [1] Çelik & Xie 2025 — "the original implementation cannot
+    #     handle proteins longer than 3,000 amino acids for billion
+    #     parameter models" without FlashAttention.
     AVAILABLE_MODELS = {
-        # ESM2 family (loaded via fair-esm inside the container).
         'esm2_t6_8M_UR50D': {
             'name': 'ESM2-8M',
             'family': 'esm2',
             'params': '8M',
             'vram_gb': 0.1,
+            'n_layers': 6, 'hidden_dim': 320, 'n_heads': 20,
+            'flash_attn': False,
             'description': 'ESM2, 6 layers, 320 dim',
         },
         'esm2_t12_35M_UR50D': {
@@ -27,6 +39,8 @@ class ESMEmbeddings(RemoteJobManager):
             'family': 'esm2',
             'params': '35M',
             'vram_gb': 0.2,
+            'n_layers': 12, 'hidden_dim': 480, 'n_heads': 20,
+            'flash_attn': False,
             'description': 'ESM2, 12 layers, 480 dim',
         },
         'esm2_t30_150M_UR50D': {
@@ -34,6 +48,8 @@ class ESMEmbeddings(RemoteJobManager):
             'family': 'esm2',
             'params': '150M',
             'vram_gb': 0.6,
+            'n_layers': 30, 'hidden_dim': 640, 'n_heads': 20,
+            'flash_attn': False,
             'description': 'ESM2, 30 layers, 640 dim',
         },
         'esm2_t33_650M_UR50D': {
@@ -41,27 +57,143 @@ class ESMEmbeddings(RemoteJobManager):
             'family': 'esm2',
             'params': '650M',
             'vram_gb': 2.5,
+            'n_layers': 33, 'hidden_dim': 1280, 'n_heads': 20,
+            'flash_attn': False,
             'description': 'ESM2, 33 layers, 1280 dim',
         },
 
-        # ESM-C family (EvolutionaryScale, loaded via transformers +
-        # trust_remote_code inside the container to sidestep the `esm`
-        # package name collision with fair-esm).
+        # ESM-C family (EvolutionaryScale). Default `esm` Python
+        # package uses FlashAttention, so memory scales linearly
+        # with L instead of quadratically.
         'esmc_300m': {
             'name': 'ESM-C-300M',
             'family': 'esmc',
             'params': '300M',
             'vram_gb': 1.5,
-            'description': 'ESM-C (2024-12), 960 dim',
+            'n_layers': 30, 'hidden_dim': 960, 'n_heads': 15,
+            'flash_attn': True,
+            'description': 'ESM-C (2024-12), 30 layers, 960 dim',
         },
         'esmc_600m': {
             'name': 'ESM-C-600M',
             'family': 'esmc',
             'params': '600M',
             'vram_gb': 2.5,
-            'description': 'ESM-C (2024-12), 1152 dim',
+            'n_layers': 36, 'hidden_dim': 1152, 'n_heads': 18,
+            'flash_attn': True,
+            'description': 'ESM-C (2024-12), 36 layers, 1152 dim',
         },
     }
+
+    @classmethod
+    def estimate_peak_vram_gb(
+        cls, model_id: str, max_len: int,
+        flash_attn_available: bool = True,
+    ) -> float:
+        """Rough peak VRAM (GB) for embedding one sequence of length `max_len`.
+
+        FlashAttention support is hardware-gated: it needs at least
+        Turing (SM 7.5+) and FA-2 needs Ampere (SM 8.0+). Pre-Ampere
+        cards (Pascal: 1080 Ti, P100; Volta: V100 in some configs)
+        fall back to PyTorch's `math` attention even when the model
+        code requests SDPA — so ESM-C's "linear in L" benefit
+        evaporates on those GPUs. Pass `flash_attn_available=False`
+        to model that case.
+
+        Two regimes:
+
+        - **No FlashAttention** (Pascal hardware OR ESM-2's fair-esm
+          path) — activations are dominated by the attention score
+          matrix at every layer:
+          `~ n_layers × n_heads × L² × 2 bytes` (bf16). The 1.5×
+          fudge folds in q/k/v projections, MLP, and layer norms
+          without overcomplicating the formula.
+        - **FlashAttention** (Ampere+ AND model code that uses it) —
+          linear in L, dominated by hidden-state buffers:
+          `~ 6 × n_layers × L × hidden_dim × 2 bytes`. The factor 6
+          accounts for the residual stream + attention output + MLP
+          intermediate; consistent with the per-sequence slice of
+          ESME paper's batch-of-16 numbers (3B at L=3500: ~525 MB).
+
+        Numbers should be read as "rough order of magnitude" —
+        useful for distinguishing comfortable / tight / OOM, not for
+        predicting allocator behavior to the megabyte.
+        """
+        info = cls.AVAILABLE_MODELS.get(model_id)
+        if not info:
+            return 0.0
+        weights_gb = info.get('vram_gb', 0.0)
+        n_layers = info.get('n_layers') or 1
+        # Effective FlashAttention = model wants it AND hardware supports it.
+        # Without hardware support, even ESM-C falls back to math attention.
+        use_flash = info.get('flash_attn') and flash_attn_available
+        if use_flash:
+            hidden = info.get('hidden_dim') or 1280
+            act_bytes = 6 * n_layers * max_len * hidden * 2
+        else:
+            n_heads = info.get('n_heads') or 20
+            act_bytes = 1.5 * n_layers * n_heads * (max_len ** 2) * 2
+        return weights_gb + act_bytes / (1024 ** 3)
+
+    # CUDA compute-capability gate for FlashAttention. We use the
+    # FA-2 threshold (SM 8.0, Ampere) because PyTorch's stable SDPA
+    # flash backend (`scaled_dot_product_attention` with FLASH) has
+    # been FA-2-based since torch 2.x. FA-1 (SM 7.5, Turing) is
+    # legacy and not reliably installable from PyPI for current
+    # torch versions.
+    _FLASH_ATTN_MIN_COMPUTE_CAPABILITY = (8, 0)
+
+    @classmethod
+    def gpu_supports_flash_attn(
+        cls, gpu_name: str = "", compute_cap: str = "",
+    ) -> bool:
+        """Does this GPU support FlashAttention?
+
+        Prefers the explicit compute-capability check (authoritative)
+        over name matching. `compute_cap` comes from
+        `nvidia-smi --query-gpu=compute_cap` and looks like "6.1"
+        (Pascal) / "7.5" (Turing) / "8.0" (Ampere) / "9.0" (Hopper).
+        Falls back to a name-based heuristic for ancient drivers
+        that don't expose the field.
+
+        Conservative when ambiguous: returns True (assume modern
+        hardware) so users on unrecognised cards don't get spurious
+        warnings — an actual OOM at submit time is more actionable
+        than a false alarm here.
+        """
+        if compute_cap:
+            try:
+                major, minor = compute_cap.split(".")
+                cc = (int(major), int(minor))
+            except (ValueError, AttributeError):
+                cc = None
+            if cc is not None:
+                return cc >= cls._FLASH_ATTN_MIN_COMPUTE_CAPABILITY
+
+        # Name fallback for legacy drivers without compute_cap. Lists
+        # are not exhaustive — when the name doesn't match any known
+        # pre-Ampere card, default to True. The known-bad list
+        # below covers the most common "lab server with old GPUs"
+        # cases (Pascal/Maxwell/Kepler).
+        if not gpu_name:
+            return True
+        n = gpu_name.lower()
+        pascal = (
+            "1080", "1070", "1060", "1050",
+            " p100", " p40", " p4 ",
+            "titan x", "titan xp",
+        )
+        even_older = (
+            "980", "970", "960", "950", "940", "930",
+            "780", "770", "760", "750", "k80", "k40", "m40",
+        )
+        # Volta (V100, Titan V) is SM 7.0 — no FA-2 even though it
+        # has tensor cores. List separately for clarity.
+        volta = ("v100", "titan v")
+        for tag in pascal + even_older + volta:
+            if tag in n:
+                return False
+        return True
 
     def __init__(self, host: Optional[str] = None, user: Optional[str] = None,
                  key_path: Optional[str] = None,
@@ -83,35 +215,62 @@ class ESMEmbeddings(RemoteJobManager):
         return {'model': info.get('model', 'unknown')}
 
     def query_gpus(self) -> List[Dict]:
-        """Return a list of {index, free_mb, total_mb, name} for each GPU.
+        """Return a list of {index, free_mb, total_mb, name, compute_cap}
+        for each GPU on the remote.
+
+        `compute_cap` is the CUDA Compute Capability as a string
+        (e.g. "6.1" for Pascal, "8.0" for Ampere, "9.0" for Hopper) —
+        the canonical signal for whether FlashAttention will run.
+        Empty string when `nvidia-smi` doesn't expose the field
+        (very old driver) so callers can fall back to name matching.
 
         Relies on `nvidia-smi` being on the remote PATH. If nvidia-smi
-        isn't available (or the host has no NVIDIA GPUs), returns an
-        empty list — callers should treat that as "can't tell, skip the
-        check" rather than an error.
+        isn't available (e.g. AMD GPUs, CPU-only host, or no NVIDIA
+        driver installed), returns an empty list — callers should
+        treat that as "can't tell, skip the check" rather than an
+        error. CPU-only deployments are useful for testing the
+        pipeline but will be very slow for real workloads.
         """
-        result = self.conn.run(
+        # Newer nvidia-smi (>=470) supports compute_cap as a queryable
+        # field. We try the rich query first; if that returns nothing
+        # (older driver), fall back to the legacy 4-column query so
+        # users on ancient drivers still get a memory budget.
+        rich = self.conn.run(
+            'nvidia-smi --query-gpu=index,memory.free,memory.total,name,'
+            'compute_cap --format=csv,noheader,nounits 2>/dev/null',
+            hide=True, warn=True,
+        )
+        if rich.ok and rich.stdout.strip():
+            return self._parse_gpu_csv(rich.stdout, with_compute_cap=True)
+
+        legacy = self.conn.run(
             'nvidia-smi --query-gpu=index,memory.free,memory.total,name '
             '--format=csv,noheader,nounits 2>/dev/null',
             hide=True, warn=True,
         )
-        if not result.ok or not result.stdout.strip():
-            return []
+        if legacy.ok and legacy.stdout.strip():
+            return self._parse_gpu_csv(legacy.stdout, with_compute_cap=False)
+        return []
 
+    @staticmethod
+    def _parse_gpu_csv(text: str, with_compute_cap: bool) -> List[Dict]:
         gpus = []
-        for line in result.stdout.strip().splitlines():
+        min_fields = 5 if with_compute_cap else 4
+        for line in text.strip().splitlines():
             parts = [p.strip() for p in line.split(',')]
-            if len(parts) < 4:
+            if len(parts) < min_fields:
                 continue
             try:
-                gpus.append({
+                row = {
                     'index': int(parts[0]),
                     'free_mb': int(parts[1]),
                     'total_mb': int(parts[2]),
                     'name': parts[3],
-                })
+                    'compute_cap': parts[4] if with_compute_cap else '',
+                }
             except ValueError:
                 continue
+            gpus.append(row)
         return gpus
 
     def _select_gpu(self, requested: int, model: str) -> int:
@@ -286,25 +445,24 @@ class ESMEmbeddings(RemoteJobManager):
         )
         pid = result.stdout.strip()
 
-        job_db = self._load_job_db()
-        job_db[job_id] = {
-            'job_type': 'embeddings',
-            'name': job_name,
-            'model': model,
-            'input_file': input_record,
-            'source_job_id': source_job_id,
-            'remote_path': remote_job_path,
-            'submitted_at': datetime.now().isoformat(),
-            'status': 'SUBMITTED',
-            'pid': pid,
-            'parameters': {
-                'repr_layers': repr_layers,
-                'include_mean': include_mean,
-                'include_per_tok': include_per_tok,
-                'gpu_id': gpu_id
+        with self._mutate_job_db() as db:
+            db[job_id] = {
+                'job_type': 'embeddings',
+                'name': job_name,
+                'model': model,
+                'input_file': input_record,
+                'source_job_id': source_job_id,
+                'remote_path': remote_job_path,
+                'submitted_at': datetime.now().isoformat(),
+                'status': 'SUBMITTED',
+                'pid': pid,
+                'parameters': {
+                    'repr_layers': repr_layers,
+                    'include_mean': include_mean,
+                    'include_per_tok': include_per_tok,
+                    'gpu_id': gpu_id,
+                },
             }
-        }
-        self._save_job_db(job_db)
 
         model_info = self.AVAILABLE_MODELS[model]
         print(f"✓ Submitted {job_name} → {model_info['name']} ({job_id})")

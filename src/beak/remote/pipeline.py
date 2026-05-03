@@ -458,18 +458,20 @@ class Pipeline(RemoteJobManager):
         # After executing, check the actual script on server
         result = self.conn.run(f'cat {remote_job_path}/pipeline.sh', hide=True)
         
-        # Update local job database
-        job_db = self._load_job_db()
-        job_db[job_id] = {
-            'job_type': 'pipeline',
-            'name': job_name,
-            'steps': [{'type': s.step_type, 'params': s.params} for s in self.steps],
-            'remote_path': remote_job_path,
-            'submitted_at': datetime.now().isoformat(),
-            'status': 'SUBMITTED',
-            'pid': pid
-        }
-        self._save_job_db(job_db)
+        # Update local job database (atomic add)
+        with self._mutate_job_db() as db:
+            db[job_id] = {
+                'job_type': 'pipeline',
+                'name': job_name,
+                'steps': [
+                    {'type': s.step_type, 'params': s.params}
+                    for s in self.steps
+                ],
+                'remote_path': remote_job_path,
+                'submitted_at': datetime.now().isoformat(),
+                'status': 'SUBMITTED',
+                'pid': pid,
+            }
         
         steps_str = ' → '.join(s.step_type for s in self.steps)
         print(f"✓ Submitted {job_name}: {steps_str} ({job_id})")

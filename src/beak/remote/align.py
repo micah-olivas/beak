@@ -267,20 +267,23 @@ fi
 
         self.conn.run(f'echo {pid} > {remote_job_path}/pid.txt', hide=True)
 
-        job_db = self._load_job_db()
-        job_db[job_id] = {
-            'job_type': 'align',
-            'name': job_name,
-            'input_file': str(input_file),
-            'algorithm': algorithm,
-            'output_format': output_format,
-            'remote_path': remote_job_path,
-            'submitted_at': datetime.now().isoformat(),
-            'status': 'SUBMITTED',
-            'pid': pid,
-            'parameters': align_params
-        }
-        self._save_job_db(job_db)
+        # Atomic add — without holding the lock around the add, a
+        # concurrent status poll could read jobs.json before this
+        # entry exists and write it back without our new job, losing
+        # the submission.
+        with self._mutate_job_db() as db:
+            db[job_id] = {
+                'job_type': 'align',
+                'name': job_name,
+                'input_file': str(input_file),
+                'algorithm': algorithm,
+                'output_format': output_format,
+                'remote_path': remote_job_path,
+                'submitted_at': datetime.now().isoformat(),
+                'status': 'SUBMITTED',
+                'pid': pid,
+                'parameters': align_params,
+            }
 
         print(f"✓ Submitted {job_name} [{algo_info['name']}] ({job_id})")
 

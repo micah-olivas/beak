@@ -29,10 +29,39 @@ class TestInferStatus:
         assert mgr._infer_status(_job(), is_running=True,
                                  status_lines=['RUNNING', 'FAILED']) == 'FAILED'
 
-    def test_running_from_status_file(self):
+    def test_cancelled_marker_overrides_running(self):
+        # Cancel appends `CANCELLED` to a status.txt that already has
+        # `RUNNING` from the launch script. Without the terminal
+        # marker winning, the post-cancel poll keeps reporting
+        # RUNNING and the layers panel never updates.
         mgr = _mgr()
-        assert mgr._infer_status(_job(), is_running=False,
-                                 status_lines=['RUNNING']) == 'RUNNING'
+        assert mgr._infer_status(
+            _job(), is_running=False,
+            status_lines=['RUNNING', 'CANCELLED']
+        ) == 'CANCELLED'
+
+    def test_dead_pid_with_running_marker_within_grace_is_submitted(self):
+        # Dead PID + status.txt = RUNNING + within grace window: the
+        # script may simply be booting and hasn't touched the file
+        # since the initial RUNNING line. Keep it SUBMITTED.
+        mgr = _mgr()
+        assert mgr._infer_status(
+            _job(submitted_seconds_ago=10), is_running=False,
+            status_lines=['RUNNING']
+        ) == 'SUBMITTED'
+
+    def test_dead_pid_with_running_marker_past_grace_is_failed(self):
+        # The pre-fix bug: PID dead + stale RUNNING marker would be
+        # reported as RUNNING forever, because the old logic trusted
+        # the file even when the process was gone. After kill -9,
+        # OOM, or a server reboot the script never writes FAILED, so
+        # we have to infer it from "past grace + dead PID + no
+        # terminal marker."
+        mgr = _mgr()
+        assert mgr._infer_status(
+            _job(submitted_seconds_ago=300), is_running=False,
+            status_lines=['RUNNING']
+        ) == 'FAILED'
 
     def test_running_from_live_pid(self):
         mgr = _mgr()
@@ -73,7 +102,10 @@ class TestInferStatus:
         assert mgr._infer_status({}, is_running=False,
                                  status_lines=['NO_STATUS']) == 'SUBMITTED'
 
-    def test_empty_status_lines_is_unknown(self):
+    def test_empty_status_lines_within_grace_is_submitted(self):
+        # status_lines == [] is an edge case (the file exists but is
+        # empty). Treat it like NO_STATUS: within grace it's still
+        # plausibly the script booting; past grace it'd be FAILED.
         mgr = _mgr()
         assert mgr._infer_status(_job(), is_running=False,
-                                 status_lines=[]) == 'UNKNOWN'
+                                 status_lines=[]) == 'SUBMITTED'

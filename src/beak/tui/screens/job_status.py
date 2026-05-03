@@ -52,7 +52,9 @@ class JobStatusModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-body"):
-            yield Label(f"[bold]Job · {self._job_id}[/bold]", id="status-title")
+            yield Label(
+                f"[bold]Job · {self._job_id}[/bold]", id="modal-title",
+            )
             yield Static("[dim]Loading status…[/dim]", id="status-content")
             with Horizontal(id="modal-buttons"):
                 cancel_btn = Button(
@@ -98,9 +100,19 @@ class JobStatusModal(ModalScreen):
                 self._set_content,
                 f"[red]Status check failed:[/red] [dim]{type(e).__name__}[/dim]\n"
                 f"[dim]{msg[:200]}[/dim]\n\n"
-                f"[dim]The remote job itself may still be running — "
-                f"close this and reopen, or check `beak jobs`.[/dim]",
+                f"[dim]The remote job itself may still be running, or "
+                f"may have crashed and the server is unreachable.\n"
+                f"Use [bold]Clear[/bold] to drop this job from the "
+                f"project locally — manifest cleanup runs without SSH "
+                f"and will unstick the layers panel.[/dim]",
             )
+            # Surface the Clear button even though we couldn't confirm
+            # the remote state. The clear path's manifest cleanup is
+            # local-only, so the user can always escape a stuck pill;
+            # remote `cleanup()` will fail-soft inside `_do_clear` if
+            # SSH stays broken. Treat the unknowable state as UNKNOWN
+            # so `_update_clear_button` enables the button.
+            self.app.call_from_thread(self._on_status_unreachable)
             return
         finally:
             # Drop the SSH socket between polls — the modal refreshes
@@ -180,7 +192,14 @@ class JobStatusModal(ModalScreen):
         )
 
     def _set_content(self, text: str) -> None:
-        self.query_one("#status-content", Static).update(text)
+        # Guard against dismissal-while-poll-in-flight: the worker's
+        # `app.call_from_thread` can land here after the modal was
+        # closed, in which case the widget is gone and `query_one`
+        # raises NoMatches. Silently no-op rather than crash.
+        try:
+            self.query_one("#status-content", Static).update(text)
+        except Exception:
+            pass
 
     def _update_cancel_button(self, status: str) -> None:
         """Show + label the cancel button based on current job status.
@@ -208,6 +227,20 @@ class JobStatusModal(ModalScreen):
             btn.label = "Confirm cancel"
         else:
             btn.label = "Cancel job"
+
+    def _on_status_unreachable(self) -> None:
+        """Hand the user a Clear escape hatch when the status poll itself
+        threw (SSH down, server gone, jobs.json corrupt). We can't
+        verify the remote, but the local manifest can still be cleaned
+        up, which is what unsticks the layers panel."""
+        self._last_status = "UNKNOWN"
+        # Hide Cancel — we can't kill what we can't reach.
+        try:
+            cancel_btn = self.query_one("#cancel-btn", Button)
+            cancel_btn.display = False
+        except Exception:
+            pass
+        self._update_clear_button("UNKNOWN")
 
     def _update_clear_button(self, status: str) -> None:
         """Show + label the clear button for terminal failure states.
@@ -398,9 +431,55 @@ class JobStatusModal(ModalScreen):
                     _pop_if_match(rem, "job_id")
 
             if check_embed:
-                rem = (m.get("embeddings") or {}).get("remote")
-                if rem:
-                    _pop_if_match(rem, "job_id")
+                # Embeddings are now per-(homolog set, model): walk
+                # `embeddings.sets`, pop whichever `remote.job_id`
+                # matches, and drop entries that have nothing left
+                # (no `n_embeddings`, no `remote`). For dropped
+                # entries we *also* rmtree the per-(set, model) dir
+                # — without that, a failed embed leaves orphan files
+                # under `embeddings/<set>/<model_slug>/` that the
+                # next embed for the same pair would overwrite into.
+                # An entry with surviving `n_embeddings` from a prior
+                # successful run is left intact (just the failed
+                # job_id gets dropped), so re-submitting against an
+                # already-good model doesn't lose its data.
+                emb = m.get("embeddings") or {}
+                sets = emb.get("sets") or []
+                kept = []
+                self._embed_dirs_to_rm: list[tuple[str, str | None]] = []
+                for s in sets:
+                    rem = s.get("remote") or {}
+                    if rem.get("job_id") == target_id:
+                        rem.pop("job_id", None)
+                        if rem:
+                            s["remote"] = rem
+                        else:
+                            s.pop("remote", None)
+                    if s.get("n_embeddings") or s.get("remote"):
+                        kept.append(s)
+                    else:
+                        set_name = s.get("source_homologs_set")
+                        if set_name:
+                            self._embed_dirs_to_rm.append(
+                                (set_name, s.get("model"))
+                            )
+                if kept:
+                    emb["sets"] = kept
+                    m["embeddings"] = emb
+                elif "embeddings" in m:
+                    m.pop("embeddings", None)
+
+        # Outside the manifest lock: rmtree any dirs flagged for the
+        # embed branch above. Lock is per-project (project.mutate); we
+        # don't want filesystem I/O blocking other manifest writers.
+        dirs = getattr(self, "_embed_dirs_to_rm", None) or []
+        if dirs:
+            import shutil
+            for set_name, model in dirs:
+                d = self._project.embeddings_set_dir(set_name, model=model)
+                if d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
+            self._embed_dirs_to_rm = []
 
     def _after_clear(self, err: str | None) -> None:
         self._clear_in_flight = False
