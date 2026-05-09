@@ -15,7 +15,16 @@ from pathlib import Path
 from typing import Callable, List, Optional, Union
 
 
-PDBE_SIFTS_URL = "https://www.ebi.ac.uk/pdbe/api/mappings/uniprot"
+# PDBe SIFTS UniProt → PDB mapping endpoint. As of 2026 the
+# `/mappings/uniprot` POST batch route is gone (returns 405); we
+# now hit `/mappings/best_structures/<uid>` which returns per-chain
+# entries already pre-ranked by experimental quality (lower
+# resolution X-ray first, NMR / EM following) AND populates the
+# `resolution` + `experimental_method` fields the local ranker uses
+# downstream. The plain `/mappings/<uid>` endpoint also exists but
+# omits resolution/method, so the local "best" picker can't tell
+# the structures apart.
+PDBE_BEST_STRUCTURES_URL = "https://www.ebi.ac.uk/pdbe/api/mappings/best_structures"
 RCSB_DOWNLOAD_URL = "https://files.rcsb.org/download"
 ALPHAFOLD_CIF_URL = (
     "https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v6.cif"
@@ -213,22 +222,53 @@ def fetch_structures(
 
 
 def _fetch_pdb_mappings_batch(uniprot_ids: List[str]) -> List[dict]:
-    """POST a batch of UniProt IDs to PDBe SIFTS and parse the response."""
-    data = ','.join(uniprot_ids).encode('utf-8')
+    """Fetch UniProt → PDB mappings from PDBe SIFTS.
+
+    PDBe deprecated the POST-with-comma-separated-ids batch endpoint
+    (it now returns 405 Method Not Allowed; verified live 2026-05).
+    The replacement is a per-UniProt GET against
+    ``/pdbe/api/mappings/<id>`` — same JSON response shape as the
+    old POST batch, so the parser is reused unchanged. We loop the
+    incoming list and merge the per-id results, preserving the
+    historical "batch" return contract for callers.
+
+    Each per-id request goes through `_get_sifts_for_uniprot`, which
+    handles the retry-on-transient and 404-as-empty cases.
+    """
+    rows: List[dict] = []
+    for uid in uniprot_ids:
+        rows.extend(_get_sifts_for_uniprot(uid))
+        # Small spacing between consecutive GETs so a project with
+        # multiple targets doesn't hammer PDBe; matches the
+        # `PDBE_DELAY` cadence the old batch path used between
+        # batches.
+        if len(uniprot_ids) > 1:
+            time.sleep(PDBE_DELAY)
+    return rows
+
+
+def _get_sifts_for_uniprot(uniprot_id: str) -> List[dict]:
+    """GET pre-ranked PDB structures for a single UniProt id.
+
+    Hits the `/mappings/best_structures/<id>` endpoint, which:
+      * returns per-chain entries already sorted by experimental
+        quality (resolution-then-coverage), so callers that just
+        want the top hit can take ``rows[0]``;
+      * carries the `resolution` and `experimental_method` fields
+        so the local `_select_structures("best")` ranker stays
+        meaningful when callers want a different secondary sort.
+    """
+    url = f"{PDBE_BEST_STRUCTURES_URL}/{uniprot_id}"
     req = urllib.request.Request(
-        PDBE_SIFTS_URL,
-        data=data,
-        headers={
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Accept': 'application/json',
-        },
+        url,
+        headers={'Accept': 'application/json'},
     )
 
     for attempt in range(MAX_RETRIES):
         try:
             with urllib.request.urlopen(req) as response:
                 result = json.loads(response.read().decode('utf-8'))
-                return _parse_sifts_response(result)
+                return _parse_best_structures_response(result)
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 retry_after = int(e.headers.get('Retry-After', 5))
@@ -236,7 +276,8 @@ def _fetch_pdb_mappings_batch(uniprot_ids: List[str]) -> List[dict]:
                     time.sleep(retry_after)
                     continue
             if e.code == 404:
-                # No mappings found for any ID in this batch
+                # No PDB structures for this UniProt — empty result,
+                # not an error. Caller should fall back to AlphaFold.
                 return []
             raise
         except urllib.error.URLError:
@@ -246,6 +287,44 @@ def _fetch_pdb_mappings_batch(uniprot_ids: List[str]) -> List[dict]:
             raise
 
     return []
+
+
+def _parse_best_structures_response(result: dict) -> List[dict]:
+    """Parse `/mappings/best_structures/<id>` JSON into flat row dicts.
+
+    Response shape::
+
+        {"<uniprot_id>": [
+            {"pdb_id": "...", "chain_id": "A", "resolution": 1.45,
+             "experimental_method": "X-ray diffraction",
+             "unp_start": 1, "unp_end": 99, "coverage": 1.0, ...},
+            ...
+        ]}
+
+    Different from the older `/mappings/<id>` shape (which nested
+    chains under `{"PDB": {<pdb_id>: [...]}}` and omitted resolution).
+    """
+    rows = []
+    for uniprot_id, entries in result.items():
+        for entry in entries:
+            pdb_id = entry.get('pdb_id') or ''
+            if not pdb_id:
+                continue
+            resolution = entry.get('resolution')
+            start = entry.get('unp_start')
+            end = entry.get('unp_end')
+            rows.append({
+                'uniprot_id': uniprot_id,
+                'source': 'pdb',
+                'structure_id': pdb_id.upper(),
+                'chain_id': entry.get('chain_id', ''),
+                'resolution': float(resolution) if resolution is not None else None,
+                'method': entry.get('experimental_method', ''),
+                'coverage_start': int(start) if start is not None else None,
+                'coverage_end': int(end) if end is not None else None,
+                'download_url': f"{RCSB_DOWNLOAD_URL}/{pdb_id}.cif",
+            })
+    return rows
 
 
 def _parse_sifts_response(result: dict) -> List[dict]:

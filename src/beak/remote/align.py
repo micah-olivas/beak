@@ -56,8 +56,16 @@ ALGORITHMS = {
 
 
 def _build_clustalo_cmd(input_path, output_path, output_format, log_path, params):
-    """Build Clustal Omega command string."""
-    parts = [f'clustalo -i {input_path} -o {output_path}']
+    """Build Clustal Omega command string.
+
+    `--verbose` is passed unconditionally so the log captures the
+    "Read N sequences", "Calculating pairwise…", "Guide-tree…",
+    "Progressive alignment…" milestones that the job-status modal
+    parses as stages. Without it Clustal Omega runs silently — the
+    log stays at 0 bytes, every stage stays pending in the modal,
+    and there's no `last_log_line` to surface either.
+    """
+    parts = [f'clustalo --verbose -i {input_path} -o {output_path}']
     if output_format != 'fasta':
         parts.append(f'--outfmt={output_format}')
     for k, v in params.items():
@@ -67,7 +75,12 @@ def _build_clustalo_cmd(input_path, output_path, output_format, log_path, params
 
 
 def _build_mafft_cmd(input_path, output_path, output_format, log_path, params):
-    """Build MAFFT command string."""
+    """Build MAFFT command string.
+
+    MAFFT prints progress to stderr by default; we redirect stderr
+    into the log file so the modal's progress parser (`STEP X / Y`,
+    "Progressive alignment", etc.) sees it.
+    """
     parts = ['mafft']
     # MAFFT uses --flag or --key value style
     for k, v in params.items():
@@ -77,13 +90,19 @@ def _build_mafft_cmd(input_path, output_path, output_format, log_path, params):
         else:
             parts.append(f'{flag} {v}')
     parts.append(input_path)
-    # MAFFT writes to stdout
+    # MAFFT writes the alignment to stdout, progress to stderr — so
+    # only stdout is the alignment file, stderr → log for the modal.
     return ' '.join(parts) + f' > {output_path} 2> {log_path}'
 
 
 def _build_muscle_cmd(input_path, output_path, output_format, log_path, params):
-    """Build MUSCLE command string."""
-    parts = [f'muscle -align {input_path} -output {output_path}']
+    """Build MUSCLE command string.
+
+    `-verbose` makes MUSCLE 5 emit per-iteration progress so the modal
+    can render stage state; without it MUSCLE prints only a banner +
+    final summary, leaving the log static for hours during big aligns.
+    """
+    parts = [f'muscle -verbose -align {input_path} -output {output_path}']
     for k, v in params.items():
         parts.append(f'-{k.replace("_", "-")} {v}')
     parts.append(f'2>&1 | tee {log_path}')

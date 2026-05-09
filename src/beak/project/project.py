@@ -158,6 +158,70 @@ class BeakProject:
         except Exception:  # noqa: BLE001 — best-effort manifest sync
             pass
 
+    def remote_job_ids(self) -> List[str]:
+        """Every job_id this project still references in the manifest.
+
+        Collected once (no SSH) so the delete path can fan out a
+        single batch of remote `rm -rf`s — search jobs, alignment
+        jobs, the project-level taxonomy job, and every per-(set,
+        model) embedding job. Useful regardless of completion state;
+        the cleanup target is `~/beak_jobs/<id>/` on the remote, which
+        is scratch even for COMPLETED jobs we already pulled.
+        """
+        m = self.manifest()
+        job_ids: List[str] = []
+
+        for s in (m.get("homologs") or {}).get("sets") or []:
+            remote = s.get("remote") or {}
+            for k in ("search_job_id", "align_job_id"):
+                jid = remote.get(k)
+                if jid:
+                    job_ids.append(str(jid))
+
+        tax = m.get("taxonomy") or {}
+        tax_jid = (tax.get("remote") or {}).get("job_id")
+        if tax_jid:
+            job_ids.append(str(tax_jid))
+
+        for e in (m.get("embeddings") or {}).get("sets") or []:
+            jid = (e.get("remote") or {}).get("job_id")
+            if jid:
+                job_ids.append(str(jid))
+
+        # De-dupe while preserving order — manifest theoretically
+        # shouldn't contain duplicates but a re-submitted job that
+        # reused an id would otherwise produce double-cleanup attempts.
+        seen: set = set()
+        unique: List[str] = []
+        for jid in job_ids:
+            if jid not in seen:
+                seen.add(jid)
+                unique.append(jid)
+        return unique
+
+    def delete(self) -> None:
+        """Delete the project directory entirely.
+
+        Local-only: rmtrees `<PROJECTS_DIR>/<name>/`. Caller is
+        responsible for cleaning up remote scratch dirs (use
+        `remote_job_ids()` to enumerate them before calling this).
+        Failures bubble as `BeakProjectError` so the UI can surface
+        a useful toast.
+        """
+        if not self.path.exists():
+            return
+        try:
+            shutil.rmtree(self.path)
+        except OSError as e:
+            raise BeakProjectError(
+                f"Could not delete project directory at {self.path}: {e}"
+            ) from e
+        # Drop any per-path lock cache entry — pointing at a deleted
+        # path with a stale RLock would deadlock a future project of
+        # the same name.
+        with _MANIFEST_LOCKS_GUARD:
+            _MANIFEST_LOCKS.pop(str(self.path.resolve()), None)
+
     @classmethod
     def list_projects(cls) -> List["BeakProject"]:
         if not PROJECTS_DIR.exists():
@@ -323,6 +387,29 @@ class BeakProject:
                     f"Could not move set directory: {e}"
                 ) from e
 
+        # Embedding artefacts are scoped per (set, model) under
+        # `embeddings/<set>/<model>/`. If we don't move that dir too
+        # the manifest entry will keep pointing at the new name while
+        # the bytes sit at the old path, and `active_embeddings_dir`
+        # will return an empty path. Best-effort: a missing source
+        # dir is fine (no embeddings yet for the renamed set); a
+        # collision at the destination is rare but raises since it
+        # would silently lose data otherwise.
+        old_emb_dir = self.path / "embeddings" / old_name
+        new_emb_dir = self.path / "embeddings" / new_name
+        if old_emb_dir.exists():
+            if new_emb_dir.exists():
+                raise BeakProjectError(
+                    f"Embeddings dir already exists at {new_emb_dir}; "
+                    f"refusing to overwrite — move or delete it first."
+                )
+            try:
+                old_emb_dir.rename(new_emb_dir)
+            except OSError as e:
+                raise BeakProjectError(
+                    f"Could not move embeddings dir: {e}"
+                ) from e
+
         with self.mutate() as m:
             homologs = m.setdefault("homologs", {})
             for s in homologs.get("sets") or []:
@@ -331,6 +418,14 @@ class BeakProject:
                     break
             if homologs.get("active") == old_name:
                 homologs["active"] = new_name
+            # Cascade to every embedding entry that referenced the
+            # old set name. Without this, the rename leaves orphan
+            # `source_homologs_set` strings pointing at a set name
+            # that no longer exists, and the layers panel / PCA pane
+            # silently filter those entries out as unrelated.
+            for e in (m.get("embeddings") or {}).get("sets") or []:
+                if e.get("source_homologs_set") == old_name:
+                    e["source_homologs_set"] = new_name
         return True
 
     def filter_homolog_set_by_length(
@@ -408,7 +503,9 @@ class BeakProject:
         # The parsed-alignment cache sidecar is dropped explicitly so a
         # stale ~10 MB file doesn't sit around orphaned.
         from ..alignments.cache import invalidate_cache
-        for name in ("alignment.fasta", "conservation.npy"):
+        # Both names listed: the new JSD cache and the pre-2026
+        # target-identity cache, so reset cleans up either generation.
+        for name in ("alignment.fasta", "conservation_jsd.npy", "conservation.npy"):
             f = set_dir / name
             if f.exists():
                 if name == "alignment.fasta":
@@ -506,7 +603,9 @@ class BeakProject:
         # Clear stale alignment artifacts — the old alignment was built
         # over the redundant FASTA, so column counts no longer match.
         from ..alignments.cache import invalidate_cache
-        for name in ("alignment.fasta", "conservation.npy"):
+        # Both names listed: the new JSD cache and the pre-2026
+        # target-identity cache, so reset cleans up either generation.
+        for name in ("alignment.fasta", "conservation_jsd.npy", "conservation.npy"):
             f = set_dir / name
             if f.exists():
                 if name == "alignment.fasta":

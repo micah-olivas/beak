@@ -10,6 +10,11 @@ from beak.structures.features import (
     _get_representative_atom,
     _compute_contacts_and_wcn,
     _parse_ss_from_mmcif,
+    _compute_relative_sasa,
+    _compute_sasa,
+    _TIEN_2013_MAX_SASA,
+    SASA_BURIED_THRESHOLD_PCT,
+    SASA_EXPOSED_THRESHOLD_PCT,
 )
 
 
@@ -253,3 +258,70 @@ class TestSecondaryStructureFallback:
     def test_no_annotations_returns_empty(self, linear_cif):
         ss = _parse_ss_from_mmcif(linear_cif, 'A')
         assert len(ss) == 0
+
+
+# ── Tests: relative SASA (Tien 2013 normalisation) ───────────────
+
+
+class TestRelativeSasa:
+    def test_returns_one_entry_per_residue(self, linear_cif):
+        rsasa = _compute_relative_sasa(linear_cif, 'A')
+        # 5 ALA + 3 GLY = 8 residues numbered 1..8.
+        assert sorted(rsasa.keys()) == list(range(1, 9))
+
+    def test_values_in_percent_range(self, linear_cif):
+        # Linear 8-residue chain with no neighbouring atoms blocking
+        # — every residue is highly exposed but rSASA stays bounded
+        # by the per-AA Tien 2013 maximum, so values land in [0, 100].
+        rsasa = _compute_relative_sasa(linear_cif, 'A')
+        for resnum, val in rsasa.items():
+            assert 0.0 <= val <= 100.0, (
+                f"rSASA out of [0, 100] at residue {resnum}: {val}"
+            )
+
+    def test_normalisation_against_absolute(self, linear_cif):
+        # Sanity: rSASA = 100 · abs / max_per_residue. Verify the
+        # ratio matches the Tien table for a few residues.
+        absolute = _compute_sasa(linear_cif, 'A')
+        rsasa = _compute_relative_sasa(linear_cif, 'A')
+        # First 5 residues are ALA → max 113; residues 6..8 are GLY → max 85.
+        for resnum in (1, 3, 5):
+            expected = min(100.0, 100.0 * absolute[resnum] / _TIEN_2013_MAX_SASA["ALA"])
+            assert rsasa[resnum] == pytest.approx(expected, rel=1e-6)
+        for resnum in (6, 7, 8):
+            expected = min(100.0, 100.0 * absolute[resnum] / _TIEN_2013_MAX_SASA["GLY"])
+            assert rsasa[resnum] == pytest.approx(expected, rel=1e-6)
+
+    def test_thresholds_constant_values(self):
+        # Burial / exposure cutoffs match the rSASA literature
+        # (<20% buried, ≥50% exposed).
+        assert SASA_BURIED_THRESHOLD_PCT == 20.0
+        assert SASA_EXPOSED_THRESHOLD_PCT == 50.0
+
+    def test_tien_table_covers_all_20_aa(self):
+        # The Tien 2013 reference must define a max for every standard
+        # amino acid — otherwise rSASA would silently fall through to
+        # absolute SASA for that residue type.
+        canonical = {
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY",
+            "HIS", "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER",
+            "THR", "TRP", "TYR", "VAL",
+        }
+        assert set(_TIEN_2013_MAX_SASA) == canonical
+
+    def test_glycine_relative_higher_than_alanine_for_same_absolute(
+        self, linear_cif
+    ):
+        # Tien max-SASA is smaller for Gly (85) than Ala (113), so a
+        # given absolute SASA value normalises to a *higher* rSASA on
+        # a Gly than on an Ala. Verify the ranking holds for residues
+        # at comparable solvent exposure.
+        absolute = _compute_sasa(linear_cif, 'A')
+        rsasa = _compute_relative_sasa(linear_cif, 'A')
+        # Compare the most-exposed Ala (one of 1..5) to a Gly with
+        # similar absolute SASA.
+        for ala_res in range(1, 6):
+            for gly_res in range(6, 9):
+                if abs(absolute[ala_res] - absolute[gly_res]) < 5.0:
+                    # Equal absolute SASA → Gly is higher rSASA.
+                    assert rsasa[gly_res] >= rsasa[ala_res]

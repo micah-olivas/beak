@@ -116,7 +116,7 @@ _EMBEDDING_SIZE_WARN_BYTES = 5 * 1024 ** 3  # 5 GB
 @click.option('--db', 'database', required=True, help='Database alias (e.g., uniref90)')
 @click.option('--name', 'job_name', default=None, help='Job name')
 @click.option('--preset', default=None,
-              type=click.Choice(['default', 'fast', 'sensitive', 'exhaustive', 'very_sensitive']),
+              type=click.Choice(['default', 'close', 'broad', 'twilight']),
               help='Search preset')
 @click.option('--uniprot', is_flag=True,
               help='Treat QUERY as a UniProt accession ID instead of a file path')

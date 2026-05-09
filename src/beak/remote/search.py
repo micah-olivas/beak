@@ -41,46 +41,84 @@ class MMseqsSearch(RemoteJobManager):
         'rnacentral': 'rnacentral_active_seq_id_90_cov_80_linclust.fasta',
     }
 
+    # Each preset targets a specific homolog-set use case for BEAK's
+    # downstream alignment + conservation chain. Sensitivity floors and
+    # iteration counts are chosen against the SCOPe ROC1 benchmark in
+    # Kallenborn et al. 2025 (Nat Biotech) — single-pass at -s 5.7/7.5
+    # buys little, but 1→2 iterations roughly bumps recall 0.4 → 0.61
+    # and 1→3 iterations to ~0.67, the actual lever for distant
+    # homologs. ColabFold's 3-iteration MSA pipeline (Mirdita et al.
+    # 2022) sets the precedent for E=0.1 in iterative mode.
+    #
+    # `roc1` is a literature-derived ROC1 estimate for the SCOPe
+    # benchmark — descriptive only. It tells the user how much recall
+    # they're trading per preset, NOT a per-search measurement (which
+    # would need a labelled reference set we don't have).
     PRESETS = {
         'default': {
-            'description': 'Default MMseqs2 sensitivity (balanced speed/sensitivity)',
+            'tagline': 'Orthologs and close paralogs',
+            'description': (
+                'Clean homolog set at MMseqs2 default sensitivity. '
+                'ROC1 ≈ 0.39 (Kallenborn et al. 2025, SCOPe).'
+            ),
+            'roc1': 0.39,
             'params': {
                 's': 5.7,
                 'e': 0.001,
-            }
-        },
-        'fast': {
-            'description': 'Fast search for close homologs (low sensitivity, capped hits)',
-            'params': {
-                's': 2.5,           # was 4.0 — drops cluster-explore depth
-                'e': 1e-3,
-                'max_seqs': 1000,   # cap result list per query
-            }
-        },
-        'sensitive': {
-            'description': 'More sensitive search (slower)',
-            'params': {
-                's': 7.5,
-                'e': 0.001,
-            }
-        },
-        'exhaustive': {
-            'description': 'Exhaustive search for remote homologs',
-            'params': {
-                's': 8.5,
-                'e': 10,
-                'max_seqs': 30000,
-                'min_seq_id': 0.15,
-                'c': 0.3,
+                'max_seqs': 2000,
+                'min_seq_id': 0.20,
+                'c': 0.5,
                 'cov_mode': 0,
             }
         },
-        'very_sensitive': {
-            'description': 'Very sensitive (good for distant homologs)',
+        'close': {
+            'tagline': 'Strict orthologs — precision-first',
+            'description': (
+                'High identity + coverage cut. ROC1 not meaningful '
+                '(precision-first; benchmark assumes recall sweep).'
+            ),
+            'roc1': None,
             'params': {
-                's': 8.0,
-                'e': 0.01,
+                's': 5.7,
+                'e': 1e-10,
                 'max_seqs': 1000,
+                'min_seq_id': 0.50,
+                'c': 0.7,
+                'cov_mode': 0,
+            }
+        },
+        'broad': {
+            'tagline': 'Family depth · 2-iter profile search',
+            'description': (
+                '~50% more recall than single-pass. ROC1 ≈ 0.61 '
+                '(2-iteration MMseqs2, SCOPe; Kallenborn et al. 2025).'
+            ),
+            'roc1': 0.61,
+            'params': {
+                's': 7.5,
+                'e': 0.001,
+                'max_seqs': 5000,
+                'min_seq_id': 0.20,
+                'c': 0.5,
+                'cov_mode': 0,
+                'num_iterations': 2,
+            }
+        },
+        'twilight': {
+            'tagline': 'Remote homologs · 3-iter profile search',
+            'description': (
+                'Approaches JackHMMER 3-iter (0.685). ROC1 ≈ 0.67 '
+                '(SCOPe; Kallenborn et al. 2025). Slowest preset.'
+            ),
+            'roc1': 0.67,
+            'params': {
+                's': 7.5,
+                'e': 0.1,
+                'max_seqs': 5000,
+                'min_seq_id': 0.15,
+                'c': 0.4,
+                'cov_mode': 0,
+                'num_iterations': 3,
             }
         },
     }

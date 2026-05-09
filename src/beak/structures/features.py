@@ -293,9 +293,12 @@ def _parse_ss_from_mmcif(cif_path, chain_id):
 
 
 def _compute_sasa(cif_path, chain_id):
-    """Compute per-residue SASA using BioPython's ShrakeRupley.
+    """Compute per-residue absolute SASA using BioPython's ShrakeRupley.
 
-    Returns dict of {residue_number: float}.
+    Returns dict of ``{residue_number: SASA_in_angstroms_squared}``.
+    Use :func:`_compute_relative_sasa` when the consumer wants a
+    residue-type-normalized 0-100 % value (the field-standard
+    representation for "is this residue buried?").
     """
     from Bio.PDB.MMCIFParser import MMCIFParser
     from Bio.PDB.SASA import ShrakeRupley
@@ -318,3 +321,89 @@ def _compute_sasa(cif_path, chain_id):
             sasa_map[resnum] = residue.sasa
 
     return sasa_map
+
+
+# Tien et al., "Maximum Allowed Solvent Accessibilities of Residues in
+# Proteins", PLOS ONE 2013 (PMC3836772). Theoretical maxima from
+# extended-conformation Gly-X-Gly tripeptides, the field-standard
+# normalisation reference for residue-level rSASA. Values in Å². The
+# Tien-2013 numbers are used by FreeSASA, BioPython's tutorials, and
+# the dominant share of recent rSASA-using methods literature
+# (e.g. Tsishyn et al. 2025 on mutational-effect prediction).
+_TIEN_2013_MAX_SASA = {
+    "ALA": 113.0,
+    "ARG": 241.0,
+    "ASN": 158.0,
+    "ASP": 151.0,
+    "CYS": 140.0,
+    "GLN": 189.0,
+    "GLU": 183.0,
+    "GLY": 85.0,
+    "HIS": 194.0,
+    "ILE": 182.0,
+    "LEU": 180.0,
+    "LYS": 211.0,
+    "MET": 204.0,
+    "PHE": 218.0,
+    "PRO": 143.0,
+    "SER": 122.0,
+    "THR": 146.0,
+    "TRP": 259.0,
+    "TYR": 229.0,
+    "VAL": 160.0,
+}
+
+# Boundaries for rSASA classification, taken from the standard
+# burial/exposure conventions used across the rSASA literature:
+#   rSASA <  20 % → buried
+#   20 % ≤ rSASA < 50 % → partially exposed
+#   rSASA ≥ 50 % → exposed
+SASA_BURIED_THRESHOLD_PCT = 20.0
+SASA_EXPOSED_THRESHOLD_PCT = 50.0
+
+
+def _compute_relative_sasa(cif_path, chain_id):
+    """Per-residue relative SASA in [0, 100] (%).
+
+    rSASA = 100 · (observed SASA / max-SASA-for-residue-type), with
+    max-SASA-per-AA from the Tien et al. 2013 reference table. Values
+    above 100 % are clipped — they appear occasionally for terminal
+    residues whose conformation differs from the Gly-X-Gly reference,
+    and clipping keeps the [0, 100] convention intact for downstream
+    palette work.
+
+    Non-canonical residues (selenomethionine, modified residues, etc.)
+    fall back to the absolute SASA so a structure with an MSE doesn't
+    silently report rSASA = 0 for that position; the value just isn't
+    normalised. Returns dict of ``{residue_number: rsasa_percent}``.
+    """
+    from Bio.PDB.MMCIFParser import MMCIFParser
+    from Bio.PDB.SASA import ShrakeRupley
+
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure("model", cif_path)
+    model = structure[0]
+
+    sr = ShrakeRupley()
+    sr.compute(structure, level='R')
+
+    rsasa_map = {}
+    for chain in model:
+        if chain.id != chain_id:
+            continue
+        for residue in chain:
+            if residue.id[0] != ' ':
+                continue
+            resnum = residue.id[1]
+            resname = residue.get_resname().upper()
+            max_sasa = _TIEN_2013_MAX_SASA.get(resname)
+            if max_sasa is None or max_sasa <= 0:
+                # Non-canonical or unknown residue: report absolute
+                # SASA so we don't silently clamp it to 0%. Caller can
+                # detect this case by checking against the standard
+                # 20-AA set.
+                rsasa_map[resnum] = float(residue.sasa)
+                continue
+            rsasa_map[resnum] = min(100.0, 100.0 * residue.sasa / max_sasa)
+
+    return rsasa_map
