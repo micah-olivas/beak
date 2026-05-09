@@ -2,8 +2,14 @@ services:
   embeddings:
     build: .
     runtime: nvidia
-    environment:
-      - CUDA_VISIBLE_DEVICES=0
+    # Intentionally NO `CUDA_VISIBLE_DEVICES` env var — that variable
+    # is parsed by CUDA as a comma-separated list of GPU indices, so
+    # `=all` would *break* visibility (no index matches "all" → 0
+    # GPUs visible to torch), and `=0` would hide a second card.
+    # GPU exposure is handled by `deploy.resources.reservations.devices`
+    # below, which gives the container every GPU the host has.
+    # Inside the container, the embedding script's `--gpu N` arg
+    # picks a specific card via `cuda:N`.
     volumes:
       # Mount /home so container paths match host paths exactly. The run
       # scripts pass absolute host paths like /home/<user>/beak_jobs/<id>
@@ -12,6 +18,21 @@ services:
       # service case (${HOME} is whoever brought the service up, not the
       # user exec'ing in).
       - /home:/home
+      # HuggingFace cache mount — model downloads (ESM3 weights, ~5
+      # GB; ESMC weights; tokenizers) live in the host user's cache
+      # so re-pulls survive container rebuilds, AND the user's HF
+      # auth token (`~/.cache/huggingface/token`) is visible to the
+      # container without an env-var workaround. Models like
+      # `esm3-sm-open-v1` are gated behind a license-acceptance step
+      # on HuggingFace; once the user has accepted on the host, the
+      # cached token authenticates the container automatically.
+      #
+      # `${HOME}` is whoever ran `docker compose up`; for the
+      # shared-service deploy that's the user who first triggered
+      # `_ensure_docker_service`. Each user's exec'd Python process
+      # then reads the token from the right cache path (`HOME` is
+      # set per-exec, but the cache is shared via this mount).
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
     restart: unless-stopped
     deploy:
       resources:

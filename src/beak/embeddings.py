@@ -81,7 +81,19 @@ def load_mean_embeddings(
     sample_layers = next(iter(raw.values()))
     layer_key = _pick_layer(sample_layers, layer)
 
-    records = {seq_id: layers[layer_key] for seq_id, layers in raw.items()}
+    # Defensive mean-pool on read. An older docker build wrote per-
+    # residue tensors `(seq_len, D)` here instead of mean vectors
+    # `(D,)`, which caused `pd.DataFrame.from_dict` to raise
+    # "inhomogeneous shape after 1 dimensions" on assembly. Reducing
+    # leading axes here makes such pickles usable without resubmitting
+    # the embedding job — and is a no-op when the values are already 1-D.
+    records = {}
+    for seq_id, layers in raw.items():
+        arr = np.asarray(layers[layer_key])
+        while arr.ndim > 1:
+            arr = arr.mean(axis=0)
+        records[seq_id] = arr
+
     df = pd.DataFrame.from_dict(records, orient='index')
     df.columns = [f"dim_{i}" for i in range(df.shape[1])]
     df.index.name = 'seq_id'
@@ -175,6 +187,20 @@ def load_or_compute_pca_2d(
     df = df.dropna()
     n_dropped = n_before - len(df)
     if df.empty or df.shape[1] < 2 or df.shape[0] < 2:
+        # Disambiguate "no real data" from "every row had NaN". The
+        # latter usually traces to the remote embedding job falling
+        # back to CPU because of a CUDA/PyTorch driver mismatch —
+        # surface that hypothesis instead of a generic empty error.
+        if n_before > 0 and n_dropped == n_before:
+            raise ValueError(
+                f"All {n_before:,} embeddings contain NaN. The remote "
+                f"job likely fell back to CPU because of a CUDA / "
+                f"PyTorch driver mismatch (look for a 'CUDA "
+                f"initialization' warning in the job log). Update the "
+                f"GPU driver on the remote, or rebuild the docker "
+                f"service with a PyTorch matching the driver, then "
+                f"resubmit the embedding job."
+            )
         return None
 
     from sklearn.decomposition import PCA

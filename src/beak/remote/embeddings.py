@@ -83,6 +83,24 @@ class ESMEmbeddings(RemoteJobManager):
             'flash_attn': True,
             'description': 'ESM-C (2024-12), 36 layers, 1152 dim',
         },
+
+        # ESM3 (EvolutionaryScale, 2024). Multimodal model trained on
+        # sequence + structure + function tokens; for beak's use case
+        # we ignore everything but the per-residue sequence embeddings
+        # (the `embeddings` field on the model output, same shape
+        # contract as ESM-C). Only the small `open-v1` variant has
+        # downloadable weights — medium (7B) and large (98B) are
+        # Forge-API only and would need a separate HTTP backend.
+        # vram_gb is at fp32 on Pascal; halve for bf16 on Ampere+.
+        'esm3_sm_open_v1': {
+            'name': 'ESM3 small (open)',
+            'family': 'esm3',
+            'params': '1.4B',
+            'vram_gb': 7.0,
+            'n_layers': 48, 'hidden_dim': 1536, 'n_heads': 24,
+            'flash_attn': True,
+            'description': 'ESM3-sm-open-v1 (2024), 48 layers, 1536 dim',
+        },
     }
 
     @classmethod
@@ -199,8 +217,32 @@ class ESMEmbeddings(RemoteJobManager):
                  key_path: Optional[str] = None,
                  remote_job_dir: Optional[str] = None, connection=None):
         super().__init__(host, user, key_path, remote_job_dir, connection)
+        # `_ensure_docker_service` runs `up -d --build`, which is slow
+        # (~3-5 min on first build, a few seconds on no-op rebuilds)
+        # and — critically — can fail when Docker is in a stale state.
+        # Triggering it in `__init__` meant any operation on this
+        # manager required a healthy Docker, including operations that
+        # don't touch Docker at all (cleanup is `rm -rf` over SSH;
+        # status reads `status.txt`; download is scp). When the build
+        # fails, cleanup fails too, which is exactly the wrong
+        # ordering — broken Docker should never block the user from
+        # tearing down a job's remote scratch dir.
+        #
+        # Defer the build to `submit()` (the only entry point that
+        # actually needs the container running). Other methods rely on
+        # the inherited base class machinery and don't import Docker.
         self._verify_docker()
+        self._docker_ready = False
+
+    def _ensure_docker_ready(self) -> None:
+        """Lazy wrapper — only build/start the service the first time
+        a Docker-dependent operation needs it. After the first call
+        within this manager's lifetime, subsequent calls short-circuit.
+        """
+        if self._docker_ready:
+            return
         self._ensure_docker_service()
+        self._docker_ready = True
 
     def _verify_docker(self):
         """Verify Docker is available on remote"""
@@ -273,16 +315,71 @@ class ESMEmbeddings(RemoteJobManager):
             gpus.append(row)
         return gpus
 
-    def _select_gpu(self, requested: int, model: str) -> int:
+    # Multiplicative safety factor on the *peak* VRAM estimate. Covers
+    # CUDA allocator fragmentation, driver state, and the few hundred
+    # MB of headroom torch wants for kernel launches. The previous
+    # factor was 2.0 against `vram_gb`, but `vram_gb` already includes
+    # a generous activation budget, so the effective requirement was
+    # ~4× the actual peak — too conservative for ESM3-sm-open-v1
+    # (advertised 7 GB at fp32) on an 11 GB Pascal card.
+    _VRAM_HEADROOM_FACTOR = 1.2
+
+    def _select_gpu(
+        self, requested: int, model: str,
+        input_file: Optional[str] = None,
+    ) -> int:
         """Resolve the GPU to use, honoring `requested` (an int or 'auto').
 
-        For an integer: check that the chosen GPU has at least 2× the
-        model's advertised VRAM footprint free, and abort with a helpful
-        message if not. For 'auto': pick the GPU with the most free
-        memory, printing the choice.
+        Computes the per-job VRAM requirement using
+        ``estimate_peak_vram_gb`` (length-aware + FA-aware) when an
+        input FASTA is available, falling back to the static
+        ``vram_gb`` from `AVAILABLE_MODELS` otherwise. A 1.2× safety
+        multiplier covers allocator fragmentation; the previous 2×
+        was double-counting since `vram_gb` already includes
+        activations.
+
+        For 'auto': pick the GPU with the most free memory, abort if
+        even that's insufficient. For an integer: check just that
+        GPU.
         """
-        vram_gb = self.AVAILABLE_MODELS[model]['vram_gb']
-        required_mb = int(vram_gb * 1024 * 2)  # 2× headroom for activations
+        info = self.AVAILABLE_MODELS[model]
+        # Compute max sequence length from the input fasta when we have
+        # one (the typical submit path). When called for a remote-input
+        # job (`source_job_id`) we don't have the file locally and fall
+        # back to a 1024-token assumption — that's the model's max
+        # context window so it's the right worst-case.
+        max_len = 1024
+        if input_file is not None:
+            try:
+                from pathlib import Path as _P
+                p = _P(input_file)
+                cur = 0
+                with open(p) as f:
+                    for line in f:
+                        if line.startswith(">"):
+                            if cur > max_len:
+                                max_len = cur
+                            cur = 0
+                        else:
+                            cur += len(line.rstrip())
+                    if cur > max_len:
+                        max_len = cur
+            except Exception:
+                # Couldn't parse the fasta — use the model's max
+                # context window as the safe upper bound.
+                max_len = 1024
+
+        # Length-aware peak. Assume FA available — the submit modal's
+        # estimator does the same and the submit path doesn't know the
+        # remote GPU's compute capability yet (would require another
+        # SSH probe). The 1.2× safety covers the gap on Pascal where
+        # FA isn't actually used.
+        peak_gb = self.estimate_peak_vram_gb(
+            model, max_len=max_len, flash_attn_available=True,
+        )
+        if peak_gb <= 0:
+            peak_gb = info.get('vram_gb', 1.0)
+        required_mb = int(peak_gb * 1024 * self._VRAM_HEADROOM_FACTOR)
 
         gpus = self.query_gpus()
         if not gpus:
@@ -297,7 +394,8 @@ class ESMEmbeddings(RemoteJobManager):
                 )
                 raise RuntimeError(
                     f"No GPU has >= {required_mb} MB free "
-                    f"(model {model} needs ~{vram_gb} GB, 2× headroom). "
+                    f"(model {model} needs ~{peak_gb:.1f} GB at L≤{max_len}, "
+                    f"{self._VRAM_HEADROOM_FACTOR:.1f}× safety). "
                     f"Current state: {summary}"
                 )
             print(
@@ -316,9 +414,10 @@ class ESMEmbeddings(RemoteJobManager):
         if match['free_mb'] < required_mb:
             raise RuntimeError(
                 f"GPU {idx} has only {match['free_mb']} MB free; "
-                f"model {model} needs ~{required_mb} MB (2× headroom for "
-                f"activations). Pass --gpu auto to pick the freest GPU, "
-                f"or wait for the current job to finish."
+                f"model {model} needs ~{required_mb} MB at L≤{max_len} "
+                f"({self._VRAM_HEADROOM_FACTOR:.1f}× safety). Pass --gpu auto "
+                f"to pick the freest GPU, or wait for the current job "
+                f"to finish."
             )
         return idx
 
@@ -385,9 +484,16 @@ class ESMEmbeddings(RemoteJobManager):
             available = ', '.join(self.AVAILABLE_MODELS.keys())
             raise ValueError(f"Unknown model '{model}'. Available: {available}")
 
+        # Build/start the embeddings container now — submit is the
+        # only entry point that actually executes inside it. Cleanup,
+        # status, list, download don't touch Docker so they don't
+        # trigger this; that's deliberate, so a broken Docker can't
+        # block the user from tearing down jobs or checking status.
+        self._ensure_docker_ready()
+
         # Resolve gpu_id — accepts int or 'auto'. Raises with an
         # actionable message if the chosen GPU is too busy.
-        gpu_id = self._select_gpu(gpu_id, model)
+        gpu_id = self._select_gpu(gpu_id, model, input_file=input_file)
 
         job_id = str(uuid.uuid4())[:8]
         if not job_name:
