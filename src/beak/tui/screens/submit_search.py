@@ -13,7 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select
+from textual.widgets import Button, Input, Label, Select, Static
 
 from ...project import BeakProject
 
@@ -28,6 +28,22 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
     """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    DEFAULT_CSS = """
+    /* Two-line blurb under the preset Select. Slightly indented and
+       given a left accent so it reads as derived metadata, not
+       another editable field. `height: auto` lets the second line
+       wrap onto a third without clipping at the modal's right edge
+       (which is what bit the previous single-line `Label`). */
+    SubmitSearchModal #preset-blurb {
+        height: auto;
+        margin-top: 0;
+        margin-bottom: 1;
+        padding: 0 1;
+        border-left: tall #2E86AB;
+        color: $text;
+    }
+    """
 
     def __init__(self, project: BeakProject) -> None:
         super().__init__()
@@ -70,6 +86,16 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
                 id="preset-select",
                 allow_blank=False,
             )
+            # Inline two-line blurb under the Select: tagline +
+            # ROC1/param chips so the user sees what each preset
+            # actually does (and the literature-derived ROC1 estimate
+            # it carries) without having to read the source. `Static`
+            # rather than `Label` because the blurb is multi-line.
+            yield Static(
+                self._preset_blurb("default"),
+                id="preset-blurb",
+                classes="preset-blurb",
+            )
             yield Label("Job name (optional)")
             yield Input(
                 placeholder=f"{self._project.name}_search_<auto>",
@@ -85,6 +111,57 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
         if self._submitting:
             return
         self.dismiss(None)
+
+    def _preset_blurb(self, preset: str) -> str:
+        """Two-line blurb under the preset Select.
+
+        Line 1 — tagline (the intent in 4–5 words).
+        Line 2 — ROC1 chip + the params that actually moved between
+                 presets, in chip form (`-s 7.5 · 2× iter · ≤5000 hits …`).
+                 Numbers reflect what `mgr.submit(...preset=...)` will
+                 actually pass to MMseqs2; the chips and the wire
+                 args can't drift apart.
+        """
+        from ...remote.search import MMseqsSearch
+        cfg = MMseqsSearch.PRESETS.get(preset, {})
+        if not cfg:
+            return ""
+        tagline = cfg.get("tagline") or cfg.get("description") or ""
+        params = cfg.get("params") or {}
+        roc1 = cfg.get("roc1")
+
+        chips = []
+        if roc1 is not None:
+            chips.append(f"[bold]ROC1 ≈ {roc1:.2f}[/bold]")
+        else:
+            chips.append("[bold]ROC1 —[/bold]")
+        if "s" in params:
+            chips.append(f"[dim]-s {params['s']}[/dim]")
+        n_iter = params.get("num_iterations", 1)
+        if n_iter > 1:
+            chips.append(f"[dim]{n_iter}× iter[/dim]")
+        if "max_seqs" in params:
+            chips.append(f"[dim]≤{params['max_seqs']} hits[/dim]")
+        if "min_seq_id" in params:
+            chips.append(
+                f"[dim]≥{int(round(params['min_seq_id'] * 100))}% id[/dim]"
+            )
+        if "c" in params:
+            chips.append(
+                f"[dim]≥{int(round(params['c'] * 100))}% cov[/dim]"
+            )
+        sep = " [dim]·[/dim] "
+        return f"{tagline}\n{sep.join(chips)}"
+
+    def on_select_changed(self, event) -> None:
+        if getattr(event.select, "id", None) != "preset-select":
+            return
+        try:
+            self.query_one("#preset-blurb", Static).update(
+                self._preset_blurb(str(event.value))
+            )
+        except Exception:
+            pass
 
     def on_input_changed(self, event: Input.Changed) -> None:
         # Live-validate the set name as the user types so the regex
@@ -137,8 +214,11 @@ class SubmitSearchModal(ModalScreen[Optional[str]]):
         try:
             from ...remote.search import MMseqsSearch
             mgr = MMseqsSearch()
+            # Always pass the preset — `default` now carries filters
+            # (max_seqs, coverage, min_seq_id) so skipping it on the
+            # default branch would silently drop them.
             kwargs = {"database": db, "job_name": job_name}
-            if preset and preset != "default":
+            if preset:
                 kwargs["preset"] = preset
             job_id = mgr.submit(str(self._project.target_sequence_path), **kwargs)
 

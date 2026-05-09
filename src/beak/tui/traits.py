@@ -50,7 +50,8 @@ def build_traits_table(project, force: bool = False) -> Optional[pd.DataFrame]:
     )
 
     try:
-        merged.to_parquet(cache, index=False)
+        from .taxonomy import atomic_to_parquet
+        atomic_to_parquet(merged, cache, index=False)
     except Exception:
         pass
     return merged

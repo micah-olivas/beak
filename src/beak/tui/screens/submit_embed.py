@@ -20,8 +20,17 @@ from ...project import BeakProject
 _DEFAULT_GPU_BUDGET_GB = 11.0
 
 
-class SubmitEmbedModal(ModalScreen[Optional[str]]):
-    """Pick model + output options for an ESM embedding job."""
+class SubmitEmbedModal(ModalScreen[Optional[dict]]):
+    """Pick model + output options for an ESM embedding job.
+
+    Dismisses with a params dict ``{"model", "layers", "job_name"}``
+    when the user clicks Submit, or ``None`` on Cancel. The actual
+    remote ``mgr.submit()`` call runs on the parent screen so the
+    modal can come down immediately — the first build of a fresh
+    container can take 3-5 minutes (downloading the cu12 base image,
+    layer rebuilds, ESMC-venv reinstall) and there's no point keeping
+    the user staring at a frozen modal while it completes.
+    """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -57,33 +66,71 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
     def compose(self) -> ComposeResult:
         from ...remote.embeddings import ESMEmbeddings
 
-        models = list(ESMEmbeddings.AVAILABLE_MODELS.keys())
+        # Sort: ESM-C family first (modern recommendation), then
+        # ESM-2 by parameter size ascending. Family is implicit in
+        # each model's `name` (`ESM-C-300M` / `ESM2-650M`), so a
+        # family-prefixed sort key keeps related entries adjacent.
+        def _params_int(m: str) -> int:
+            p = ESMEmbeddings.AVAILABLE_MODELS[m].get("params", "0")
+            # Strip the unit and convert M/B to multipliers so
+            # "650M" sorts above "150M" but below "1.5B".
+            try:
+                return int(float(p.rstrip("MmBb")) * (1_000 if p.upper().endswith("B") else 1))
+            except (TypeError, ValueError):
+                return 0
+
+        def _family_rank(m: str) -> int:
+            fam = ESMEmbeddings.AVAILABLE_MODELS[m].get("family", "")
+            return 0 if fam == "esmc" else 1
+
+        models = sorted(
+            ESMEmbeddings.AVAILABLE_MODELS.keys(),
+            key=lambda m: (_family_rank(m), _params_int(m)),
+        )
         default_model = "esm2_t33_650M_UR50D" if "esm2_t33_650M_UR50D" in models else models[0]
+
+        # Compose tabular labels: name padded to a uniform width,
+        # then hidden-dim and VRAM estimate aligned in their own
+        # columns. Looks like:
+        #     ESM-C-300M    960d   1.5 GB
+        #     ESM-C-600M   1152d   2.5 GB
+        #     ESM2-8M       320d   0.1 GB
+        # The right-aligned numbers make scanning by size trivial,
+        # the left-aligned name keeps families grouped visually.
+        name_w = max(
+            len(ESMEmbeddings.AVAILABLE_MODELS[m].get("name", m))
+            for m in models
+        )
+        options = []
+        for m in models:
+            info = ESMEmbeddings.AVAILABLE_MODELS[m]
+            name = info.get("name", m).ljust(name_w)
+            dim = f"{info.get('hidden_dim', '?'):>4}d"
+            vram = f"{info.get('vram_gb', 0):>3.1f} GB"
+            label = f"{name}  [dim]·[/dim] {dim}  [dim]·[/dim] {vram}"
+            options.append((label, m))
 
         with Vertical(id="modal-body"):
             yield Label(
                 f"[bold]Submit ESM embeddings · {self._project.name}[/bold]",
                 id="modal-title",
             )
-            yield Label("[dim]Runs on the configured remote GPU[/dim]")
-            yield Label("")
-
             yield Label("Model")
             yield Select(
-                [(m, m) for m in models],
+                options,
                 value=default_model,
                 id="model-select",
                 allow_blank=False,
             )
-            # Inline panel: "7,241 sequences · longest 1,532 aa · …"
-            # Filled in by background workers after mount; updated when
-            # the user changes models.
-            yield Label("[dim]Loading set stats…[/dim]", id="set-stats")
-            # Hardware summary row — surfaces the actual remote GPUs
-            # and their FlashAttention capability so users on diverse
-            # hardware (Pascal lab servers vs Hopper rented boxes)
-            # see warnings calibrated to *their* setup.
-            yield Label("[dim]Probing remote GPU…[/dim]", id="gpu-info")
+            # Two compact info rows below the dropdown:
+            #   1. Context — set size + hardware in one line
+            #      (e.g. "6 seqs · max 576 aa · 2× 1080 Ti · 11 GB · no FA")
+            #   2. Verdict — color-coded VRAM estimate + attention regime
+            #      (e.g. "Est. 3.1 / 11 GB · comfortable · O(L²)")
+            # Background workers fill in the worker-dependent bits as
+            # they complete; the verdict line re-renders whenever the
+            # model selection changes.
+            yield Label("[dim]Loading…[/dim]", id="context-line")
             yield Label("", id="vram-estimate")
             yield Label("Layer (e.g. -1 for last; comma-sep for multiple)")
             yield Input(value="-1", id="layer-input")
@@ -152,26 +199,107 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
 
     def _set_stats_unavailable(self, msg: str) -> None:
         try:
-            self.query_one("#set-stats", Label).update(f"[red]{msg}[/red]")
+            self.query_one("#context-line", Label).update(f"[red]{msg}[/red]")
         except Exception:
             pass
 
     def _render_set_stats(self) -> None:
-        if self._n_seqs is None:
-            return
-        parts = [
-            f"[bold]{self._n_seqs:,}[/bold] sequences",
-            f"longest [bold]{self._max_len:,} aa[/bold]",
-            f"p90 {self._p90_len:,} aa",
-        ]
-        if self._n_long:
-            parts.append(
-                f"[yellow]{self._n_long:,} over 1,500 aa[/yellow]"
-            )
+        # Set-stats trigger a context-line render; GPU-info trigger
+        # also calls this. Both pieces fill in independently as their
+        # workers finish, so this method is idempotent and uses
+        # whatever's available at call time.
+        self._render_context_line()
+
+    @staticmethod
+    def _compact_gpu_name(name: str) -> str:
+        """Short-form GPU name for a 64-cell modal.
+
+        `nvidia-smi` returns names like "NVIDIA GeForce GTX 1080 Ti"
+        and "NVIDIA A100-SXM4-40GB"; the brand prefix and SKU suffix
+        chew up modal width and don't help the user identify the
+        card. Strip the noise to "1080 Ti", "A100", "RTX 3090", "H100".
+        """
+        if not name:
+            return "?"
+        # Drop the brand prefixes.
+        n = name
+        for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce ", "Tesla "):
+            if n.startswith(prefix):
+                n = n[len(prefix):]
+        # Strip GTX prefix (1080 Ti is unambiguously a Pascal card;
+        # users don't need GTX vs RTX disambiguation if they can read
+        # the model number).
+        if n.startswith("GTX "):
+            n = n[len("GTX "):]
+        # SKU suffix on datacenter cards: "A100-SXM4-40GB" → "A100".
+        # Keep the model letters + first numeric chunk only.
+        for sep in ("-",):
+            if sep in n:
+                n = n.split(sep, 1)[0]
+        # Strip "80GB HBM3" tail on H100 etc.
+        n = n.split(" ")
+        out = []
+        for tok in n:
+            if tok.upper().endswith("GB") or tok.upper() in ("HBM3", "HBM2", "HBM2E", "PCIE"):
+                continue
+            out.append(tok)
+        return " ".join(out).strip() or name
+
+    def _render_context_line(self) -> None:
+        """Single-line summary: set size + hardware.
+
+        Renders best-effort with whatever workers have completed:
+        - Both done:    "6 seqs · max 576 aa · 2× 1080 Ti · 11 GB · no FA"
+        - Set only:     "6 seqs · max 576 aa · [dim]Probing GPU…[/dim]"
+        - GPU only:     "[dim]Loading set…[/dim] · 2× 1080 Ti · 11 GB · no FA"
+        - Neither:      "[dim]Loading…[/dim]"
+        """
         try:
-            self.query_one("#set-stats", Label).update(" · ".join(parts))
+            label = self.query_one("#context-line", Label)
         except Exception:
-            pass
+            return
+
+        # ---- Set part ----
+        if self._n_seqs is None:
+            set_part = "[dim]Loading set…[/dim]"
+        else:
+            set_part = (
+                f"[bold]{self._n_seqs:,}[/bold] seqs · "
+                f"max [bold]{self._max_len:,} aa[/bold]"
+            )
+
+        # ---- GPU part ----
+        if not self._gpus_queried:
+            gpu_part = "[dim]Probing GPU…[/dim]"
+        elif not self._gpus:
+            gpu_part = (
+                "[red]CPU only[/red] [dim](embeddings will be slow)[/dim]"
+            )
+        else:
+            # Group homogeneous cards: "2× 1080 Ti", or "1× A100 + 1× 3090"
+            # if mixed. Drop the per-group SM tag from this row — it
+            # lives on the verdict line via the attention regime.
+            by_kind: dict[str, list[dict]] = {}
+            for g in self._gpus:
+                key = self._compact_gpu_name(g.get("name", "?"))
+                by_kind.setdefault(key, []).append(g)
+            kind_chunks = []
+            for short, items in by_kind.items():
+                count = len(items)
+                kind_chunks.append(
+                    f"{count}× {short}" if count > 1 else short
+                )
+            mem_gb = min(g.get("total_mb", 0) for g in self._gpus) / 1024.0
+            fa_tag = (
+                "[green]FA[/green]" if self._flash_attn_supported
+                else "[yellow]no FA[/yellow]"
+            )
+            gpu_part = (
+                f"[bold]{' + '.join(kind_chunks)}[/bold] · "
+                f"{mem_gb:.0f} GB · {fa_tag}"
+            )
+
+        label.update(f"{set_part}  ·  {gpu_part}")
 
     @work(thread=True, exclusive=True, group="embed-gpu-query")
     def _query_gpu_budget(self) -> None:
@@ -223,51 +351,9 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
         self.app.call_from_thread(self._refresh_estimate)
 
     def _render_gpu_info(self) -> None:
-        """One-line summary of the remote GPU pool.
-
-        Examples:
-            2× GeForce GTX 1080 Ti · 11 GB · SM 6.1 · no FlashAttention
-            1× NVIDIA H100 80GB HBM3 · 80 GB · SM 9.0 · FlashAttention
-            CPU only — no NVIDIA GPU detected (embeddings will be slow)
-        """
-        try:
-            label = self.query_one("#gpu-info", Label)
-        except Exception:
-            return
-        if not self._gpus:
-            label.update(
-                "[red]CPU only[/red] — no NVIDIA GPU detected on remote. "
-                "[dim]Embeddings will run on CPU, which is 10-100× "
-                "slower than a modest GPU.[/dim]"
-            )
-            return
-
-        # Group by (name, compute_cap) so 2× 1080 Ti collapses to a
-        # single row but a mixed-card box (1× A100 + 1× 3090) shows
-        # both. Common case (homogeneous pool) reads cleanly; the
-        # less common case still tells the truth.
-        by_kind: dict[tuple[str, str], list[dict]] = {}
-        for g in self._gpus:
-            key = (g.get("name", "?"), g.get("compute_cap", ""))
-            by_kind.setdefault(key, []).append(g)
-
-        parts = []
-        for (name, cc), items in by_kind.items():
-            count = len(items)
-            mem_gb = items[0].get("total_mb", 0) / 1024.0
-            cc_tag = f" · SM {cc}" if cc else ""
-            count_tag = f"{count}× " if count > 1 else ""
-            parts.append(
-                f"[bold]{count_tag}{name}[/bold] · "
-                f"{mem_gb:.0f} GB{cc_tag}"
-            )
-        head = "  +  ".join(parts)
-        fa_tag = (
-            "[green]FlashAttention[/green]"
-            if self._flash_attn_supported
-            else "[yellow]no FlashAttention[/yellow]"
-        )
-        label.update(f"{head} · {fa_tag}")
+        """Back-compat shim — both workers funnel through the merged
+        context-line renderer now."""
+        self._render_context_line()
 
     def _refresh_estimate(self) -> None:
         """Recompute and re-render the VRAM estimate label.
@@ -301,59 +387,44 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
         # the docker container's working set, and the allocator's
         # fragmentation. So 80% peak ≈ "expect OOM".
         if ratio >= 0.85:
-            color, verdict = "red", "[bold]likely OOM[/bold]"
+            color, verdict = "red", "likely OOM"
         elif ratio >= 0.55:
-            color, verdict = "yellow", "tight — risk on the longest sequences"
+            color, verdict = "yellow", "tight"
         else:
             color, verdict = "green", "comfortable"
 
-        gpu_tag = f" on {self._gpu_name}" if self._gpu_name else ""
-        # Distinguish "model has FA code path" from "hardware can run
-        # FA" — Pascal cards request FA via SDPA but get math-backend
-        # at runtime, so calling it FlashAttention in the modal would
-        # be misleading.
+        # Attention regime as a short tag — the GPU/FA detail is on
+        # the context line above, so we just need the complexity tag
+        # here. "PyTorch math (O(L²))" when ESM-C wants FA but the
+        # hardware doesn't have it, because that's the surprising
+        # case worth calling out.
         wants_flash = info.get("flash_attn", False)
         gets_flash = wants_flash and self._flash_attn_supported
         if gets_flash:
-            attn_label = "FlashAttention (O(L))"
+            attn_label = "O(L) FlashAttention"
         elif wants_flash and not self._flash_attn_supported:
-            attn_label = (
-                "PyTorch math attention (O(L²)) — "
-                "FA disabled; GPU is pre-Ampere"
-            )
+            attn_label = "O(L²) — FA unavailable on this GPU"
         else:
-            attn_label = "PyTorch attention (O(L²))"
+            attn_label = "O(L²)"
+
+        # Single line: "[color]Est. 3.1 / 11 GB · comfortable[/color] [dim]· O(L²)[/dim]"
         msg = (
-            f"[{color}]Est. peak VRAM @ longest seq:[/{color}] "
-            f"[bold]{peak_gb:.1f} GB[/bold] / {budget:.0f} GB{gpu_tag} "
-            f"— {verdict}\n"
-            f"[dim]{attn_label} · model {info['name']}[/dim]"
+            f"[{color}]Est. {peak_gb:.1f} / {budget:.0f} GB · "
+            f"{verdict}[/{color}]  [dim]· {attn_label}[/dim]"
         )
 
+        # Optional one-line tip when the verdict is bad.
         if ratio >= 0.55:
-            # When neither family can use FA on this hardware, ESM-C
-            # is no longer the magic escape from quadratic scaling —
-            # it's just a smaller model. Tailor the tip accordingly.
             family = info.get("family")
+            tip = ""
             if family == "esm2" and self._flash_attn_supported:
-                msg += (
-                    "\n[dim]Tip: ESM-C uses FlashAttention and stays "
-                    "linear in length — it'll fit where ESM-2 won't.[/dim]"
-                )
+                tip = "Try ESM-C — it stays linear with FlashAttention."
             elif family == "esm2" and not self._flash_attn_supported:
-                msg += (
-                    "\n[dim]Tip: ESM-C-300M is smaller (and a stronger "
-                    "model per parameter) — consider it. Both families "
-                    "are quadratic on pre-Ampere GPUs, so longest-seq "
-                    "headroom comes mostly from picking a smaller "
-                    "model or filtering long outliers.[/dim]"
-                )
+                tip = "Try ESM-C-300M — smaller, and stronger per parameter."
             elif self._max_len and self._max_len > 1500:
-                msg += (
-                    "\n[dim]Filter long outliers from the homologs "
-                    "panel — most of the cost is from the tail of "
-                    "the length distribution.[/dim]"
-                )
+                tip = "Filter long outliers from the homologs panel."
+            if tip:
+                msg += f"\n[dim]{tip}[/dim]"
         label.update(msg)
 
     def action_cancel(self) -> None:
@@ -367,15 +438,19 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
         elif event.button.id == "submit-btn" and not self._submitting:
             self._do_submit()
 
-    @work(thread=True, exclusive=True, group="embed-submit")
     def _do_submit(self) -> None:
+        """Validate params on the UI thread, then dismiss with the
+        params dict. The parent screen runs the actual ``mgr.submit()``
+        in its own worker so the modal isn't blocking the user during
+        what can be a 3-5 minute first-time container build.
+        """
         model = str(self.query_one("#model-select", Select).value)
         layers_str = self.query_one("#layer-input", Input).value.strip() or "-1"
         try:
             layers = [int(x) for x in layers_str.split(",") if x.strip()]
         except ValueError:
-            self.app.call_from_thread(
-                self._set_status, "[red]Layer must be int(s) — e.g. -1 or 30,33[/red]"
+            self._set_status(
+                "[red]Layer must be int(s) — e.g. -1 or 30,33[/red]"
             )
             return
         job_name = self.query_one("#job-name", Input).value.strip()
@@ -384,48 +459,20 @@ class SubmitEmbedModal(ModalScreen[Optional[str]]):
 
         hits_fasta = self._project.active_homologs_dir() / "sequences.fasta"
         if not hits_fasta.exists():
-            self.app.call_from_thread(
-                self._set_status,
-                "[red]No hits.fasta — run a search first.[/red]",
+            self._set_status(
+                "[red]No hits.fasta — run a search first.[/red]"
             )
             return
 
-        self._submitting = True
-        self.app.call_from_thread(
-            self._set_status, "[dim]Submitting (a few seconds)…[/dim]"
-        )
-
-        mgr = None
-        try:
-            from ...remote.embeddings import ESMEmbeddings
-            mgr = ESMEmbeddings()
-            job_id = mgr.submit(
-                str(hits_fasta),
-                model=model,
-                job_name=job_name,
-                repr_layers=layers,
-            )
-            # Stamp the job onto the active homolog set's embedding
-            # entry — multi-set support means every embedding is keyed
-            # to the set it was computed against.
-            self._project.update_active_embeddings_set(
-                model=model,
-                remote={"job_id": job_id},
-            )
-        except Exception as e:  # noqa: BLE001
-            self.app.call_from_thread(
-                self._set_status, f"[red]{type(e).__name__}: {e}[/red]"
-            )
-            self._submitting = False
-            return
-        finally:
-            try:
-                if mgr is not None and getattr(mgr, "conn", None) is not None:
-                    mgr.conn.close()
-            except Exception:
-                pass
-
-        self.app.call_from_thread(self.dismiss, job_id)
+        # Hand the validated params to the parent screen and bail
+        # immediately. The parent runs the slow remote submit in its
+        # own worker and surfaces success / error via toast.
+        self.dismiss({
+            "model": model,
+            "layers": layers,
+            "job_name": job_name,
+            "hits_fasta": str(hits_fasta),
+        })
 
     def _set_status(self, msg: str) -> None:
         self.query_one("#status-line", Label).update(msg)

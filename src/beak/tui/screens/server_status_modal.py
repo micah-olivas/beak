@@ -213,46 +213,73 @@ class ServerStatusModal(ModalScreen[None]):
 
     @staticmethod
     def _render_host(s: str) -> str:
-        load1 = load5 = load15 = "?"
-        cores = "?"
-        mem_used = mem_total = None
+        """Host load + memory as colored bars instead of plain text.
+
+        Load is plotted relative to core count (`load / cores`) — the
+        canonical "is the box overcommitted" ratio. Three rows so the
+        1/5/15-minute trend is visible at a glance: a high 1-minute
+        with a low 15-minute means the load just spiked, not a
+        long-term saturation.
+        """
+        load1 = load5 = load15 = None
+        cores: Optional[int] = None
+        mem_used: Optional[int] = None
+        mem_total: Optional[int] = None
         uptime = ""
 
         for line in s.splitlines():
             line = line.strip()
             if not line:
                 continue
-            # `cat /proc/loadavg` prints e.g. "0.42 0.31 0.28 1/123 4567"
             parts = line.split()
             if len(parts) >= 3 and all(_is_floaty(p) for p in parts[:3]) \
                     and not line.startswith("cores ") \
                     and not line.startswith("mem_mb "):
-                load1, load5, load15 = parts[0], parts[1], parts[2]
+                try:
+                    load1, load5, load15 = (
+                        float(parts[0]), float(parts[1]), float(parts[2])
+                    )
+                except ValueError:
+                    pass
             elif line.startswith("cores "):
-                cores = line.split(None, 1)[1]
+                tail = line.split(None, 1)[1]
+                if tail.isdigit():
+                    cores = int(tail)
             elif line.startswith("mem_mb "):
                 bits = line.split()
-                if len(bits) >= 3:
-                    mem_used, mem_total = bits[1], bits[2]
+                if len(bits) >= 3 and bits[1].isdigit() and bits[2].isdigit():
+                    mem_used, mem_total = int(bits[1]), int(bits[2])
             elif line.startswith("up "):
                 uptime = line
 
-        rows = [
-            "[bold]Host[/bold]",
-            f"  load   {load1} / {load5} / {load15}   "
-            f"[dim]({cores} cores)[/dim]",
-        ]
-        if mem_used and mem_total:
-            try:
-                used_gb = int(mem_used) / 1024
-                total_gb = int(mem_total) / 1024
-                pct = (int(mem_used) / max(int(mem_total), 1)) * 100
+        rows = ["[bold]Host[/bold]"]
+        if load1 is not None and cores:
+            rows.append(
+                f"  [dim]load · {cores} cores · "
+                f"bar = load ÷ cores[/dim]"
+            )
+            for label, lv in (("1m ", load1), ("5m ", load5), ("15m", load15)):
+                if lv is None:
+                    continue
+                ratio = lv / max(cores, 1)
                 rows.append(
-                    f"  memory {used_gb:.1f} / {total_gb:.1f} GB   "
-                    f"[dim]({pct:.0f}%)[/dim]"
+                    f"  {label}   {_bar_colored(ratio, _BAR_W)}  "
+                    f"[bold]{lv:5.2f}[/bold]"
                 )
-            except (TypeError, ValueError):
-                pass
+        elif load1 is not None:
+            rows.append(
+                f"  load   {load1:.2f} / {load5 or 0:.2f} / "
+                f"{load15 or 0:.2f}   [dim](cores unknown)[/dim]"
+            )
+        if mem_used is not None and mem_total:
+            used_gb = mem_used / 1024
+            total_gb = mem_total / 1024
+            ratio = mem_used / max(mem_total, 1)
+            rows.append(
+                f"  mem    {_bar_colored(ratio, _BAR_W)}  "
+                f"[bold]{used_gb:5.1f}[/bold] / {total_gb:.1f} GiB  "
+                f"[dim]({ratio * 100:.0f}%)[/dim]"
+            )
         if uptime:
             rows.append(f"  [dim]{uptime}[/dim]")
         return "\n".join(rows)
@@ -261,8 +288,10 @@ class ServerStatusModal(ModalScreen[None]):
     def _render_gpu(s: str) -> str:
         if not s.strip():
             return ""
-        rows = ["[bold]GPUs[/bold]"]
-        # csv: index, name, utilization, mem_used, mem_total
+        rows = [
+            "[bold]GPUs[/bold]",
+            "  [dim]util / mem (GiB)[/dim]",
+        ]
         for line in s.splitlines():
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 5:
@@ -274,19 +303,21 @@ class ServerStatusModal(ModalScreen[None]):
                 mem_total = int(parts[4])
             except ValueError:
                 continue
-            name = parts[1]
-            mem_pct = (mem_used / max(mem_total, 1)) * 100
-            color = (
-                "green" if util < 25
-                else "yellow" if util < 75
-                else "red"
-            )
-            bar = _bar(util / 100, 12)
+            name = _compact_gpu_name(parts[1])
+            mem_pct = mem_used / max(mem_total, 1)
+            # Two narrower bars side-by-side beats one wide bar +
+            # a separate mem row. Width 12 each fits the modal's
+            # 96 cells once the rest of the row is in (index, name,
+            # labels, percentages, mem readout in GiB).
+            util_bar = _bar_colored(util / 100, 12)
+            mem_bar = _bar_colored(mem_pct, 12)
+            mem_used_gib = mem_used / 1024.0
+            mem_total_gib = mem_total / 1024.0
             rows.append(
-                f"  [bold]{idx}[/bold] {name[:24]:<24}  "
-                f"[{color}]{bar}[/{color}]  "
-                f"[bold]{util:>3}%[/bold]   "
-                f"[dim]{mem_used:>5}/{mem_total} MiB ({mem_pct:.0f}%)[/dim]"
+                f"  [bold]{idx}[/bold]  {name:<14}"
+                f"  [dim]util[/dim] {util_bar} [bold]{util:>3}%[/bold]"
+                f"  [dim]mem[/dim] {mem_bar} "
+                f"[bold]{mem_used_gib:4.1f}[/bold]/{mem_total_gib:.0f} GiB"
             )
         return "\n".join(rows)
 
@@ -294,34 +325,45 @@ class ServerStatusModal(ModalScreen[None]):
     def _render_procs(s: str) -> str:
         if not s.strip():
             return "[bold]Processes[/bold]\n  [dim]none[/dim]"
-        lines = s.splitlines()
-        # First line is the ps header from `awk 'NR==1 || ...'`. Strip
-        # it and re-emit our own header in a more compact form.
-        header_skipped = False
-        rows = ["[bold]Processes[/bold]"]
-        rows.append(
-            "  [dim]" + f"{'PID':>7} {'USER':<14} {'CPU':>5} "
-            f"{'MEM':>5} {'TIME':>10}  COMMAND" + "[/dim]"
-        )
-        proc_count = 0
-        for line in lines:
+        # Parse rows out of `ps` output, sort by CPU% desc, show a
+        # per-process CPU bar so the top burner-on-the-box is obvious.
+        parsed: List[tuple] = []
+        for line in s.splitlines():
             line = line.strip()
             if not line:
                 continue
-            if not header_skipped and line.upper().startswith("PID"):
-                header_skipped = True
+            if line.upper().startswith("PID"):
                 continue
             parts = line.split(None, 5)
             if len(parts) < 6:
                 continue
             pid, user, cpu, mem, etime, comm = parts
+            try:
+                cpu_f = float(cpu)
+                mem_f = float(mem)
+            except ValueError:
+                continue
+            parsed.append((cpu_f, mem_f, pid, user, etime, comm))
+
+        parsed.sort(reverse=True)
+        parsed = parsed[:10]
+        if not parsed:
+            return "[bold]Processes[/bold]\n  [dim]none[/dim]"
+
+        rows = [
+            "[bold]Processes[/bold]  "
+            "[dim](top by CPU% — beak compute tools)[/dim]",
+        ]
+        for cpu_f, mem_f, pid, user, etime, comm in parsed:
+            # CPU% can exceed 100 on multi-thread processes; cap the
+            # bar at 100% but show the real number on the right.
+            bar = _bar_colored(min(cpu_f, 100.0) / 100.0, _BAR_W)
             rows.append(
-                f"  {pid:>7} {user[:14]:<14} {cpu:>5} {mem:>5} "
-                f"{etime:>10}  {comm}"
+                f"  {bar}  [bold]{cpu_f:>5.1f}%[/bold]  "
+                f"{comm[:14]:<14}  "
+                f"[dim]pid {pid:>6}  {user[:10]:<10}  "
+                f"mem {mem_f:>4.1f}%  up {etime}[/dim]"
             )
-            proc_count += 1
-        if proc_count == 0:
-            rows.append("  [dim]none[/dim]")
         return "\n".join(rows)
 
     @staticmethod
@@ -360,3 +402,59 @@ def _bar(frac: float, width: int) -> str:
     frac = max(0.0, min(1.0, frac))
     filled = int(round(frac * width))
     return "█" * filled + "░" * (width - filled)
+
+
+# Shared bar width across host/GPU/process panes so the columns of
+# numbers right of every bar line up in one visual ruler down the
+# modal — hugely helpful for "is this thing maxed?" at a glance.
+_BAR_W = 18
+
+
+def _compact_gpu_name(name: str) -> str:
+    """Strip vendor / brand boilerplate from an `nvidia-smi --query`
+    GPU name so it fits the status modal's per-GPU row.
+
+    "NVIDIA GeForce GTX 1080 Ti" → "GTX 1080 Ti"
+    "NVIDIA A100-SXM4-40GB"      → "A100"
+    "NVIDIA H100 80GB HBM3"      → "H100"
+
+    Mirrors the `_compact_gpu_name` helper in the submit-embed modal
+    — both panes want the same readable form.
+    """
+    if not name:
+        return "?"
+    n = name
+    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "GeForce ", "Tesla "):
+        if n.startswith(prefix):
+            n = n[len(prefix):]
+            break
+    # Datacenter SKUs encode product + interconnect + memory
+    # ("A100-SXM4-40GB"). Keep just the product up to the first dash.
+    if "-" in n:
+        n = n.split("-", 1)[0]
+    # Trim trailing "80GB", "HBM3" tokens.
+    out_tokens = []
+    for tok in n.split(" "):
+        u = tok.upper()
+        if u.endswith("GB") or u in ("HBM2", "HBM2E", "HBM3", "PCIE"):
+            continue
+        out_tokens.append(tok)
+    return " ".join(out_tokens).strip() or name
+
+
+def _bar_colored(frac: float, width: int = _BAR_W) -> str:
+    """Block-drawing bar with the canonical green/yellow/red ramp.
+
+    The thresholds match the top-right pill: <50% green (idle / safe),
+    <85% yellow (loaded but room), ≥85% red (saturated). Same scheme
+    everywhere keeps the modal legible without a legend.
+    """
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    bar = "█" * filled + "░" * (width - filled)
+    color = (
+        "green" if frac < 0.5
+        else "yellow" if frac < 0.85
+        else "red"
+    )
+    return f"[{color}]{bar}[/{color}]"

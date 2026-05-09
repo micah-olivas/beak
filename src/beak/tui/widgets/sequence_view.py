@@ -18,7 +18,6 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from ...project import BeakProject
-from .colorbar import Colorbar
 
 
 _SS_COLORS = {
@@ -64,8 +63,6 @@ class SequenceView(Vertical):
         padding-right: 1;
         dock: bottom;
     }
-    /* Scope to specific IDs so the Colorbar (a Static subclass) keeps its
-       own width: 42 from DEFAULT_CSS rather than getting clobbered. */
     SequenceView #seq-ss-key,
     SequenceView #seq-domains-key { width: auto; padding-right: 2; }
     SequenceView #seq-spacer { width: 1fr; padding: 0; }
@@ -92,6 +89,10 @@ class SequenceView(Vertical):
             (project.manifest().get("view") or {}).get("color_mode", "plddt")
         )
         self._midpoint: float = 50.0
+        # Source label of the loaded structure ("AlphaFold" or "PDB ...").
+        # Drives the pLDDT → B-factor swap mirrored from StructureView so
+        # the bottom-panel legend matches what's painted on the ribbon.
+        self._source_label: str = "AlphaFold"
         # Domain bars and the SS track are both off on first project view —
         # they tile vertically below the sequence and crowd the layout
         # before the user has decided what they care about. Once a user
@@ -106,18 +107,16 @@ class SequenceView(Vertical):
             yield _SequenceBody(self, id="seq-body")
         with Horizontal(id="seq-footer"):
             # SS key pinned to the left; spacer pushes the rest right.
+            # The colorbar gradient lives on the panel's bottom border
+            # (via `border_subtitle`), matching the structure pane.
             yield Static("", id="seq-ss-key")
             yield Static("", id="seq-spacer")
             yield Static("", id="seq-domains-key")
-            yield Colorbar(id="seq-colorbar")
 
     def on_mount(self) -> None:
-        # Sync the inline colorbar to the persisted mode before any data
-        # loads, so the gradient + label match the dropdown immediately.
-        try:
-            self.query_one("#seq-colorbar", Colorbar).set_mode(self._color_mode)
-        except Exception:
-            pass
+        # Paint the border legend before any data loads so the gradient
+        # is visible immediately on first render.
+        self._refresh_subtitle()
         self._load()
         self._auto_pfam()
 
@@ -157,15 +156,13 @@ class SequenceView(Vertical):
         if mode == "pfam" and (self._pfam_idx is None or not self._domains):
             return False
         self._color_mode = mode
-        try:
-            self.query_one("#seq-colorbar", Colorbar).set_mode(mode)
-        except Exception:
-            pass
+        self._refresh_subtitle()
         self._refresh_view()
         return True
 
     def set_midpoint(self, midpoint: float) -> None:
         self._midpoint = midpoint
+        self._refresh_subtitle()
         self._refresh_view()
 
     def _scalar_for_mode(self):
@@ -179,10 +176,19 @@ class SequenceView(Vertical):
             return self._pfam_idx
         return self._plddt
 
-    def on_colorbar_midpoint_changed(self, message: Colorbar.MidpointChanged) -> None:
-        self._midpoint = message.midpoint
-        self._refresh_view()
-        # Let the screen forward this to the structure view too.
+    def _effective_mode(self) -> str:
+        """Resolve the user-facing mode to the physical quantity rendered.
+
+        Mirrors `StructureView._effective_mode` so the bottom-panel
+        sequence colors and legend match the ribbon overhead. The
+        dropdown's `pLDDT` entry shows AlphaFold confidence (0–100)
+        when an AF model is loaded but B-factor (Å², 0–50) when a PDB
+        experimental structure is loaded — both live in the cif's
+        b_iso column but use opposite gradients.
+        """
+        if self._color_mode == "plddt" and self._source_label.startswith("PDB"):
+            return "bfactor"
+        return self._color_mode
 
     def toggle_domains(self) -> bool:
         if not self._domains:
@@ -244,15 +250,13 @@ class SequenceView(Vertical):
         try:
             ss_legend = self._ss_legend() if (self._show_ss and self._ss) else ""
             self.query_one("#seq-ss-key", Static).update(ss_legend)
-            cb = self.query_one("#seq-colorbar", Colorbar)
-            cb.set_midpoint(self._midpoint)
-            # Pfam coloring is categorical, so the gradient bar would
-            # be misleading — hide it and let the domain chip legend
-            # do the talking.
-            cb.display = self._color_mode != "pfam"
             self.query_one("#seq-domains-key", Static).update(self._domains_legend())
         except Exception:
             pass
+        # Border legend tracks midpoint + mode; refresh on every view
+        # update so conservation midpoint changes show up in the corner
+        # without waiting for the next mode toggle.
+        self._refresh_subtitle()
 
     def toggle_ss(self) -> bool:
         if not self._ss:
@@ -317,17 +321,34 @@ class SequenceView(Vertical):
 
         target = self._project.manifest().get("target", {}) or {}
         uniprot = target.get("uniprot_id")
+        # Prefer cached PDB over AlphaFold for the same target. Both
+        # carry per-CA B-factor (pLDDT for AF; crystallographic B for
+        # PDB) and per-residue SASA, so the same scalar wires work.
+        # Honor the per-project preferred structure so the source label
+        # tracks whichever cif the StructureView is actually rendering.
+        from ..structure import _cached_structure
+        cif_path = None
+        source_label = "AlphaFold"
         if uniprot:
-            cif_path = self._project.path / "structures" / f"{uniprot}_AF.cif"
-            if cif_path.exists():
-                try:
-                    from ..structure import load_ca_coords, parse_secondary_structure
-                    _, p = load_ca_coords(cif_path)
-                    if len(p) == len(sequence):
-                        plddt = p
-                    ss = parse_secondary_structure(cif_path, len(sequence))
-                except Exception:
-                    pass
+            preferred = (
+                (self._project.manifest().get("view") or {})
+                .get("preferred_structure")
+            )
+            cached = _cached_structure(
+                uniprot, self._project.path / "structures",
+                preferred=preferred,
+            )
+            if cached is not None:
+                cif_path, source_label = cached
+        if cif_path is not None:
+            try:
+                from ..structure import load_ca_coords, parse_secondary_structure
+                _, p = load_ca_coords(cif_path)
+                if len(p) == len(sequence):
+                    plddt = p
+                ss = parse_secondary_structure(cif_path, len(sequence))
+            except Exception:
+                pass
 
         manifest = self._project.manifest()
         domains = (manifest.get("domains") or {}).get("hits") or []
@@ -340,18 +361,16 @@ class SequenceView(Vertical):
         except Exception:
             pass
 
-        # SASA from the cached CIF if available.
+        # SASA from the same cached structure (whichever source it was).
         sasa = None
-        if uniprot:
-            cif_path = self._project.path / "structures" / f"{uniprot}_AF.cif"
-            if cif_path.exists():
-                try:
-                    from ..structure import load_sasa
-                    s = load_sasa(cif_path, len(sequence))
-                    if s is not None and len(s) == len(sequence):
-                        sasa = s
-                except Exception:
-                    pass
+        if cif_path is not None:
+            try:
+                from ..structure import load_sasa
+                s = load_sasa(cif_path, len(sequence))
+                if s is not None and len(s) == len(sequence):
+                    sasa = s
+            except Exception:
+                pass
 
         self._sequence = sequence
         self._plddt = plddt
@@ -360,58 +379,100 @@ class SequenceView(Vertical):
         self._ss = ss
         self._domains = list(domains)
         self._pfam_idx = self._compute_pfam_idx()
+        self._source_label = source_label
         self.app.call_from_thread(self._refresh_view)
 
     # ---- rendering (called by inner _SequenceBody.render) ----
 
-    def _render_body(self, width: int) -> str:
+    def _render_body(self, width: int):
+        """Build the wrapped sequence body as a Rich `Text`.
+
+        Returns a `rich.text.Text` rather than a markup string so the
+        compositor doesn't pass ~thousands of `[#hex]X[/]` tags through
+        Textual's regex-based markup tokenizer on every paint — the
+        same fix applied to `tui/structure.py::render_structure` after
+        a tokenizer hang froze the UI. Pre-styled segments are O(n) to
+        emit and skip the tokenizer entirely.
+        """
         if not self._sequence:
             return self._status
 
+        from rich.style import Style
+        from rich.text import Text
         from ..structure import color_for_mode
 
         if width < 20:
-            return ""
+            return Text("")
         block_w = max(20, width - 14)
 
         n = len(self._sequence)
         ss = self._ss if self._ss else ' ' * n
+        scalar = self._scalar_for_mode()
+        eff_mode = self._effective_mode()
 
-        lines = []
+        out = Text()
+        first_block = True
         for start in range(0, n, block_w):
             end = min(start + block_w, n)
             seq_chunk = self._sequence[start:end]
             ss_chunk = ss[start:end]
 
-            ss_line = ''.join(
-                f"[{_SS_COLORS[c]}]{c}[/{_SS_COLORS[c]}]" if c in _SS_COLORS else ' '
-                for c in ss_chunk
-            )
-
-            scalar = self._scalar_for_mode()
-            if scalar is not None:
-                seq_parts = []
-                for i, aa in enumerate(seq_chunk):
-                    color = color_for_mode(scalar[start + i], self._color_mode, self._midpoint)
-                    seq_parts.append(f"[{color}]{aa}[/{color}]")
-                seq_line = ''.join(seq_parts)
-            else:
-                seq_line = seq_chunk
-
-            pos_label = f"[dim]{start + 1:>5}[/dim]"
-            end_label = f"[dim]{end:>5}[/dim]"
+            if not first_block:
+                out.append("\n")
+            first_block = False
 
             if self._show_domains and self._domains:
-                lines.append(f"      {self._domain_line(start, end)}")
+                out.append("      ")
+                self._append_domain_line(out, start, end)
+                out.append("\n")
             if self._show_ss and self._ss:
-                lines.append(f"      {ss_line}")
-            lines.append(f"{pos_label} {seq_line} {end_label}")
-            lines.append("")
+                out.append("      ")
+                for c in ss_chunk:
+                    if c in _SS_COLORS:
+                        out.append(c, style=Style(color=_SS_COLORS[c]))
+                    else:
+                        out.append(" ")
+                out.append("\n")
 
-        # Legend lives in its own Static at the bottom of the panel — see
-        # `#seq-legend` in compose() — so it stays anchored regardless of
-        # sequence length.
-        return "\n".join(lines).rstrip("\n")
+            # Position labels in muted style, sequence chunk per-AA.
+            out.append(f"{start + 1:>5}", style="dim")
+            out.append(" ")
+            if scalar is not None:
+                for i, aa in enumerate(seq_chunk):
+                    color = color_for_mode(
+                        scalar[start + i], eff_mode, self._midpoint,
+                    )
+                    out.append(aa, style=Style(color=color))
+            else:
+                out.append(seq_chunk)
+            out.append(" ")
+            out.append(f"{end:>5}", style="dim")
+            out.append("\n")
+
+        return out
+
+    def _append_domain_line(self, out, start: int, end_exc: int) -> None:
+        """Append the per-residue domain coloring strip onto `out` (a Text)."""
+        from rich.style import Style
+        cells: list = [None] * (end_exc - start)
+        for i, d in enumerate(self._domains):
+            color = _DOMAIN_PALETTE[i % len(_DOMAIN_PALETTE)]
+            f = max(start, int(d.get("env_from", 1)) - 1)
+            t = min(end_exc, int(d.get("env_to", 0)))
+            for pos in range(f, t):
+                cells[pos - start] = color
+        # Coalesce consecutive identical colors into one styled segment.
+        i = 0
+        while i < len(cells):
+            color = cells[i]
+            j = i
+            while j < len(cells) and cells[j] == color:
+                j += 1
+            if color is None:
+                out.append(" " * (j - i))
+            else:
+                out.append("█" * (j - i), style=Style(color=color))
+            i = j
 
     def _domain_line(self, start: int, end_exc: int) -> str:
         cells: list = [None] * (end_exc - start)
@@ -447,6 +508,73 @@ class SequenceView(Vertical):
                 parts.append(f"[{color}]{seg}[/{color}]")
                 i = j
         return "".join(parts)
+
+    def _refresh_subtitle(self) -> None:
+        """Render the colorbar legend on the panel's bottom-right border.
+
+        Mirrors `StructureView._refresh_subtitle` so the gradient lives
+        on the panel outline rather than as an inline footer widget — a
+        row of vertical real estate is reclaimed and the chrome reads
+        consistently across the two scalar-driven views.
+        """
+        self.border_subtitle = self._build_legend()
+
+    def _build_legend(self) -> str:
+        """Build the gradient + label string for `border_subtitle`.
+
+        Pfam mode renders one chip per domain (categorical key);
+        every other mode renders a 10-cell continuous gradient with
+        0/100 labels, matching the structure pane verbatim.
+        """
+        from ..structure import color_for_mode
+
+        # Mirror StructureView: `pLDDT → bfactor` swap when a PDB is
+        # loaded. Drives both the gradient sample colors and the label.
+        eff_mode = self._effective_mode()
+
+        if eff_mode == "pfam":
+            if not self._domains:
+                return ""
+            cells = []
+            for i in range(min(len(self._domains), 8)):
+                color = _DOMAIN_PALETTE[i % len(_DOMAIN_PALETTE)]
+                cells.append(f"[{color}]█[/{color}]")
+            return "[dim]Pfam[/dim] " + "".join(cells)
+
+        bar_cells = 10
+        if eff_mode == "bfactor":
+            bar_lo, bar_hi, hi_label = 0.0, 50.0, "50 Å²"
+        else:
+            bar_lo, bar_hi, hi_label = 0.0, 100.0, "100"
+        cells = []
+        for i in range(bar_cells):
+            score = bar_lo + (i / (bar_cells - 1)) * (bar_hi - bar_lo)
+            color = color_for_mode(score, eff_mode, self._midpoint)
+            cells.append(f"[{color}]█[/{color}]")
+        bar = "".join(cells)
+
+        label = {
+            "plddt": "pLDDT",
+            "bfactor": "B-factor",
+            "conservation": "cons",
+            "sasa": "SASA",
+            "differential": "diff",
+        }.get(eff_mode, eff_mode)
+
+        if eff_mode == "conservation":
+            head = f"[dim]{label} mid={int(self._midpoint)}[/dim]"
+        else:
+            head = f"[dim]{label}[/dim]"
+
+        legend = f"{head} [dim]{int(bar_lo)}[/dim] {bar} [dim]{hi_label}[/dim]"
+        # Surface the keybinding next to the bar in conservation mode —
+        # the inline focusable Colorbar that used to advertise ◀/▶ is
+        # gone, so the hint now lives on the panel border itself.
+        # `\[` / `\]` escape the brackets so rich doesn't treat them as
+        # markup tags.
+        if eff_mode == "conservation":
+            legend += r" [dim]\[/\] adjust[/dim]"
+        return legend
 
     def _ss_legend(self) -> str:
         h = _SS_COLORS['H']

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -118,6 +119,7 @@ class ProjectListScreen(Screen):
     BINDINGS = [
         Binding("n", "new_project", "New"),
         Binding("e", "rename_project", "Rename"),
+        Binding("d", "delete_project", "Delete"),
         Binding("r", "refresh", "Refresh"),
         Binding("s", "settings", "Settings"),
     ]
@@ -181,6 +183,15 @@ class ProjectListScreen(Screen):
         self._detail_text_seen: Dict[str, str] = {}
         # Column key for the Detail cell — captured at on_mount.
         self._detail_col_key = None
+        # Slow rotation for the highlighted-project ribbon preview.
+        # `_ribbon_proj` is the project whose preview is currently on
+        # screen (re-rendered every tick); `_ribbon_coords_cache` keys
+        # parsed (coords, plddt, cif_mtime) on project name so we don't
+        # re-parse the CIF on every frame. None values mark projects
+        # without a cached structure so we don't retry every tick.
+        self._ribbon_angle_y: float = 0.0
+        self._ribbon_proj: Optional[BeakProject] = None
+        self._ribbon_coords_cache: Dict[str, Optional[tuple]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -209,6 +220,13 @@ class ProjectListScreen(Screen):
     # gets ~2.5s of stable reading time. Re-applies on every wrap.
     _DETAIL_DWELL_TICKS = 17
 
+    # Ribbon rotation cadence for the highlighted-project preview.
+    # ~36 s per revolution (1°/frame at 10 fps) — deliberately slower
+    # than the project-detail StructureView (~12 s/revolution) so the
+    # landing screen reads as ambient motion, not a busy spinner.
+    _RIBBON_FPS = 10
+    _RIBBON_DEGREES_PER_FRAME = 1.0
+
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         # Sorted by recency by default; the `Updated` column makes the
@@ -221,7 +239,39 @@ class ProjectListScreen(Screen):
         )
         self._detail_col_key = keys[-1] if keys else None
         self._populate()
-        self.set_interval(self._DETAIL_TICK_SECONDS, self._tick_details)
+        # Capture the timers so on_screen_suspend can pause them while
+        # we're buried under the detail/alignment screens — without this
+        # both timers keep firing at 10/0.15 Hz against widgets the user
+        # can't see, contributing writes to the bounded textual-output
+        # queue. With the alignment view's own heavy renders + the
+        # detail rotation timer all in flight on pop, that's enough to
+        # saturate the queue on a slightly-slow terminal and wedge the
+        # asyncio loop. (See app.py's writer-thread patch for the
+        # bulletproof side; this is the cooperative side.)
+        self._detail_timer = self.set_interval(
+            self._DETAIL_TICK_SECONDS, self._tick_details
+        )
+        self._ribbon_timer = self.set_interval(
+            1.0 / self._RIBBON_FPS, self._tick_ribbon
+        )
+
+    def on_screen_suspend(self) -> None:
+        for attr in ("_detail_timer", "_ribbon_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.pause()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def on_screen_resume(self) -> None:
+        for attr in ("_detail_timer", "_ribbon_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                try:
+                    timer.resume()
+                except Exception:  # noqa: BLE001
+                    pass
 
     @staticmethod
     def _project_mtime(proj: BeakProject) -> float:
@@ -239,12 +289,35 @@ class ProjectListScreen(Screen):
         except OSError:
             return 0.0
 
+    # Project statuses that indicate an in-flight remote job (search /
+    # align / tax / embed) or multiple of those concurrently. Used to
+    # promote those projects to the top of the list — the user almost
+    # always wants to glance at an active project first.
+    _ACTIVE_STATUSES = frozenset({"search", "align", "tax", "embed", "running"})
+
+    @classmethod
+    def _project_sort_key(cls, proj: BeakProject) -> tuple:
+        """Sort tuple `(active_first, mtime)` — both descending.
+
+        Active projects (any in-flight remote job) rise to the top;
+        within each group the manifest mtime breaks ties so the most
+        recently-touched project still leads. Inactive projects
+        (`ready` / `new`) follow, again ordered by recency.
+        """
+        try:
+            status = proj.status_summary()
+        except Exception:
+            status = "ready"
+        is_active = status in cls._ACTIVE_STATUSES
+        return (is_active, cls._project_mtime(proj))
+
     def _populate(self) -> None:
         table = self.query_one(DataTable)
         table.clear()
         projects = BeakProject.list_projects()
-        # Sort: most recent activity first. Stable on ties.
-        projects.sort(key=self._project_mtime, reverse=True)
+        # Sort: active jobs first (search / align / tax / embed),
+        # then by recency within each group. Stable on ties.
+        projects.sort(key=self._project_sort_key, reverse=True)
         self._projects = projects
         if not self._projects:
             self._update_summary(None)
@@ -468,6 +541,12 @@ class ProjectListScreen(Screen):
         meta = self.query_one("#summary-meta", Static)
         ribbon = self.query_one("#summary-ribbon", Static)
         stats = self.query_one("#summary-stats", Static)
+        # Track which project the ribbon is showing so the rotation
+        # timer knows what to re-render. Reset the angle on a project
+        # switch so each project starts at its PCA-aligned 0° pose.
+        if proj is not self._ribbon_proj:
+            self._ribbon_angle_y = 0.0
+        self._ribbon_proj = proj
         if proj is None:
             meta.update("[dim]No project selected.[/dim]")
             ribbon.update("")
@@ -551,37 +630,109 @@ class ProjectListScreen(Screen):
         rows.append(f"[dim]Created: {_format_dt(proj_meta_get(m, 'created_at'))}[/dim]")
         return "\n".join(rows)
 
-    def _render_ribbon_preview(self, proj: BeakProject, width: int, height: int) -> str:
+    def _ribbon_coords(self, proj: BeakProject):
+        """Load + PCA-align CA coords once per project, cached on disk mtime.
+
+        Returns ``(coords, plddt)`` or ``None`` for projects without a
+        cached structure / on parse failure. The cache is invalidated
+        when the on-disk CIF mtime changes (e.g. user picks a different
+        structure as default), and stays valid across rotation ticks
+        so the per-frame cost is just the projection + render.
+        """
         target = (proj.manifest().get("target") or {})
         uniprot = target.get("uniprot_id")
         if not uniprot:
-            return "[dim]No structure preview (project has no UniProt ID).[/dim]"
-        cif_path = proj.path / "structures" / f"{uniprot}_AF.cif"
-        if not cif_path.exists():
-            return (
-                "[dim]No cached structure. Open the project to fetch the "
-                "AlphaFold model.[/dim]"
-            )
+            return None
+        from ..structure import cached_structure_path
+        cif_path = cached_structure_path(uniprot, proj.path / "structures")
+        if cif_path is None:
+            return None
         try:
-            from ..structure import load_ca_coords, render_structure
+            mtime = cif_path.stat().st_mtime
+        except OSError:
+            return None
+        cached = self._ribbon_coords_cache.get(proj.name)
+        if cached is not None and cached[2] == mtime:
+            return cached[0], cached[1]
+        try:
+            from ..structure import load_ca_coords
             coords, plddt = load_ca_coords(cif_path)
-            # PCA-align so the long axis is roughly horizontal — same trick
-            # the StructureView uses on first load.
             centered = coords - coords.mean(axis=0)
             _, _, vt = np.linalg.svd(centered, full_matrices=False)
             if np.linalg.det(vt) < 0:
                 vt[2] *= -1
             coords = centered @ vt.T
-        except Exception as e:  # noqa: BLE001
-            return f"[dim red]Structure preview failed: {e}[/dim red]"
-        # Subtract a small margin to match the panel border drawing.
+        except Exception:  # noqa: BLE001
+            self._ribbon_coords_cache[proj.name] = (None, None, mtime)
+            return None
+        self._ribbon_coords_cache[proj.name] = (coords, plddt, mtime)
+        return coords, plddt
+
+    def _render_ribbon_preview(self, proj: BeakProject, width: int, height: int):
+        # Returns a Rich `Text` for the rendered structure or a short
+        # markup string for status placeholders. The Rich Text path
+        # bypasses Textual's markup tokenizer (which has hung the UI on
+        # the structure render before — see `~/.beak/last-crash.log`
+        # watchdog dumps) while the status strings are tiny and parse
+        # in microseconds.
+        target = (proj.manifest().get("target") or {})
+        uniprot = target.get("uniprot_id")
+        if not uniprot:
+            return "[dim]No structure preview (project has no UniProt ID).[/dim]"
+        from ..structure import cached_structure_path
+        cif_path = cached_structure_path(uniprot, proj.path / "structures")
+        if cif_path is None:
+            return (
+                "[dim]No cached structure. Open the project to fetch a\n"
+                "PDB / AlphaFold model.[/dim]"
+            )
+        loaded = self._ribbon_coords(proj)
+        if loaded is None:
+            return "[dim red]Structure preview failed.[/dim red]"
+        coords, plddt = loaded
+        from math import radians
+        from ..structure import render_structure
         w = max(8, width - 2)
         h = max(6, height - 2)
         return render_structure(
             coords, plddt, w, h,
-            angle_y=0.0, angle_x=0.0,
+            angle_y=radians(self._ribbon_angle_y), angle_x=0.0,
             color_mode="plddt", midpoint=50.0,
             view_mode="trace",
+        )
+
+    def _tick_ribbon(self) -> None:
+        """Advance the ribbon rotation and re-render on the highlighted row.
+
+        Skips work when no project is highlighted, or when the active
+        project has no cached coords (no CIF on disk yet) — both
+        conditions hold steady on the project list, so we'd otherwise
+        burn CPU re-rendering "no preview" hints every 100 ms.
+        """
+        proj = self._ribbon_proj
+        if proj is None:
+            return
+        loaded = self._ribbon_coords(proj)
+        if loaded is None:
+            return
+        # Yield as soon as a small backlog forms — healthy ptys keep
+        # the queue near zero, so >3 means back-pressure. See
+        # StructureView._tick for the rationale.
+        try:
+            wq = self.app._driver._writer_thread._queue
+            if wq.qsize() > 3:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        self._ribbon_angle_y = (
+            self._ribbon_angle_y + self._RIBBON_DEGREES_PER_FRAME
+        ) % 360.0
+        try:
+            ribbon = self.query_one("#summary-ribbon", Static)
+        except Exception:
+            return
+        ribbon.update(
+            self._render_ribbon_preview(proj, ribbon.size.width, ribbon.size.height)
         )
 
     def action_refresh(self) -> None:
@@ -621,6 +772,112 @@ class ProjectListScreen(Screen):
             return
         self.notify(f"Renamed to '{new_name}'", timeout=4)
         self._populate()
+
+    def action_delete_project(self) -> None:
+        table = self.query_one(DataTable)
+        if table.cursor_row is None or not self._projects:
+            return
+        try:
+            row_idx = int(table.cursor_row)
+        except (TypeError, ValueError):
+            return
+        if not (0 <= row_idx < len(self._projects)):
+            return
+        proj = self._projects[row_idx]
+        from .delete_project import DeleteProjectModal
+        self.app.push_screen(
+            DeleteProjectModal(proj),
+            lambda confirmed: self._on_project_deleted(proj, confirmed),
+        )
+
+    def _on_project_deleted(self, proj: BeakProject, confirmed) -> None:
+        if not confirmed:
+            return
+        # Snapshot job_ids and the path before the rmtree — the manifest
+        # is gone after `delete()`, so the worker has to carry these
+        # forward as plain values rather than re-querying the project.
+        try:
+            job_ids = proj.remote_job_ids()
+        except Exception:  # noqa: BLE001
+            job_ids = []
+        self._delete_project_worker(proj.name, proj, job_ids)
+
+    @work(thread=True, exclusive=False, group="delete-project")
+    def _delete_project_worker(
+        self, name: str, proj: BeakProject, job_ids: List[str],
+    ) -> None:
+        """Best-effort remote scratch cleanup, then local rmtree.
+
+        Remote cleanup is best-effort: if the server is unreachable the
+        local delete still runs (the user explicitly typed the name to
+        confirm). Any orphaned remote dirs surface as a warning so the
+        user can clean them up later if the workstation comes back.
+        """
+        # 1) Remote cleanup. Carrier manager: ESMEmbeddings — its
+        # `cleanup()` is generic over the per-job remote_path recorded
+        # in jobs.json, same pattern as `_cleanup_remote_jobs` in
+        # layer_detail.
+        remote_summary = ""
+        if job_ids:
+            from ...remote.embeddings import ESMEmbeddings
+
+            mgr = None
+            failed: List[str] = []
+            try:
+                try:
+                    mgr = ESMEmbeddings()
+                except Exception as e:  # noqa: BLE001
+                    self.app.call_from_thread(
+                        self.notify,
+                        f"Remote cleanup skipped — can't reach the server "
+                        f"({type(e).__name__}). {len(job_ids)} job dir(s) "
+                        f"left on remote.",
+                        severity="warning",
+                        timeout=12,
+                    )
+                else:
+                    for jid in job_ids:
+                        try:
+                            mgr.cleanup(jid, keep_results=False)
+                        except Exception:  # noqa: BLE001
+                            failed.append(jid)
+                    cleaned = len(job_ids) - len(failed)
+                    if failed:
+                        remote_summary = (
+                            f" · {cleaned}/{len(job_ids)} remote dirs cleaned"
+                        )
+                    else:
+                        remote_summary = (
+                            f" · {len(job_ids)} remote dir"
+                            f"{'s' if len(job_ids) > 1 else ''} cleaned"
+                        )
+            finally:
+                if mgr is not None:
+                    try:
+                        conn = getattr(mgr, "conn", None)
+                        if conn is not None:
+                            conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        # 2) Local delete.
+        try:
+            proj.delete()
+        except Exception as e:  # noqa: BLE001
+            self.app.call_from_thread(
+                self.notify,
+                f"Local delete failed for '{name}': {e}",
+                severity="error",
+                timeout=10,
+            )
+            return
+
+        self.app.call_from_thread(
+            self.notify,
+            f"Deleted project '{name}'{remote_summary}",
+            timeout=6,
+        )
+        self.app.call_from_thread(self._populate)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         from .detail import ProjectDetailScreen

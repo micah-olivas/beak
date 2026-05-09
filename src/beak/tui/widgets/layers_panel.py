@@ -16,6 +16,7 @@ Status sources, in priority order:
 """
 
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -74,18 +75,60 @@ def _close_mgr(mgr) -> None:
         pass
 
 
-def _scratch_cleanup(mgr, job_id: str) -> None:
+def _atomic_copy(src: Path, dest: Path) -> None:
+    """Copy `src` to `dest` via tempfile + fsync + atomic rename.
+
+    Used by pull workers so a crash between writing the artefact and
+    cleaning up remote scratch can never leave the user with a
+    truncated `sequences.fasta` / `alignment.fasta` while the remote
+    copy has already been rm-rf'd. Either the previous file stays
+    intact, or the new file is fully on disk — never a half-written
+    mix that downstream parsing would silently treat as valid.
+    """
+    import shutil
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    shutil.copy2(src, tmp)
+    # fsync the bytes before the rename so a power loss between
+    # rename and journal flush can't leave a renamed-but-empty file.
+    try:
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    os.replace(tmp, dest)
+
+
+def _scratch_cleanup(mgr, job_id: str, on_warn=None) -> None:
     """rm -rf the remote job dir + drop the local jobs.json entry.
 
     `~/beak_jobs/<id>/` is treated as scratch — once the artifact has
     landed in a project's local directory, the remote copy is
-    redundant. Best-effort: SSH errors are swallowed so a flaky
-    connection doesn't roll back a successful pull.
+    redundant.
+
+    Best-effort: a flaky connection or remote rm failure does not roll
+    back the local pull, but it MUST surface to the user — silent
+    cleanup failures violate the L2 cleanup contract (CLAUDE.md) and
+    let the remote scratch dir bloat indefinitely with no visible
+    cause. `on_warn(msg)` is invoked on failure if provided (callers
+    typically pass `lambda m: app.call_from_thread(self.notify, m,
+    severity='warning')`).
     """
     try:
         mgr.cleanup(job_id, keep_results=False)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        msg = f"Remote scratch cleanup for {job_id} failed: {e}"
+        if on_warn is not None:
+            try:
+                on_warn(msg)
+            except Exception:  # noqa: BLE001
+                # Notify hop itself raced a screen pop — log to stderr
+                # so the failure isn't completely silent.
+                import sys as _sys
+                print(msg, file=_sys.stderr)
+        else:
+            import sys as _sys
+            print(msg, file=_sys.stderr)
 
 
 def _human_size(n: float) -> str:
@@ -276,6 +319,22 @@ class LayersPanel(Vertical):
         # row's status pill can render a counter. None when no build is
         # running.
         self._tax_progress: Optional[tuple] = None
+
+    def _cleanup_warn(self, msg: str) -> None:
+        """Surface a remote-cleanup failure as a non-blocking toast.
+
+        Pull workers run in worker threads, so we hop to the UI thread
+        via `call_from_thread`. The notify call itself can raise if
+        the screen is being torn down — we swallow that, since the
+        underlying cleanup failure has already been preserved on
+        stderr by `_scratch_cleanup`.
+        """
+        try:
+            self.app.call_from_thread(
+                self.notify, msg, severity="warning", timeout=10,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def compose(self) -> ComposeResult:
         for layer in _LAYER_ORDER:
@@ -805,6 +864,8 @@ class LayersPanel(Vertical):
         if "homologs" in self._pulling_kinds:
             return
         self._pulling_kinds.add("homologs")
+        local_landed = False
+        file_on_disk = False
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling homologs · {job_id}…"
@@ -812,11 +873,14 @@ class LayersPanel(Vertical):
             result = mgr.get_results(job_id, parse=False, download_sequences=True)
             src_fasta = Path(result["fasta"])
 
-            # Files land in the active set's directory.
+            # Files land in the active set's directory. Write to a temp
+            # path + fsync + atomic rename so a crash between the rm-rf
+            # of the remote scratch and the manifest write can't leave
+            # the user with a half-flushed sequences.fasta.
             homologs_dir = self._project.active_homologs_dir(ensure=True)
             dest = homologs_dir / "sequences.fasta"
-            import shutil
-            shutil.copy2(src_fasta, dest)
+            _atomic_copy(src_fasta, dest)
+            file_on_disk = True
 
             with open(dest) as f:
                 n = sum(1 for line in f if line.startswith(">"))
@@ -827,30 +891,49 @@ class LayersPanel(Vertical):
                 n_homologs=n,
                 last_updated=datetime.now(),
             )
+            local_landed = True
 
             self.app.call_from_thread(
                 self.notify, f"Homologs ready · {n} sequences", timeout=8
             )
-            # Local artifact landed → wipe the remote scratch dir.
-            _scratch_cleanup(mgr, job_id)
             # Kick off the taxonomy fetch in parallel — it's UniProt
             # REST only, no SSH, takes seconds for hundreds of hits.
             self._build_taxonomy()
         except Exception as e:  # noqa: BLE001
-            self.app.call_from_thread(
-                self.notify,
-                f"Pull failed: {e}",
-                severity="error",
-                timeout=10,
-            )
+            # Distinguish the partial-state case (file landed on disk
+            # but the manifest write failed) from a generic pull error.
+            # The user needs to know the bytes are recoverable so they
+            # can rerun manifest assembly without re-pulling from
+            # remote. Otherwise they'll waste a re-search.
+            if file_on_disk:
+                self._cleanup_warn(
+                    f"Homologs file written but manifest update failed: "
+                    f"{e}. The remote scratch is preserved — retry the "
+                    f"pull or re-open the project to recover."
+                )
+            else:
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Pull failed: {e}",
+                    severity="error",
+                    timeout=10,
+                )
         finally:
             self._pulling_kinds.discard("homologs")
+            # Cleanup runs ONLY if the local artefact + manifest update
+            # both succeeded. A failed pull leaves the remote scratch
+            # in place so the user can inspect / retry. Cleanup
+            # failures here surface as a toast but never roll back.
+            if local_landed:
+                _scratch_cleanup(mgr, job_id, on_warn=self._cleanup_warn)
 
     def _pull_alignment_now(self, mgr, job_id: str) -> None:
         """Download alignment.fasta into the active set + tag the manifest."""
         if "alignment" in self._pulling_kinds:
             return
         self._pulling_kinds.add("alignment")
+        local_landed = False
+        file_on_disk = False
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling alignment · {job_id}…"
@@ -864,8 +947,8 @@ class LayersPanel(Vertical):
 
             homologs_dir = self._project.active_homologs_dir(ensure=True)
             dest = homologs_dir / "alignment.fasta"
-            import shutil
-            shutil.copy2(src, dest)
+            _atomic_copy(src, dest)
+            file_on_disk = True
 
             with open(dest) as f:
                 n = sum(1 for line in f if line.startswith(">"))
@@ -875,23 +958,35 @@ class LayersPanel(Vertical):
                 n_aligned=n, last_updated=datetime.now(),
             )
 
-            cache = homologs_dir / "conservation.npy"
-            if cache.exists():
-                cache.unlink()
+            # Drop both the new JSD cache and the legacy target-identity
+            # cache so the next read recomputes against the freshly-
+            # pulled alignment regardless of which generation was on disk.
+            for cache_name in ("conservation_jsd.npy", "conservation.npy"):
+                cache = homologs_dir / cache_name
+                if cache.exists():
+                    cache.unlink()
+            local_landed = True
 
             self.app.call_from_thread(
                 self.notify, f"Alignment ready · {n} sequences", timeout=8
             )
-            _scratch_cleanup(mgr, job_id)
         except Exception as e:  # noqa: BLE001
-            self.app.call_from_thread(
-                self.notify,
-                f"Pull failed: {e}",
-                severity="error",
-                timeout=10,
-            )
+            if file_on_disk:
+                self._cleanup_warn(
+                    f"Alignment file written but manifest update failed: "
+                    f"{e}. The remote scratch is preserved."
+                )
+            else:
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Pull failed: {e}",
+                    severity="error",
+                    timeout=10,
+                )
         finally:
             self._pulling_kinds.discard("alignment")
+            if local_landed:
+                _scratch_cleanup(mgr, job_id, on_warn=self._cleanup_warn)
 
     @work(thread=True, exclusive=True, group="align-submit")
     def _submit_alignment(self, set_name: Optional[str] = None) -> None:
@@ -986,6 +1081,8 @@ class LayersPanel(Vertical):
         if key in self._pulling_kinds:
             return
         self._pulling_kinds.add(key)
+        local_landed = False
+        files_on_disk = False
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling embeddings · {job_id}…"
@@ -999,6 +1096,7 @@ class LayersPanel(Vertical):
             embeddings_dir.mkdir(parents=True, exist_ok=True)
             extracted = mgr.download(job_id, local_dir=str(embeddings_dir))
             n = sum(1 for _ in Path(extracted).rglob("*") if _.is_file())
+            files_on_disk = True
 
             try:
                 with open(_JOBS_DB) as f:
@@ -1014,18 +1112,27 @@ class LayersPanel(Vertical):
                 model=model,
                 last_updated=datetime.now(),
             )
+            local_landed = True
 
             self.app.call_from_thread(
                 self.notify, f"Embeddings ready · {n} files", timeout=8
             )
-            _scratch_cleanup(mgr, job_id)
         except Exception as e:  # noqa: BLE001
-            self.app.call_from_thread(
-                self.notify, f"Embeddings pull failed: {e}",
-                severity="error", timeout=10,
-            )
+            if files_on_disk:
+                self._cleanup_warn(
+                    f"Embeddings extracted but manifest update failed: "
+                    f"{e}. The remote scratch is preserved — re-open "
+                    f"the project to recover."
+                )
+            else:
+                self.app.call_from_thread(
+                    self.notify, f"Embeddings pull failed: {e}",
+                    severity="error", timeout=10,
+                )
         finally:
             self._pulling_kinds.discard(key)
+            if local_landed:
+                _scratch_cleanup(mgr, job_id, on_warn=self._cleanup_warn)
 
     @work(thread=True, exclusive=True, group="embed-submit")
     def _submit_embeddings(self) -> None:
@@ -1083,6 +1190,8 @@ class LayersPanel(Vertical):
         if "taxonomy" in self._pulling_kinds:
             return
         self._pulling_kinds.add("taxonomy")
+        local_landed = False
+        file_on_disk = False
         try:
             self.app.call_from_thread(
                 self.notify, f"Pulling taxonomy · {job_id}…"
@@ -1092,31 +1201,60 @@ class LayersPanel(Vertical):
                 raise RuntimeError("Empty taxonomy results")
 
             homologs_dir = self._project.active_homologs_dir(ensure=True)
-            df.to_parquet(homologs_dir / "taxonomy_mmseqs.parquet", index=False)
+            from ..taxonomy import atomic_to_parquet
+            atomic_to_parquet(
+                df, homologs_dir / "taxonomy_mmseqs.parquet", index=False,
+            )
+            file_on_disk = True
 
             from datetime import datetime
             with self._project.mutate() as manifest:
                 tax = manifest.setdefault("taxonomy", {})
                 tax["n_assigned"] = int(len(df))
                 tax["last_updated"] = datetime.now()
+            local_landed = True
 
             self.app.call_from_thread(
                 self.notify, f"Taxonomy ready · {len(df)} assignments", timeout=8
             )
-            _scratch_cleanup(mgr, job_id)
+
+            # Fallback merge: when this job was a fallback for the
+            # UniProt-unresolved subset, upsert the LCA assignments
+            # into the canonical taxonomy.parquet so downstream views
+            # (PCA temp coloring, taxonomy histogram, traits) can see
+            # the newly-resolved rows without the user having to
+            # rebuild taxonomy by hand.
+            try:
+                from ..taxonomy import merge_mmseqs_fallback
+                n_filled = merge_mmseqs_fallback(self._project)
+            except Exception:  # noqa: BLE001
+                n_filled = 0
+            if n_filled:
+                self.app.call_from_thread(
+                    self.notify,
+                    f"Resolved {n_filled} previously-unannotated taxonomies "
+                    f"via MMseqs LCA.",
+                    timeout=6,
+                )
+
             # MMseqs LCA may surface organisms the UniProt path missed —
-            # rebuild traits to pick them up. Force=True via a stale cache:
-            # _pull_taxonomy_now writes taxonomy_mmseqs.parquet, not the
-            # canonical taxonomy.parquet, so the traits builder is a no-op
-            # here unless the UniProt path also ran. Still cheap to call.
+            # rebuild traits to pick them up.
             self._build_traits()
         except Exception as e:  # noqa: BLE001
-            self.app.call_from_thread(
-                self.notify, f"Taxonomy pull failed: {e}",
-                severity="error", timeout=10,
-            )
+            if file_on_disk:
+                self._cleanup_warn(
+                    f"Taxonomy parquet written but manifest update "
+                    f"failed: {e}. Remote scratch is preserved."
+                )
+            else:
+                self.app.call_from_thread(
+                    self.notify, f"Taxonomy pull failed: {e}",
+                    severity="error", timeout=10,
+                )
         finally:
             self._pulling_kinds.discard("taxonomy")
+            if local_landed:
+                _scratch_cleanup(mgr, job_id, on_warn=self._cleanup_warn)
 
     def submit_embeddings(self) -> None:
         """Public entry point — gated against double-submit."""

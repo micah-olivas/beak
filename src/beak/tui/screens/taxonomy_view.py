@@ -18,12 +18,14 @@ composition list.
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+import colorsys
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
 
@@ -77,7 +79,9 @@ _TEMP_CLASSES = (
 )
 
 
-_LEVELS = ("phylum", "domain", "class")
+# Cycle order for the `space` keybind: broad → fine. The first entry
+# is also the default level the screen opens on (set in __init__).
+_LEVELS = ("domain", "phylum", "class")
 
 
 def _temp_color(t: float) -> str:
@@ -99,6 +103,32 @@ def _temp_color(t: float) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def _shade_for_domain(base_hex: str, label: str) -> str:
+    """Deterministic hue-preserving shade of `base_hex` keyed on `label`.
+
+    Used so a bacterial phylum reads as a distinct shade of green while
+    every eukaryotic phylum reads as a distinct shade of blue — keeping
+    the taxonomic kinship visible at lower-than-domain levels. The hue
+    is taken from the parent domain's base color (so all bacteria stay
+    in the green family); lightness and saturation are perturbed in
+    bounded ranges by a label-keyed bucket so different phyla within
+    the same domain are still discriminable.
+    """
+    r = int(base_hex[1:3], 16) / 255.0
+    g = int(base_hex[3:5], 16) / 255.0
+    b = int(base_hex[5:7], 16) / 255.0
+    h, l_, s = colorsys.rgb_to_hls(r, g, b)
+    n_buckets = 7
+    bucket = (hash(label) % n_buckets)
+    # Lightness 0.35..0.72 — keeps the chip readable on dark and light
+    # terminals without bleeding into white. Saturation 0.55..0.90 to
+    # preserve hue identity even at the lighter end of the range.
+    new_l = 0.35 + (bucket / max(1, n_buckets - 1)) * 0.37
+    new_s = 0.55 + ((bucket * 3) % n_buckets) / n_buckets * 0.35
+    nr, ng, nb = colorsys.hls_to_rgb(h, new_l, max(0.0, min(1.0, new_s)))
+    return f"#{int(nr * 255):02X}{int(ng * 255):02X}{int(nb * 255):02X}"
+
+
 def _bar_str(frac: float, width: int) -> str:
     """Render a horizontal bar with 1/8-cell tip precision."""
     width = max(1, width)
@@ -116,10 +146,10 @@ class _TaxonomyBody(Static):
 
     def __init__(self, parent: "TaxonomyViewerScreen", **kwargs) -> None:
         super().__init__("[dim]Loading taxonomy…[/dim]", **kwargs)
-        self._parent = parent
+        self._screen_ref = parent
 
     def render(self):
-        return self._parent._render_body(self.size.width, self.size.height)
+        return self._screen_ref._render_body(self.size.width, self.size.height)
 
     def on_resize(self, event) -> None:
         self.refresh()
@@ -137,7 +167,18 @@ class TaxonomyViewerScreen(Screen):
     ]
 
     DEFAULT_CSS = """
-    TaxonomyViewerScreen _TaxonomyBody { height: 1fr; padding: 1 2; overflow-y: auto; }
+    /* Body wrapped in a VerticalScroll: trait composition + temp
+       histogram together overflow most terminal heights, especially
+       on projects with many trait columns. The inner Static gets
+       `height: auto` so it grows to fit its content; the scroller
+       handles the overflow. `overflow-y: auto` on a bare Static
+       (the previous setup) is a no-op — only scroll containers
+       actually scroll in Textual. */
+    TaxonomyViewerScreen #tax-scroll {
+        height: 1fr;
+        padding: 1 2;
+    }
+    TaxonomyViewerScreen _TaxonomyBody { height: auto; }
     """
 
     def __init__(self, project) -> None:
@@ -145,12 +186,22 @@ class TaxonomyViewerScreen(Screen):
         self._project = project
         self._tax: Optional[pd.DataFrame] = None
         self._traits: Optional[pd.DataFrame] = None
-        self._level: str = "phylum"
+        # Default grouping = `domain` (Bacteria / Archaea / Eukaryota /
+        # Viruses). Coarser than phylum but easier to read at a glance
+        # — most projects' first question is "what kingdoms are in
+        # this MSA?" and `space` cycles to the finer levels from there.
+        self._level: str = "domain"
         self._missing: bool = False
+        # Cache of {sub-domain label → its parent domain} so coloring at
+        # phylum/class/etc. levels can pick a hue from the parent
+        # domain's base color (bacterial phyla = green shades, eukaryotic
+        # = blue shades, etc.). Built once on first lookup per load.
+        self._label_to_domain: Optional[Dict[str, str]] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield _TaxonomyBody(self, id="tax-body")
+        with VerticalScroll(id="tax-scroll"):
+            yield _TaxonomyBody(self, id="tax-body")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -180,6 +231,9 @@ class TaxonomyViewerScreen(Screen):
         if "phylum" in tax.columns and tax["phylum"].notna().sum() == 0:
             self._level = "domain"
         self._tax = tax
+        # Drop any previously-built domain map; the new frame may have
+        # different ranks populated.
+        self._label_to_domain = None
 
         # Optional traits join. Read defensively — traits is a "nice to
         # have" pane; a stale or missing parquet shouldn't block the rest.
@@ -195,7 +249,45 @@ class TaxonomyViewerScreen(Screen):
             return _DOMAIN_COLORS.get(label, _DOMAIN_FALLBACK)
         if label == "(unresolved)":
             return _DOMAIN_FALLBACK
+        # Sub-domain levels: pick a deterministic shade of the parent
+        # domain's base color so taxonomic kinship is visible at a
+        # glance — bacterial phyla read as varied greens, eukaryotic
+        # as varied blues, etc. Falls back to the legacy phylum palette
+        # only when we can't resolve the parent domain (e.g., the
+        # taxonomy.parquet doesn't carry a `domain` column).
+        domain = self._domain_for_label(label)
+        if domain and domain in _DOMAIN_COLORS:
+            return _shade_for_domain(_DOMAIN_COLORS[domain], label)
         return _PHYLUM_PALETTE[hash(label) % len(_PHYLUM_PALETTE)]
+
+    def _domain_for_label(self, label: str) -> Optional[str]:
+        """Map a sub-domain label (phylum, class, order, …) to its parent
+        domain by walking the loaded taxonomy frame once and caching."""
+        if self._label_to_domain is None:
+            self._label_to_domain = self._build_label_to_domain_map()
+        return self._label_to_domain.get(str(label))
+
+    def _build_label_to_domain_map(self) -> Dict[str, str]:
+        if self._tax is None or "domain" not in self._tax.columns:
+            return {}
+        out: Dict[str, str] = {}
+        # Walk every sub-domain rank present in the frame; whichever
+        # domain owns the row gets credit for that label. First-seen
+        # wins on the rare cross-domain collision (a label appearing
+        # under multiple domains, which shouldn't happen with proper
+        # NCBI taxonomy but might with hand-curated tables).
+        for level in (
+            "superkingdom", "kingdom", "phylum", "class",
+            "order", "family", "genus", "species",
+        ):
+            if level not in self._tax.columns:
+                continue
+            sub = self._tax[[level, "domain"]].dropna()
+            for label, domain in zip(sub[level].astype(str),
+                                     sub["domain"].astype(str)):
+                if label and label not in out:
+                    out[label] = domain
+        return out
 
     # ---- pane: counts by taxon ----
 
@@ -238,6 +330,115 @@ class TaxonomyViewerScreen(Screen):
                 f"[{color}]{bar}[/{color}]"
             )
         return header + "\n" + "\n".join(rows)
+
+    # ---- pane: growth-temp per taxon ----
+
+    def _render_temp_by_taxon_pane(self, width: int) -> str:
+        """Per-taxon growth-temperature distribution at the active level.
+
+        Renders one row per taxon as a horizontal box-plot-style bar
+        anchored on a fixed 0–100 °C scale (so two phyla can be eyeballed
+        across projects):
+
+            ─────  whiskers (min … Q1 and Q3 … max)
+            █████  interquartile range (Q1 … Q3)
+            ┃      median tick
+
+        Uses the same level grouping the user cycles via `space` — flip
+        to phylum and the bars below regroup with it. Taxon labels carry
+        the domain-shaded color (bacterial phyla = green-ish, eukaryotic
+        = blue-ish), so identity lives on the label and the bar is free
+        to encode the temperature axis itself via the cold→hot gradient.
+        """
+        if self._tax is None:
+            return ""
+        if "growth_temp" not in self._tax.columns:
+            return ""
+        if self._level not in self._tax.columns:
+            return ""
+
+        sub = self._tax[[self._level, "growth_temp"]].dropna()
+        if sub.empty:
+            return ""
+
+        # Order taxa by sample count (descending) so the most-supported
+        # rows surface first — a 5-genome phylum sits below a 5000-genome
+        # one. Same order as `_render_taxa_pane` for visual continuity.
+        ordered_labels = (
+            sub[self._level].value_counts(sort=True, ascending=False).index
+        )
+
+        max_label = max(len(str(label)) for label in ordered_labels)
+        label_w = min(max(8, max_label), 32)
+        # Reserve room for: leading "  " + label + "  " + median+°C (~10) +
+        # "  " + n=##### (~9) + "  " + bar.
+        avail = max(20, width - (label_w + 28))
+        bar_w = min(48, avail)
+
+        header = (
+            f"[bold cyan]Growth temp by {self._level}[/bold cyan]  "
+            f"[dim]({len(sub):,} of {len(self._tax):,} sequences "
+            f"with annotated temp · bar 0–100 °C · ── whiskers · "
+            f"█ IQR · ┃ median)[/dim]"
+        )
+        rows: List[str] = []
+        for label in ordered_labels:
+            vals = sub.loc[
+                sub[self._level] == label, "growth_temp"
+            ].to_numpy(dtype=float)
+            if vals.size == 0:
+                continue
+            n = int(vals.size)
+            median = float(np.median(vals))
+            label_color = self._color_for_level(str(label))
+            bar_color = _temp_color(median)
+            bar = self._render_box_bar(vals, bar_w)
+            disp = (
+                str(label) if len(str(label)) <= label_w
+                else str(label)[: label_w - 1] + "…"
+            )
+            disp = disp.ljust(label_w)
+            rows.append(
+                f"  [{label_color}]{disp}[/{label_color}]  "
+                f"[bold]{median:5.1f}[/bold] [dim]°C[/dim]  "
+                f"[dim]n={n:<5}[/dim]  "
+                f"[{bar_color}]{bar}[/{bar_color}]"
+            )
+        return header + "\n" + "\n".join(rows)
+
+    @staticmethod
+    def _render_box_bar(vals: np.ndarray, bar_w: int) -> str:
+        """Single-line box-plot-style bar over a 0–100 °C scale.
+
+        Whiskers as `─`, IQR as `█`, median as `┃` overriding the
+        IQR cell at the median position. Single-glyph string so the
+        caller can wrap it in one color span — keeps each row to one
+        markup boundary. Off-scale samples (<0 or >100) clamp to the
+        edge cells.
+        """
+        if vals.size == 0 or bar_w <= 0:
+            return " " * bar_w
+        anchor_lo, anchor_hi = 0.0, 100.0
+        span = anchor_hi - anchor_lo
+
+        def _cell(v: float) -> int:
+            return max(
+                0, min(bar_w - 1, int((v - anchor_lo) / span * (bar_w - 1)))
+            )
+
+        cmin = _cell(float(np.min(vals)))
+        cmax = _cell(float(np.max(vals)))
+        cq1 = _cell(float(np.percentile(vals, 25)))
+        cq3 = _cell(float(np.percentile(vals, 75)))
+        cmed = _cell(float(np.median(vals)))
+
+        glyphs = [" "] * bar_w
+        for c in range(cmin, cmax + 1):
+            glyphs[c] = "─"
+        for c in range(cq1, cq3 + 1):
+            glyphs[c] = "█"
+        glyphs[cmed] = "┃"
+        return "".join(glyphs)
 
     # ---- pane: growth-temperature histogram ----
 
@@ -396,6 +597,9 @@ class TaxonomyViewerScreen(Screen):
         # so the body stays tight.
         panes: List[Callable[[int], str]] = [
             self._render_taxa_pane,
+            # New "median temp per taxon" pane sits next to the count
+            # bars so flipping levels via `space` regroups both at once.
+            self._render_temp_by_taxon_pane,
             self._render_temp_pane,
             self._render_traits_pane,
         ]
