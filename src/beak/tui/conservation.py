@@ -1,18 +1,24 @@
 """Per-residue conservation, with an MSA fast-path.
 
-If `homologs/alignment.fasta` is on disk, we use it directly: at each
-target position (non-gap in the first sequence) we count the fraction
-of homolog residues that match the target. This is the canonical way
-to derive conservation once the alignment exists.
+If ``homologs/alignment.fasta`` is on disk, we score every column with
+**Jensen-Shannon divergence against a BLOSUM62 background distribution**
+(Capra & Singh, *Bioinformatics* 2007 — the field-standard metric per
+several head-to-head comparison studies, see
+``alignments/conservation.py``) and project the per-column values onto
+target positions.
 
-Before the alignment lands, we fall back to a pairwise version: for
-each hit in `homologs/sequences.fasta`, do a fast local alignment to
-the target and tally matches. Cheaper but rougher.
+Before the alignment lands, we fall back to a quick-and-dirty pairwise
+identity proxy: for each hit in ``homologs/sequences.fasta``, do a
+local alignment to the target and tally per-position match fractions.
+Cheaper but rougher; gets replaced once the MSA pull completes and the
+JSD path takes over.
 
-Either way the result is in [0, 100] so the existing pLDDT color
+Either way the result is in [0, 100] so the existing pLDDT-style colour
 palette renders directly. Cached on disk under
-`homologs/conservation.npy`; the cache is invalidated by the layers
-panel after the alignment is pulled.
+``homologs/conservation_jsd.npy``; the cache is dropped by the layers
+panel after a new alignment is pulled. (The pre-2026 cache filename
+``conservation.npy`` is silently swept on first read so projects that
+predate the JSD switch don't keep serving stale target-identity scores.)
 """
 
 from pathlib import Path
@@ -21,7 +27,11 @@ from typing import Optional
 import numpy as np
 
 
-_CACHE_FILENAME = "conservation.npy"
+_CACHE_FILENAME = "conservation_jsd.npy"
+# Older cache file from beak's pre-2026 target-identity era. Cleaned up
+# on read so existing projects don't keep silently using the old
+# metric forever.
+_LEGACY_CACHE_FILENAME = "conservation.npy"
 _MAX_HITS = 500  # cap pairwise work to keep first-render under a couple seconds
 
 
@@ -36,6 +46,19 @@ def compute_quick_conservation(project) -> Optional[np.ndarray]:
     target_seq = project.target_sequence()
     if not target_seq:
         return None
+
+    # Sweep stale legacy caches once. Pre-2026 beak wrote per-position
+    # target-identity scores to `conservation.npy`; the new file uses
+    # JSD against a BLOSUM62 background and lives at a different name
+    # so the old values can't be mistaken for the new ones. The
+    # legacy file is harmless to leave on disk, but removing it keeps
+    # `du` honest and avoids confusion when someone greps for it.
+    legacy_cache = homologs_dir / _LEGACY_CACHE_FILENAME
+    if legacy_cache.exists():
+        try:
+            legacy_cache.unlink()
+        except OSError:
+            pass
 
     cache_path = homologs_dir / _CACHE_FILENAME
     if cache_path.exists():
@@ -65,6 +88,9 @@ def compute_quick_conservation(project) -> Optional[np.ndarray]:
 
 def _conservation_from_msa(alignment_path: Path, target_seq: str) -> Optional[np.ndarray]:
     from ..alignments.cache import load_alignment_records
+    from ..alignments.conservation import (
+        conservation_score, project_to_target,
+    )
 
     records = load_alignment_records(alignment_path)
     if len(records) < 2:
@@ -83,35 +109,30 @@ def _conservation_from_msa(alignment_path: Path, target_seq: str) -> Optional[np
             target_aln = seq
             break
     if target_aln is None:
-        # Fallback to the legacy first-row assumption, which is correct
-        # for MSAs beak's own pipeline produces. Better than refusing
-        # to compute when an external tool reordered the file but kept
-        # the target in row 0 anyway.
+        # Fallback to the legacy first-row assumption (correct for MSAs
+        # beak's own pipeline produces) — better than refusing to compute
+        # when an external tool reordered the file but kept the target
+        # in row 0 anyway.
         target_aln = aligned[0]
 
-    target_len = len(target_seq)
-    counts = np.zeros(target_len, dtype=np.int32)
-    totals = np.zeros(target_len, dtype=np.int32)
-
-    target_pos = 0
-    aln_len = len(target_aln)
-    for col in range(aln_len):
-        target_aa = target_aln[col]
-        if target_aa == "-" or target_aa == ".":
-            continue
-        if target_pos >= target_len:
-            break
-        for seq in aligned:
-            ha = seq[col] if col < len(seq) else "-"
-            if ha != "-" and ha != ".":
-                totals[target_pos] += 1
-                if ha == target_aa:
-                    counts[target_pos] += 1
-        target_pos += 1
-
-    if totals.sum() == 0:
+    # Field-standard Jensen-Shannon divergence against a BLOSUM62
+    # background (Capra & Singh 2007). Replaces the prior per-position
+    # target-identity metric, which weighed gaps and common residues
+    # equally with rare ones and made functionally important sites less
+    # distinguishable. Score is in [0, 1] from the new module; we scale
+    # to [0, 100] to keep the existing pLDDT-band palette and persisted
+    # midpoint values working unchanged.
+    column_scores = conservation_score(
+        aligned,
+        method="js_divergence",
+        background="blosum62",
+        gap_penalty=True,
+    )
+    if column_scores.size == 0:
         return None
-    return np.where(totals > 0, counts / totals, 0.0).astype(np.float32) * 100.0
+
+    per_target = project_to_target(column_scores, target_aln, len(target_seq))
+    return (per_target * 100.0).astype(np.float32)
 
 
 def _conservation_pairwise(hits_fasta: Path, target_seq: str) -> Optional[np.ndarray]:
