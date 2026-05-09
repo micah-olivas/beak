@@ -1,5 +1,6 @@
 """Alignment utilities for sequence analysis."""
 
+from .conservation import conservation_score, project_to_target
 from .formatting import (
     subsample_aln,
     ungap,
@@ -12,4 +13,6 @@ __all__ = [
     'ungap',
     'aln_to_pssm',
     'aln_to_consensus',
+    'conservation_score',
+    'project_to_target',
 ]

@@ -99,17 +99,30 @@ def aln_to_pssm(
     alignment: MultipleSeqAlignment,
     as_freq: bool = False,
     include_unknown: bool = True,
+    cons_method: str = "js_divergence",
 ) -> pd.DataFrame:
-    """
-    Generate Position-Specific Scoring Matrix (PSSM)
-    from a multiple sequence alignment.
+    """Position-Specific Scoring Matrix from a multiple sequence alignment.
 
     Args:
         alignment: MultipleSeqAlignment object
-        as_freq: If True, return frequencies instead of counts
-        include_unknown: If True, include counts for unknown amino acids (X, B, Z, etc.)
+        as_freq: If True, return frequencies instead of raw counts.
+        include_unknown: If True, include an 'X' bucket for non-standard
+            residues (B, Z, J, …) so the row sums add to N regardless
+            of input character soup.
+        cons_method: Conservation metric for the trailing 'Cons' column.
+            Defaults to ``js_divergence`` (Capra & Singh 2007), the
+            field-standard for identifying functionally important
+            residues. Pass ``"shannon"`` for the pre-2026 normalized
+            Shannon entropy if you need to reproduce older PSSMs;
+            ``"property_entropy"`` and ``"target_identity"`` are also
+            available — see ``alignments.conservation`` for the full
+            list.
+
     Returns:
-        DataFrame with positions as rows and amino acids as columns
+        DataFrame with one row per alignment column, columns being the
+        21- or 22-letter alphabet (``ACDEFGHIKLMNPQRSTVWY-`` plus
+        optional ``X``) followed by a ``'Cons'`` column carrying the
+        per-column conservation in [0, 1].
     """
     # Set alphabet - standard 20 amino acids plus gap
     alphabet = 'ACDEFGHIKLMNPQRSTVWY-'
@@ -143,19 +156,19 @@ def aln_to_pssm(
                            index=range(aln_length),
                            columns=list(alphabet))
 
-    # Calculate conservation score based on Shannon entropy
-    freqs = pssm_df.div(pssm_df.sum(axis=1), axis=0)
-    # Calculate entropy, avoiding log(0)
-    entropy = -(freqs * np.log2(freqs.where(freqs > 0, 1))).sum(axis=1)
-    max_entropy = np.log2(len(alphabet))
-    conservation = 1 - (entropy / max_entropy)
-    
-    # Convert counts to frequencies if requested
+    # Conservation column comes from the shared `alignments.conservation`
+    # module so every consumer in beak (TUI structure overlay,
+    # comparative analysis, this PSSM table) reads the same metric.
+    # Default is JSD against BLOSUM62 (Capra & Singh 2007). The old
+    # Shannon-entropy behaviour is reachable via cons_method='shannon'.
+    from .conservation import conservation_score
+    pssm_df['Cons'] = conservation_score(aln_array, method=cons_method)
+
+    # Convert counts to frequencies if requested.
     if as_freq:
-        pssm_df = pssm_df.div(pssm_df.sum(axis=1), axis=0)
-    
-    # Add conservation column
-    pssm_df['Cons'] = conservation
+        aa_only = pssm_df.drop(columns=['Cons'])
+        aa_only = aa_only.div(aa_only.sum(axis=1).replace(0, 1), axis=0)
+        pssm_df = pd.concat([aa_only, pssm_df[['Cons']]], axis=1)
 
     return pssm_df
 

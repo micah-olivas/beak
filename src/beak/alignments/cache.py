@@ -46,7 +46,7 @@ def load_alignment_records(fasta_path: Path) -> List[Tuple[str, str]]:
     records = _parse_fasta(fasta_path)
     if records:
         try:
-            _save_cache(cache_path, records)
+            _save_cache(cache_path, records, fasta_path)
         except Exception:
             # A failed cache write isn't fatal; the records are still
             # returned. Next call will retry the write.
@@ -70,12 +70,36 @@ def _cache_path_for(fasta_path: Path) -> Path:
 
 
 def _cache_fresh(cache_path: Path, fasta_path: Path) -> bool:
+    """Cache is fresh iff (mtime ≥ source mtime) AND (source size matches
+    what was recorded at write-time).
+
+    mtime alone is unsafe: a fast rewrite — common when a script
+    regenerates the FASTA in the same wall-second, or when filesystems
+    with second-resolution mtimes (NFS, FAT) collapse two writes into
+    a single timestamp — can leave the sidecar pointing at stale
+    bytes. The size cross-check makes that case detectable: if the
+    new FASTA has a different on-disk size than what we cached, we
+    know the sidecar is stale even if the mtimes agree.
+    """
     if not cache_path.exists():
         return False
     try:
-        return cache_path.stat().st_mtime >= fasta_path.stat().st_mtime
+        cache_st = cache_path.stat()
+        fasta_st = fasta_path.stat()
+        if cache_st.st_mtime < fasta_st.st_mtime:
+            return False
     except OSError:
         return False
+    try:
+        with np.load(cache_path, allow_pickle=False) as data:
+            cached_size = int(data["src_size"].item()) if "src_size" in data.files else -1
+    except Exception:
+        return False
+    # Pre-`src_size` sidecars store -1 → fall back to mtime-only
+    # behavior. Subsequent writes upgrade them automatically.
+    if cached_size < 0:
+        return True
+    return cached_size == fasta_st.st_size
 
 
 def _load_from_cache(cache_path: Path) -> List[Tuple[str, str]]:
@@ -101,7 +125,7 @@ def _load_from_cache(cache_path: Path) -> List[Tuple[str, str]]:
     ]
 
 
-def _save_cache(cache_path: Path, records: List[Tuple[str, str]]) -> None:
+def _save_cache(cache_path: Path, records: List[Tuple[str, str]], fasta_path: Path) -> None:
     n = len(records)
     width = max(len(seq) for _, seq in records)
     matrix = np.zeros((n, width), dtype=np.uint8)
@@ -110,10 +134,15 @@ def _save_cache(cache_path: Path, records: List[Tuple[str, str]]) -> None:
         matrix[i, : len(b)] = np.frombuffer(b, dtype=np.uint8)
     names = np.array([r[0] for r in records])  # auto fixed-width unicode
 
+    try:
+        src_size = np.array(int(fasta_path.stat().st_size), dtype=np.int64)
+    except OSError:
+        src_size = np.array(-1, dtype=np.int64)
+
     # Atomic write: a partial sidecar would falsely look "fresh" by
     # mtime on the next open and break `_load_from_cache`.
     tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    np.savez(tmp, seqs=matrix, names=names)
+    np.savez(tmp, seqs=matrix, names=names, src_size=src_size)
     tmp.replace(cache_path)
 
 
