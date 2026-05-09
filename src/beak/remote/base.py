@@ -23,6 +23,19 @@ from typing import Dict, Optional
 _JOB_DB_LOCK = threading.RLock()
 
 
+def _tail_lines(text: str, n: int) -> str:
+    """Return the last `n` non-empty lines of `text`, joined with newlines.
+
+    Used to keep RuntimeError messages from Docker failures readable —
+    a full `docker compose build` log can be hundreds of lines, and
+    raising a 20KB exception text into the TUI breaks the modal.
+    """
+    if not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[-n:])
+
+
 class RemoteJobManager:
     """Base class for remote job management.
 
@@ -277,16 +290,98 @@ class RemoteJobManager:
         """Load local job database, tolerating a partially-written file.
 
         A SIGKILL or disk-full mid-`_save_job_db` could leave the file
-        truncated; `json.JSONDecodeError` is treated as "no jobs yet"
-        rather than crashing the whole TUI. Holds the lock so a
-        concurrent writer can't move the file out from under us.
+        truncated. We DO NOT silently treat a corrupt non-empty file
+        as "no jobs yet" — that would let the next write clobber a
+        recoverable file with `{}`. Instead, on parse failure of a
+        non-empty file, we (a) preserve the corrupt bytes by renaming
+        them to `<file>.corrupt-<ts>` for forensic recovery, (b) try a
+        sibling `<file>.bak` if one exists, and only then (c) fall
+        back to an empty dict. Truly missing / zero-byte files are
+        still treated as "no jobs yet" — that's the legitimate
+        first-run state.
         """
         with _JOB_DB_LOCK:
+            return self._load_job_db_locked()
+
+    def _load_job_db_locked(self) -> Dict:
+        path = self.local_job_db
+        try:
+            with open(path, 'r') as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return {}
+        if not raw.strip():
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        # Non-empty but un-parseable. Quarantine the corrupt file so a
+        # subsequent _save_job_db can't overwrite the recoverable bytes,
+        # then try the .bak sibling (written by _save_job_db before
+        # replace), then give up to an empty dict as a last resort.
+        self._quarantine(path, "corrupt")
+        bak = path.with_suffix(path.suffix + '.bak')
+        if bak.exists():
             try:
-                with open(self.local_job_db, 'r') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                return {}
+                with open(bak, 'r') as f:
+                    raw_bak = f.read()
+                if raw_bak.strip():
+                    try:
+                        db = json.loads(raw_bak)
+                    except json.JSONDecodeError:
+                        # The backup itself is corrupt — quarantine it
+                        # too so the next save doesn't overwrite, and
+                        # fall through to the empty-dict warning. The
+                        # earlier code silently lost the .bak bytes here.
+                        self._quarantine(bak, "bak-corrupt")
+                    else:
+                        print(f"✓ Recovered {len(db)} job(s) from {bak.name}")
+                        return db
+            except OSError:
+                pass
+        print(
+            "⚠ No usable job db backup found — starting fresh. Any "
+            "preserved *.corrupt-* / *.bak-corrupt-* files are intact "
+            "for forensic recovery."
+        )
+        return {}
+
+    @staticmethod
+    def _quarantine(path: Path, kind: str) -> None:
+        """Rename a corrupt file out of the way without ever overwriting.
+
+        `int(time.time())` had 1-second resolution — two corruptions in
+        the same wall-second would collide and `os.replace` would
+        silently overwrite the first quarantine, losing the original
+        evidence. We use nanoseconds plus an incrementing suffix as a
+        belt-and-braces guarantee that no two quarantines ever map to
+        the same filename, even on filesystems that round mtimes.
+        """
+        try:
+            import time as _time
+            base = path.with_suffix(path.suffix + f'.{kind}-{_time.time_ns()}')
+            target = base
+            i = 0
+            while target.exists():
+                i += 1
+                target = base.with_name(base.name + f'.{i}')
+            # `os.rename` (not `os.replace`) so a residual collision
+            # raises rather than silently clobbering.
+            os.rename(path, target)
+            print(
+                f"⚠ {path.name} was {kind} — preserved at {target.name}"
+            )
+        except OSError as e:
+            # Last resort: log to stderr so the user at least knows the
+            # file was unrecoverable. We do NOT swallow silently — the
+            # caller's "starting fresh" warning would otherwise look
+            # like a clean state when it isn't.
+            import sys as _sys
+            print(
+                f"⚠ Failed to quarantine {path.name} ({kind}): {e}",
+                file=_sys.stderr,
+            )
 
     def _save_job_db(self, db: Dict):
         """Save local job database via temp + atomic rename.
@@ -296,19 +391,30 @@ class RemoteJobManager:
         crash mid-write would corrupt jobs.json. The lock + tmp+replace
         pattern eliminates both classes of bug — readers always see a
         complete file, writers never lose updates.
+
+        Before each replace we copy the current file to `<file>.bak`
+        so the recovery path in `_load_job_db_locked` has something to
+        fall back to if a writer crashes mid-rename on a system where
+        replace isn't atomic against power loss.
         """
         with _JOB_DB_LOCK:
-            tmp = self.local_job_db.with_suffix(self.local_job_db.suffix + '.tmp')
+            path = self.local_job_db
+            if path.exists():
+                try:
+                    bak = path.with_suffix(path.suffix + '.bak')
+                    import shutil
+                    shutil.copy2(path, bak)
+                except OSError:
+                    pass
+            tmp = path.with_suffix(path.suffix + '.tmp')
             with open(tmp, 'w') as f:
                 json.dump(db, f, indent=2)
-                # fsync the data to disk before the rename so a power
-                # loss can't leave a renamed-but-zero-byte file.
                 f.flush()
                 try:
                     os.fsync(f.fileno())
                 except OSError:
                     pass
-            os.replace(tmp, self.local_job_db)
+            os.replace(tmp, path)
 
     @contextmanager
     def _mutate_job_db(self):
@@ -615,12 +721,19 @@ class RemoteJobManager:
         submitted_at = datetime.fromisoformat(job_info['submitted_at'])
         runtime = str(datetime.now() - submitted_at).split('.')[0]
 
-        # Parse progress if running
+        # Parse progress if running. Tools like Clustal Omega emit
+        # progress lines using bare carriage returns (in-place
+        # progress bars) rather than newlines; without `tr '\r' '\n'`
+        # the entire run lands in `tail`'s output as a single huge
+        # "line", and `re.search` for the counter then returns the
+        # *first* match (1 out of 475) instead of the latest.
         progress = {}
         if status in ['RUNNING', 'SUBMITTED'] and log_file:
             log_result = self.conn.run(
-                f'tail -n 100 {remote_path}/{log_file} 2>/dev/null || echo "No log file"',
-                hide=True, warn=True
+                f"tail -n 200 {remote_path}/{log_file} 2>/dev/null "
+                f"| tr '\\r' '\\n' "
+                f'|| echo "No log file"',
+                hide=True, warn=True,
             )
             progress = self._parse_log_progress(log_result.stdout, log_operations)
 
@@ -651,10 +764,17 @@ class RemoteJobManager:
         # sentence-like form), falling back to the raw tail.
         last_log_line = None
         if status in ['RUNNING', 'SUBMITTED'] and log_file:
+            # `tr '\r' '\n'` splits Clustal Omega's CR-driven in-place
+            # progress bar back into one line per update, so the
+            # informative-line picker can return just the most recent
+            # frame rather than a 5KB blob of concatenated updates.
             log_tail = self.conn.run(
-                f"tail -n 30 {remote_path}/{log_file} 2>/dev/null | "
-                r"sed 's/\x1b\[[0-9;]*m//g' | grep -v '^\s*$'",
-                hide=True, warn=True
+                f"tail -n 200 {remote_path}/{log_file} 2>/dev/null "
+                f"| tr '\\r' '\\n' "
+                r"| sed 's/\x1b\[[0-9;]*m//g' "
+                r"| grep -v '^\s*$' "
+                f"| tail -n 30",
+                hide=True, warn=True,
             )
             last_log_line = self._pick_informative_log_line(log_tail.stdout)
 
@@ -715,7 +835,14 @@ class RemoteJobManager:
         if not log_content or log_content == "No log file":
             return progress
 
-        lines = log_content.strip().split('\n')
+        # Defensive: some progress-emitting tools (Clustal Omega's
+        # "Progressive alignment progress: NN %" updates, MMseqs2's
+        # status frames) use bare carriage returns to overwrite the
+        # same line in-place. Without this translation a 1MB log
+        # collapses to a single str.split('\n') entry and the regex
+        # below picks the *first* counter ("1 out of 475") instead
+        # of the latest.
+        lines = log_content.replace('\r', '\n').strip().split('\n')
 
         # Parse prefiltering step.
         prefilter_pattern = r'Process prefiltering step (\d+) of (\d+)'
@@ -1068,20 +1195,37 @@ class RemoteJobManager:
 
         if keep_results:
             # Targeted cleanup of just the per-job `tmp/` subdir.
-            self.conn.run(
+            res = self.conn.run(
                 'set -e; '
                 f'p={quoted}/tmp; '
                 'if [ -d "$p" ] && [ ! -L "$p" ]; then rm -rf -- "$p"; fi',
                 hide=True, warn=True,
             )
+            if not res.ok:
+                raise RuntimeError(
+                    f"Remote cleanup of {remote_path}/tmp failed "
+                    f"(exit={res.return_code}): "
+                    f"{(res.stderr or res.stdout or '').strip()[:200]}"
+                )
             print(f"✓ Cleaned up temp files for job {job_id}")
         else:
-            self.conn.run(
+            res = self.conn.run(
                 'set -e; '
                 f'p={quoted}; '
                 'if [ -d "$p" ] && [ ! -L "$p" ]; then rm -rf -- "$p"; fi',
                 hide=True, warn=True,
             )
+            if not res.ok:
+                # Do NOT pop the local jobs.json entry when the remote rm
+                # failed — that would orphan the remote dir and leave the
+                # user with no pointer to find it again. Surface the
+                # failure so the caller (a TUI worker / cascade-cleanup)
+                # can warn the user and offer a retry.
+                raise RuntimeError(
+                    f"Remote cleanup of {remote_path} failed "
+                    f"(exit={res.return_code}): "
+                    f"{(res.stderr or res.stdout or '').strip()[:200]}"
+                )
             with self._mutate_job_db() as db:
                 db.pop(job_id, None)
             print(f"✓ Cleaned up job {job_id}")
@@ -1189,6 +1333,159 @@ class RemoteJobManager:
             return shared_dir, project_name, True
         return f"{self.remote_job_dir}/docker", project_name, False
 
+    # Published PyTorch CUDA wheel matrix — what tags exist on
+    # download.pytorch.org/whl/<tag> AND the floor compute capability
+    # each one ships kernels for. The compute-cap floor is the part
+    # that actually bites: CUDA forward-compatibility (since 11.0)
+    # makes any cu12X wheel runnable on any driver >= 525, but newer
+    # wheels drop kernel binaries for older architectures even when
+    # the driver itself would happily host them. cu128 is the canonical
+    # example — it drops Pascal (6.1) and Volta (7.0), so picking it
+    # by driver-version-match alone breaks 1080 Ti / P100 / V100 hosts.
+    # Same trap was reported as `astral-sh/uv#14742` (`torch-backend=auto`
+    # on a 1080 Ti).
+    #
+    # The compute-cap thresholds below are conservative — they reflect
+    # what each wheel guarantees support for. Verified against PyTorch
+    # 2.x release notes; bias toward "older minimum" rather than
+    # "officially advertised" so the Dockerfile fallback only fires on
+    # truly-unpublished tags.
+    _PUBLISHED_PYTORCH_CUDA_WHEELS = (
+        # (cuda_major, cuda_minor, min_compute_cap, tag)
+        (11, 8, (3, 7), "cu118"),
+        (12, 1, (5, 0), "cu121"),
+        (12, 4, (5, 0), "cu124"),
+        (12, 6, (5, 0), "cu126"),  # last wheel with Pascal/Volta kernels
+        (12, 8, (7, 5), "cu128"),  # drops 6.x/7.0; adds Blackwell (12.0)
+    )
+
+    # When detection can't tell us anything (no nvidia-smi, parse error,
+    # CPU-only host), default to cu126: runs on any CUDA-12.x driver via
+    # forward-compat *and* has kernels for every GPU PyTorch supports
+    # (5.0 → 9.0). Slightly older than the absolute newest wheel, but
+    # safe across the entire fleet beak might be deployed against.
+    _DEFAULT_TORCH_CUDA_TAG = "cu126"
+
+    def _detect_torch_cuda_tag(self, fallback: str = _DEFAULT_TORCH_CUDA_TAG) -> str:
+        """Pick a `cuXYZ` PyTorch wheel for the remote.
+
+        Two signals from `nvidia-smi`:
+          1. Driver's max-supported CUDA (from the human-readable
+             ``CUDA Version: X.Y`` header line).
+          2. Per-GPU compute capability (``--query-gpu=compute_cap``).
+
+        Selection rule (matches NVIDIA's wheel-variant blog and the
+        PyTorch forum guidance for mixed-GPU hosts):
+          * Highest published wheel whose
+            ``cuda_major == driver_major`` and
+            ``(cuda_major, cuda_minor) < (driver_major, driver_minor)``
+            and ``min_compute_cap <= host_min_compute_cap``.
+          * If compute cap is unknown, cap at cu126 (= last wheel
+            that ships Pascal/Volta kernels). Driver version alone is
+            *not* enough — that's the exact bug the uv ``torch-backend
+            =auto`` issue tracks, and it's what failed for us with
+            ``cu128`` on a driver that reports CUDA 12.8.
+
+        The strictly-less-than rule on ``(major, minor)`` is the part
+        that fixes the patch-level trap: a `cu128` wheel built against
+        CUDA toolkit 12.8.x can require a driver patch (12.8.y, y>x)
+        that ``nvidia-smi`` doesn't expose. Stepping back one
+        published minor (e.g. cu126 on a 12.8 driver) leans on CUDA
+        forward-compat — which the docs guarantee inside a major
+        family ≥ 11.0 — and sidesteps the patch-level drift entirely.
+
+        Wheels older than the driver's major are still selectable —
+        forward-compat covers them — but we don't go below the major
+        because `cu118` on a CUDA-12 driver wastes kernels.
+
+        Run-once-cache via attr so repeated submissions in the same
+        process don't re-SSH for the same answer.
+        """
+        cached = getattr(self, "_torch_cuda_tag_cache", None)
+        if cached is not None:
+            return cached
+
+        # One nvidia-smi roundtrip pulls both the driver's max CUDA
+        # (header line) and the per-GPU compute caps. Newer drivers
+        # (>=470) support `--query-gpu=compute_cap`; older ones
+        # produce empty output for that flag, which we treat as
+        # "unknown" and fall back on.
+        result = self.conn.run(
+            "nvidia-smi 2>/dev/null; echo '---compute---'; "
+            "nvidia-smi --query-gpu=compute_cap "
+            "--format=csv,noheader,nounits 2>/dev/null",
+            hide=True, warn=True,
+        )
+        stdout = (result.stdout or "")
+
+        driver_major = driver_minor = None
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("CUDA Version: "):
+                try:
+                    parts = line.split(": ", 1)[1].strip().split(".")
+                    driver_major, driver_minor = int(parts[0]), int(parts[1])
+                except (ValueError, IndexError):
+                    pass
+                break
+
+        # Compute cap section is everything after the sentinel. Take the
+        # *minimum* — a wheel needs to support the slowest card so a
+        # mixed-GPU host doesn't break submissions that land on the
+        # older one.
+        host_min_cc = None
+        if "---compute---" in stdout:
+            cc_block = stdout.split("---compute---", 1)[1]
+            ccs = []
+            for line in cc_block.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    maj_s, min_s = line.split(".")
+                    ccs.append((int(maj_s), int(min_s)))
+                except (ValueError, IndexError):
+                    continue
+            if ccs:
+                host_min_cc = min(ccs)
+
+        # No driver info at all → fallback (caller already gave us a
+        # safe default).
+        if driver_major is None:
+            self._torch_cuda_tag_cache = fallback
+            return fallback
+
+        # Two-pass walk: first pass requires strictly-less-than the
+        # driver's (major, minor) to dodge the patch-level trap; second
+        # pass relaxes to ≤ in case the driver is at the bottom of its
+        # major (12.1, 11.8) and there's no older wheel in the same
+        # family. Picking an equal-version wheel for these old-but-
+        # established CUDA releases is fine — patch-drift is a problem
+        # for the HIGHEST minor of a current release, not for long-
+        # settled versions like cu121 or cu118. Returning ``None`` when
+        # a pass finds nothing in-major distinguishes "found nothing"
+        # from "legitimately selected the fallback value".
+        def _walk(strict: bool) -> Optional[str]:
+            chosen: Optional[str] = None
+            for cu_major, cu_minor, min_cc, tag in self._PUBLISHED_PYTORCH_CUDA_WHEELS:
+                if cu_major != driver_major:
+                    continue
+                if strict:
+                    if (cu_major, cu_minor) >= (driver_major, driver_minor):
+                        continue
+                else:
+                    if (cu_major, cu_minor) > (driver_major, driver_minor):
+                        continue
+                if host_min_cc is not None and min_cc > host_min_cc:
+                    continue
+                chosen = tag
+            return chosen
+
+        best = _walk(strict=True) or _walk(strict=False) or fallback
+
+        self._torch_cuda_tag_cache = best
+        return best
+
     def _ensure_docker_service(self, service_name: str = "embeddings"):
         """Ensure the Docker service is deployed, up to date, and running.
 
@@ -1224,6 +1521,17 @@ class RemoteJobManager:
 
         self._upload_docker_files(docker_dir)
 
+        # Pick a torch CUDA wheel that matches the host's driver. We
+        # query the driver's reported max-supported CUDA version
+        # (e.g. "12.8" on a CUDA 12.8 driver) and translate to the
+        # PyTorch wheel tag (e.g. "cu128"). The Dockerfile's build
+        # arg + shell-fallback handles the case where the requested
+        # tag isn't published yet — at worst we land on cu121, which
+        # works for any CUDA-12.x driver. Without this, every host
+        # gets the same hardcoded wheel and breaks on drivers
+        # outside its compatible range.
+        torch_cuda_tag = self._detect_torch_cuda_tag()
+
         # Always run `up -d --build`. Docker layer caching makes this near-
         # free when nothing changed (a few seconds of compose overhead), and
         # it's the only way changes to the uploaded source files actually
@@ -1232,20 +1540,118 @@ class RemoteJobManager:
         # when the service was already running, which meant source-level
         # bug fixes silently failed to deploy.
         where = "shared" if is_shared else "per-user"
-        print(f"Starting Docker service '{service_name}' ({where}, build if needed)...")
+        print(
+            f"Starting Docker service '{service_name}' ({where}, "
+            f"torch wheel: {torch_cuda_tag}, build if needed)..."
+        )
         with self.conn.cd(docker_dir):
-            result = self.conn.run(
-                f'{compose} up -d --build',
+            build_result = self.conn.run(
+                f'{compose} build --build-arg TORCH_CUDA_TAG={torch_cuda_tag}',
                 hide=True, warn=True,
             )
+            if not build_result.ok:
+                # Surface the actual error in the exception message so
+                # callers (TUI submit modal, CLI) see *why* the build
+                # failed without having to ssh into the remote and dig
+                # through logs. Tail the output to keep the message
+                # readable — full output is still on the conn's logs.
+                tail = _tail_lines(build_result.stdout, 20)
+                stderr_tail = _tail_lines(build_result.stderr, 10)
+                detail = tail
+                if stderr_tail.strip():
+                    detail += "\n--- stderr ---\n" + stderr_tail
+                raise RuntimeError(
+                    f"Docker build failed (exit {build_result.exited}, "
+                    f"torch wheel tag: {torch_cuda_tag}).\n{detail}"
+                )
+            # `--remove-orphans` cleans up stale containers from a
+            # previous compose project name (we saw this with
+            # `docker-embeddings-1` lingering in a restart loop after
+            # a service-dir rename). `--force-recreate` rebuilds the
+            # container even when only the image changed underneath
+            # — without it, a Dockerfile bump (e.g. base image change)
+            # produces a name conflict on `up`:
+            #   "Conflict. The container name '/beak-embeddings-1' is
+            #    already in use by container ..."
+            # because compose tries to start a new container with the
+            # same name as the running one. force-recreate stops + rms
+            # the old one first.
+            result = self.conn.run(
+                f'{compose} up -d --remove-orphans --force-recreate',
+                hide=True, warn=True,
+            )
+            # Stale-state recovery. `up --force-recreate` can fail in
+            # several ways when a previous run left the daemon in a
+            # half-finished state — names conflicting with a stopped
+            # container, a temp-renamed container the daemon can't
+            # find ("No such container: <hash>_beak-embeddings-1"),
+            # or a project-name change that orphaned the old set.
+            # Whenever any of those signatures show up, do a hard
+            # teardown — `down -v --remove-orphans`, plus a
+            # belt-and-braces `docker rm -f` against every container
+            # whose name contains the service name (catches the
+            # hash-prefixed rename-in-progress case the docker filter
+            # would otherwise miss because the daemon-side rename
+            # didn't update the compose label) — and retry once.
+            if not result.ok:
+                blob = (
+                    (result.stderr or '').lower()
+                    + (result.stdout or '').lower()
+                )
+                stale_state = any(s in blob for s in (
+                    'conflict', 'already in use',
+                    'no such container',
+                    'name is reserved',
+                    'name is already used',
+                    'rename',
+                ))
+                if stale_state:
+                    print(
+                        "  Docker container in stale state — full reset "
+                        "(down -v, rm -f) and retry."
+                    )
+                    # SAFETY: scope the rm to compose-tagged containers
+                    # only. The earlier `--filter "name={service_name}"`
+                    # was a substring match, which on a shared remote
+                    # would have killed any container whose name
+                    # contained "embeddings" (e.g. a colleague's
+                    # `embeddings-api` or `my-embeddings-test`). Compose
+                    # tags every container it creates with the
+                    # `com.docker.compose.project` label, so filtering
+                    # by that label is exactly the set we care about
+                    # and nothing else. Same protection applies to the
+                    # network rm — networks created by `up` carry the
+                    # same project label.
+                    self.conn.run(
+                        # 1. Clean compose-managed teardown (best
+                        #    effort — may already be partially down).
+                        f'{compose} down --remove-orphans -v 2>/dev/null; '
+                        # 2. Force-remove only this project's
+                        #    containers (catches the hash-prefixed
+                        #    rename-in-progress variant compose
+                        #    creates during `--force-recreate`).
+                        f'docker ps -aq '
+                        f'--filter "label=com.docker.compose.project={project_name}" '
+                        f'| xargs -r docker rm -f 2>/dev/null; '
+                        # 3. Same label scope for networks.
+                        f'docker network ls -q '
+                        f'--filter "label=com.docker.compose.project={project_name}" '
+                        f'| xargs -r docker network rm 2>/dev/null',
+                        hide=True, warn=True,
+                    )
+                    result = self.conn.run(
+                        f'{compose} up -d --remove-orphans --force-recreate',
+                        hide=True, warn=True,
+                    )
         if not result.ok:
-            print("✗ Docker service failed to start. Build output:\n")
-            print(result.stdout)
-            if result.stderr.strip():
-                print("\nstderr:\n" + result.stderr)
+            tail = _tail_lines(result.stdout, 20)
+            stderr_tail = _tail_lines(result.stderr, 10)
+            detail = tail
+            if stderr_tail.strip():
+                detail += "\n--- stderr ---\n" + stderr_tail
             raise RuntimeError(
                 f"Docker service '{service_name}' failed to start "
-                f"(exit {result.exited}). See output above."
+                f"(exit {result.exited}).\n{detail}"
             )
 
         # Wait for the container to actually be ready for exec.
