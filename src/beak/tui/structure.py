@@ -29,6 +29,55 @@ _BRAILLE_BITS = {
 }
 
 
+def read_cif_meta(cif_path: Path) -> dict:
+    """Return resolution and experimental method extracted from a CIF header.
+
+    Keys:
+      ``resolution`` — float (Å) or None; populated for X-ray and EM
+      ``method``     — abbreviated string or None ("X-ray", "cryo-EM", "NMR", …)
+
+    Returns an empty dict on any read / parse failure so callers can
+    treat it as optional metadata and still render without it.
+    """
+    try:
+        import gemmi
+        doc = gemmi.cif.read(str(cif_path))
+        block = doc.sole_block()
+
+        res = None
+        for tag in (
+            "_refine.ls_d_res_high",
+            "_reflns.d_resolution_high",
+            "_em_3d_reconstruction.resolution",
+        ):
+            v = block.find_value(tag)
+            if v and v not in ("?", "."):
+                try:
+                    res = float(v.strip("'\""))
+                    break
+                except (ValueError, TypeError):
+                    pass
+
+        method = None
+        v = block.find_value("_exptl.method")
+        if v and v not in ("?", "."):
+            raw = v.strip("'\"").upper()
+            if "X-RAY" in raw:
+                method = "X-ray"
+            elif "ELECTRON MICROSCOPY" in raw:
+                method = "cryo-EM"
+            elif "NMR" in raw:
+                method = "NMR"
+            elif "NEUTRON" in raw:
+                method = "neutron"
+            else:
+                method = raw.title()
+
+        return {"resolution": res, "method": method}
+    except Exception:
+        return {}
+
+
 def fetch_alphafold(uniprot_id: str, dest_dir: Path) -> Path:
     """Download AF model into dest_dir, return path. Cached on disk."""
     from ..api.structures import resolve_alphafold_url, _download_file

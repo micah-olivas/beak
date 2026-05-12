@@ -179,6 +179,10 @@ class BeakApp(App):
         width: 100%;
     }}
 
+    #target-panel:hover {{
+        background: $boost;
+    }}
+
     /* Explicit percentages — `1fr` was getting clipped to a small width
        when struct-col claimed too much under `auto`, squeezing the layers
        panel and truncating the homologs count + hiding the pills. */
@@ -221,6 +225,12 @@ class BeakApp(App):
         margin-left: 1;
         min-width: 8;
         dock: right;
+    }}
+
+    #struct-meta {{
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
     }}
 
     #sequence-view {{
@@ -309,19 +319,23 @@ class BeakApp(App):
         width: 96;
         max-height: 90%;
     }}
-    /* Structures-layer gallery — fills the full LayerDetailModal so
-       the spinning braille structure renders at maximum useful size
-       (about 130 cells wide × ~30 rows on a typical terminal). The
-       canvas takes the remaining vertical space after the title and
-       hint rows. */
-    LayerDetailModal #struct-gallery-title {{
-        height: 1;
-        content-align: center middle;
-        margin-top: 1;
-    }}
+    /* Structures-layer gallery — canvas fills available space; the
+       info card sits below it as a bordered panel. */
     LayerDetailModal _StructureGalleryCanvas {{
         height: 1fr;
         min-height: 20;
+    }}
+    LayerDetailModal #struct-gallery-card {{
+        height: auto;
+        border: round $surface-lighten-1;
+        padding: 0 1;
+        margin-top: 1;
+        margin-bottom: 0;
+    }}
+    LayerDetailModal #struct-gallery-title {{
+        height: 1;
+        content-align: center middle;
+        overflow: hidden hidden;
     }}
     LayerDetailModal #struct-gallery-hint {{
         height: 1;
@@ -910,6 +924,30 @@ class BeakApp(App):
                     f.write(f"  err getting stack: {e!r}\n")
         except Exception:  # noqa: BLE001
             pass
+
+    def action_quit(self) -> None:
+        """Exit the app immediately, bypassing thread-pool join.
+
+        Textual's graceful ``app.exit()`` waits for all
+        ``@work(thread=True)`` workers to finish. Those workers open SSH
+        connections with a 10-second connect_timeout, so pressing ``q``
+        while a status poll is in-flight leaves the terminal hanging for
+        up to 10 s. ``os._exit`` skips Python's non-daemon thread join
+        entirely, matching the SIGUSR2 panic-exit pattern already in
+        this file.
+        """
+        try:
+            import faulthandler as _fh
+            _fh.cancel_dump_traceback_later()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            import os as _os
+            _os.system("stty sane 2>/dev/null")
+        except Exception:  # noqa: BLE001
+            pass
+        import os as _os
+        _os._exit(0)
 
     def _panic_exit(self, signum=None, frame=None) -> None:
         """SIGUSR2 handler: bail out hard, leave a note about why.

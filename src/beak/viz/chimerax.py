@@ -180,6 +180,36 @@ _PALETTES = {
 }
 
 
+# Pfam categorical palette — kept in sync with tui.structure.DOMAIN_PALETTE
+# (duplicated here so `viz` stays independent of the `tui` module). Order
+# matches the TUI's sequence-view and structure-view domain coloring, so
+# a `Pfam` ChimeraX export looks like the TUI panel it was rendered from.
+_PFAM_DOMAIN_PALETTE = ("#FF6B9D", "#FFA62B", "#A66DD4", "#3DCFD4", "#7DD87D")
+_PFAM_NONE_COLOR = "#3A3F4A"
+
+
+def _resnum_ranges(resnums) -> str:
+    """Compress sorted residue numbers into ChimeraX `a-b,c-d` notation.
+
+    A 200-residue domain reduces to a single ``"21-220"`` token, which
+    keeps the generated `color` commands short and readable. Singletons
+    fall through as bare numbers (``"42"``).
+    """
+    if not resnums:
+        return ""
+    rs = sorted({int(r) for r in resnums})
+    out = []
+    start = end = rs[0]
+    for n in rs[1:]:
+        if n == end + 1:
+            end = n
+        else:
+            out.append(f"{start}-{end}" if end > start else f"{start}")
+            start = end = n
+    out.append(f"{start}-{end}" if end > start else f"{start}")
+    return ",".join(out)
+
+
 # Mode-specific score thresholds for the "highlight as sticks" overlay.
 # A residue earns a stick if its score crosses this threshold (sign for
 # differential — symmetric around 0). Tuned so a typical project
@@ -463,13 +493,20 @@ _run(
 # itself: the active legend + title always reflect the most-recently-
 # loaded export.
 #
-# Layout: title centered at xpos 0.5 above the bar; units a smaller
-# second line below the title (still above the bar). xpos 0.5 with
-# default-centered alignment keeps the text visually centred on the
-# bar (which spans 0.3..0.7 with size 0.4 from the `key` command).
+# Layout: title and units centered above the bar (bar spans 0.3–0.7,
+# center at x=0.5). `2dlabels xpos` positions the label's LEFT edge,
+# so we offset left by half the label's approximate pixel width
+# (0.55 × fontSize × nchars / window_width_px). Character count is
+# baked in at script-generation time; window width is queried at
+# runtime via session.view.window_size so the result is correct on
+# HiDPI / 4K screens too.
+_sw, _sh = session.view.window_size
+_title_xpos = max(0.0, 0.5 - ({len(axis_title_safe)} * 0.55 * 16) / (2 * _sw))
+_units_text = "{("(" + axis_units_safe + ")") if axis_units_safe else ""}"
+_units_xpos  = max(0.0, 0.5 - (len(_units_text) * 0.55 * 11) / (2 * _sw))
 _title_args = (
     f'text "{axis_title_safe}" '
-    f'xpos 0.5 ypos 0.135 color black size 16 '
+    f'xpos {{_title_xpos:.4f}} ypos 0.135 color black size 16 '
     f'visibility true'
 )
 try:
@@ -481,14 +518,178 @@ except Exception:
 # when no units) so a second export that switches modes correctly
 # clears any previously-shown units string.
 _units_args = (
-    f'text "{("(" + axis_units_safe + ")") if axis_units_safe else ""}" '
-    f'xpos 0.5 ypos 0.108 color #555555 size 11 '
+    f'text "{{_units_text}}" '
+    f'xpos {{_units_xpos:.4f}} ypos 0.108 color #555555 size 11 '
     f'visibility true'
 )
 try:
     _run(f"2dlabels create beak_keyunits {{_units_args}}")
 except Exception:
     _run(f"2dlabels change beak_keyunits {{_units_args}}")
+'''
+
+
+def _build_pfam_helper_script(
+    chain_name: str,
+    pfam_domains: list,
+    domain_resnums: dict,
+    title: Optional[str],  # accepted for API symmetry; unused in pfam mode
+) -> str:
+    """Categorical Pfam rendering: per-domain colors + submodel grouping.
+
+    Pfam is categorical, so a continuous palette / colorbar legend
+    misrepresents the data. This helper:
+      * Paints each domain with a palette color matching the TUI's
+        domain bars.
+      * Uses `split atoms <spec>` to break the structure into one
+        ChimeraX submodel per Pfam hit (#1.1, #1.2, …) plus one
+        "unannotated" submodel for everything outside any domain.
+      * `rename`s each submodel to its pfam_name, so the Models
+        panel reads like the project's domain layout (with the eye
+        icon next to each name toggling that group on/off).
+      * Also registers each submodel as a `name`d selection so
+        commands like ``select HypF_C`` / ``hide ~HypF_C`` work from
+        the command line without typing residue specs.
+
+    No colorbar legend or title 2dlabel is emitted in pfam mode.
+
+    Args:
+        chain_name: CIF chain to color.
+        pfam_domains: Ordered list of ``{pfam_id, pfam_name, env_from,
+            env_to, …}`` manifest dicts; index → palette color
+            matches `tui.structure.DOMAIN_PALETTE`.
+        domain_resnums: ``{domain_index: [cif_resnum, …]}`` pre-computed
+            from the target → cif residue mapping.
+        title: ignored (kept for symmetry with `_build_helper_script`).
+    """
+    del title  # unused
+
+    color_lines = []
+    split_atom_specs = []  # `atoms #_mid/A:21-110` fragments for `split`
+    rename_lines = []      # one `rename #_mid.N <slug>` per submodel
+    name_lines = []        # named selections after split
+    # Track the actual emitted slugs (not just base counts) — Pfam
+    # names like `HypF_C` and `HypF_C_2` can collide once we start
+    # appending dedup suffixes (a 2nd `HypF_C` would naively become
+    # `HypF_C_2`, which is another *real* Pfam name on this protein).
+    used_slugs: set = set()
+    submodel_idx = 0
+    for i, d in enumerate(pfam_domains):
+        resnums = domain_resnums.get(i, [])
+        if not resnums:
+            continue
+        color = _PFAM_DOMAIN_PALETTE[i % len(_PFAM_DOMAIN_PALETTE)]
+        rspec = _resnum_ranges(resnums)
+        spec = f"{{_mid}}/{chain_name}:{rspec}"
+        color_lines.append(
+            f'_run(f"color {spec} {color} target abcs")'
+        )
+        split_atom_specs.append(f"atoms {spec}")
+
+        pname = d.get("pfam_name") or d.get("pfam_id") or f"Domain{i}"
+        base = "".join(
+            c if c.isalnum() or c == "_" else "_" for c in str(pname)
+        ).strip("_") or f"domain_{i}"
+        slug = base
+        suffix = 2
+        while slug in used_slugs:
+            slug = f"{base}__{suffix}"
+            suffix += 1
+        used_slugs.add(slug)
+
+        submodel_idx += 1
+        # After split, this domain's atoms live at #<mid>.<submodel_idx>.
+        # The submodel ids are assigned in the order of the `atoms`
+        # arguments to `split`, so submodel_idx matches the loop order.
+        submodel_spec = f"{{_mid}}.{submodel_idx}"
+        rename_lines.append(f'_run(f"rename {submodel_spec} {slug}")')
+        name_lines.append(f'_run(f"name {slug} {submodel_spec}")')
+
+    n_domains = submodel_idx
+    residual_idx = n_domains + 1  # split puts leftover atoms in one extra submodel
+
+    color_block = (
+        "\n".join(color_lines) if color_lines
+        else "# (no Pfam domain residues mapped to this structure)"
+    )
+    split_args = " ".join(split_atom_specs)
+    rename_block = "\n".join(rename_lines)
+    name_block = "\n".join(name_lines)
+    have_domains = n_domains > 0
+
+    return f'''# Auto-generated by beak (Pfam categorical mode).
+#
+# Per-domain coloring + ChimeraX submodel split. After this script
+# runs, the Models panel shows one entry per Pfam domain (renamed to
+# the pfam_name), so each domain can be toggled / hidden / colored
+# independently with the eye icon. A residual "unannotated" submodel
+# holds everything outside any domain (linker regions, heteroatoms).
+#
+# Command-line examples:
+#   select HypF_C          # select that domain (named selection)
+#   color HypF_C magenta   # recolor it
+#   hide ~HypF_C           # hide everything else
+#   hide #1.5              # hide the "unannotated" submodel
+from chimerax.core.commands import run as _cx_run
+
+def _run(cmd):
+    _cx_run(session, cmd)
+
+_m = session.models.list()[-1]
+_mid = "#" + ".".join(str(p) for p in _m.id)
+
+_run(f"cartoon {{_mid}}")
+
+# Paint every residue with the "unannotated" color first; per-domain
+# colors overlay on top.
+_run(f"color {{_mid}} & protein {_PFAM_NONE_COLOR} target abcs")
+
+# Per-domain colors. Residue ranges are compressed to `a-b,c-d`
+# notation so a contiguous domain becomes a single token. Coloring
+# happens BEFORE the split so atoms carry their final color into the
+# resulting submodels.
+{color_block}
+
+# Heteroatoms (ligands / cofactors) recolored byhetero — keeps the
+# CPK convention for non-protein atoms.
+_run(f"color {{_mid}} & protein byhetero")
+''' + (f'''
+# Split the structure into one submodel per Pfam domain. Each `atoms`
+# argument produces one submodel containing those atoms; ChimeraX
+# adds one extra submodel for atoms not matched by any spec (linker
+# regions + heteroatoms). After split:
+#   #<mid>.1 .. #<mid>.{n_domains}    = pfam domains (in declaration order)
+#   #<mid>.{residual_idx}              = unannotated residual
+_run(f"split {{_mid}} {split_args}")
+
+# Rename each submodel to its Pfam name. The Models panel now reads
+# like the protein's domain architecture — clicking the eye icon
+# next to `Acylphosphatase` shows just that domain, etc. Duplicate
+# names (multiple hits of the same Pfam, e.g. zf-HYPF) get a numeric
+# suffix so each occurrence is independently addressable.
+{rename_block}
+_run(f"rename {{_mid}}.{residual_idx} unannotated")
+
+# Named selections — `select HypF_C`, `hide ~HypF_C`, etc. work from
+# the command line without typing residue specs. Same names as the
+# submodels above.
+{name_block}
+''' if have_domains else "") + f'''
+_run("set bgColor white")
+_run("lighting gentle")
+_run("graphics silhouettes true")
+
+# Clear any colorbar + title/units labels left by a previous beak
+# export (pfam mode doesn't use a colorbar legend).
+try:
+    _run("~key")
+except Exception:
+    pass
+for _lbl in ("beak_keytitle", "beak_keyunits"):
+    try:
+        _run(f"2dlabels delete {{_lbl}}")
+    except Exception:
+        pass
 '''
 
 
@@ -544,6 +745,7 @@ def export_chimerax(
     palette: Optional[str] = None,
     score_range: Optional[Tuple[float, float]] = None,
     highlight_threshold: Optional[float] = None,
+    pfam_domains: Optional[list] = None,
 ) -> Tuple[Path, Path, int]:
     """Write a coloured CIF + matching ChimeraX command script.
 
@@ -584,6 +786,34 @@ def export_chimerax(
     )
     if chain_name is None:
         raise ValueError(f"No polymer chain found in {cif_path}")
+
+    # Pfam categorical path — scores are domain *indices* (0, 1, 2, …;
+    # -1 = no domain). The generic byattribute-palette branch would
+    # interpolate them on a continuous ramp, which is meaningless for
+    # categorical data, so we route Pfam through its own helper that
+    # emits per-domain `color` commands and a discrete legend.
+    if mode == "pfam" and pfam_domains:
+        domain_resnums: dict = {}
+        for resnum, score in residue_scores.items():
+            idx = int(score)
+            if idx < 0:
+                continue
+            domain_resnums.setdefault(idx, []).append(resnum)
+        cif_out = out_dir / f"{name}.cif"
+        cxc_out = out_dir / f"{name}.cxc"
+        # Write the cif with b_iso = domain index (negative for
+        # unannotated). The pfam helper script doesn't read b_iso, but
+        # keeping the column populated means an exported cif opened
+        # *without* the .cxc still carries the categorical assignment.
+        n_set = _write_cif_with_bfactors(
+            cif_path, cif_out, chain_name, residue_scores, sentinel=-1.0,
+        )
+        py_out = out_dir / f"{name}.py"
+        py_out.write_text(_build_pfam_helper_script(
+            chain_name, list(pfam_domains), domain_resnums, title,
+        ))
+        cxc_out.write_text(_build_cxc_script(cif_out.name, py_out.name))
+        return cif_out, cxc_out, n_set
 
     pal, rng, sentinel = _PALETTES.get(mode, _PALETTES["differential"])
     if palette is not None:

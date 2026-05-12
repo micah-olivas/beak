@@ -83,11 +83,21 @@ class StructureView(Vertical):
         in which case we silently fall back to b_iso. Surfacing the
         resolved mode lets the parent screen re-sync the dropdown
         without re-querying the StructureView's internals.
+
+        `meta` carries the CIF header metadata (resolution, method)
+        extracted by `read_cif_meta`. Empty dict for AlphaFold models
+        or when the header couldn't be read.
         """
-        def __init__(self, cif_path: Path, effective_mode: str = "plddt") -> None:
+        def __init__(
+            self,
+            cif_path: Path,
+            effective_mode: str = "plddt",
+            meta: dict | None = None,
+        ) -> None:
             super().__init__()
             self.cif_path = cif_path
             self.effective_mode = effective_mode
+            self.meta: dict = meta if meta is not None else {}
 
     def __init__(self, project: BeakProject, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -108,6 +118,7 @@ class StructureView(Vertical):
         # otherwise has no reason to read the domains layer.
         self._pfam_idx = None
         self._cif_path: Optional[Path] = None
+        self._struct_meta: dict = {}
         # Honor persisted view prefs from the project manifest so the first
         # render after re-opening a project matches the user's last choice.
         prefs = (project.manifest().get("view") or {})
@@ -317,6 +328,18 @@ class StructureView(Vertical):
             label = active_label(self._project)
             if label:
                 title = f"{self._project.name} · {label}"
+        elif eff_mode == "pfam":
+            title = f"{self._project.name} · Pfam"
+        # Pfam needs the full domain hit list from the manifest so the
+        # export can emit per-domain color commands + a discrete legend
+        # keyed on pfam_name. For every other mode the parameter stays
+        # None and export_chimerax falls through to the generic
+        # byattribute-palette path.
+        pfam_domains = None
+        if eff_mode == "pfam":
+            pfam_domains = (
+                self._project.manifest().get("domains") or {}
+            ).get("hits") or None
         return export_chimerax(
             cif_path=cif_path,
             scores=scalars,
@@ -325,6 +348,7 @@ class StructureView(Vertical):
             name=name,
             mode=eff_mode,
             title=title,
+            pfam_domains=pfam_domains,
         )
 
     def set_midpoint(self, midpoint: float) -> None:
@@ -754,11 +778,22 @@ class StructureView(Vertical):
         self._sasa_target = sasa_target
         self._cif_seq = cif_seq
         self._target_seq = target_seq
+
+        # Extract resolution / method from the CIF header for the info row.
+        from ..structure import read_cif_meta
+        meta = read_cif_meta(cif_path)
+
         self.app.call_from_thread(
-            self._on_loaded, cif_path, uniprot, source_label,
+            self._on_loaded, cif_path, uniprot, source_label, meta,
         )
 
-    def _on_loaded(self, cif_path: Path, uniprot: str, source_label: str = "AlphaFold") -> None:
+    def _on_loaded(
+        self,
+        cif_path: Path,
+        uniprot: str,
+        source_label: str = "AlphaFold",
+        meta: dict | None = None,
+    ) -> None:
         # Worker → UI hop: the load worker fires `app.call_from_thread`
         # to land here, which can race the user popping the project
         # detail screen. Setting `border_title` and posting a message
@@ -766,6 +801,7 @@ class StructureView(Vertical):
         try:
             self._cif_path = cif_path
             self._source_label = source_label
+            self._struct_meta = meta if meta is not None else {}
             # Border reads e.g. "P00046 · PDB 2acp_A" or
             # "P00046 · AlphaFold" so the user can tell at a glance
             # which model the conservation/SASA/etc. is being mapped onto.
@@ -782,7 +818,11 @@ class StructureView(Vertical):
             self._refresh_subtitle()
             self._refresh_canvas()
             self.post_message(
-                self.CifLoaded(cif_path, effective_mode=self._color_mode),
+                self.CifLoaded(
+                    cif_path,
+                    effective_mode=self._color_mode,
+                    meta=self._struct_meta,
+                ),
             )
         except Exception:
             pass

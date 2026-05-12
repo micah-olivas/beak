@@ -227,6 +227,54 @@ def _job_status(job_id: str) -> str:
         return "?"
 
 
+def _job_info(job_id: str) -> dict:
+    """Full job record for `job_id` from `~/.beak/jobs.json`.
+
+    Returns `{}` when the file is missing, malformed, or the id isn't
+    in the DB. Used by the homologs Status section to surface preset
+    / threads / submitted-at without needing a separate accessor on
+    `RemoteJobManager` (which would require an SSH connection).
+    """
+    if not _JOBS_DB.exists():
+        return {}
+    try:
+        with open(_JOBS_DB) as f:
+            db = json.load(f)
+        return db.get(job_id) or {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _format_relative(iso_ts: str) -> str:
+    """Human-friendly age for an ISO-8601 timestamp.
+
+    `5m ago` / `2h ago` / `3d ago`. Falls back to the raw string when
+    parsing fails, so a malformed manifest entry still shows
+    *something*. Past-only — beak's persisted timestamps are always
+    in the past.
+    """
+    if not iso_ts:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(iso_ts)
+        now = datetime.now(ts.tzinfo) if ts.tzinfo else datetime.now()
+        delta = (now - ts).total_seconds()
+    except (ValueError, TypeError):
+        return iso_ts
+    if delta < 0:
+        return iso_ts
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    if delta < 86400 * 14:
+        return f"{int(delta // 86400)}d ago"
+    return f"{int(delta // 86400)}d ago"
+
+
 class _StructureGalleryCanvas(Static):
     """Inner braille-rendering canvas for the structures-layer view."""
 
@@ -368,12 +416,10 @@ class LayerDetailModal(ModalScreen):
         the structure itself, which was the most useful thing about
         having one cached locally.
         """
-        yield Label("", id="struct-gallery-title", classes="section-label")
         yield _StructureGalleryCanvas(self, id="struct-gallery-canvas")
-        yield Label(
-            "[dim]← →  switch · space  pause/resume[/dim]",
-            id="struct-gallery-hint",
-        )
+        with Vertical(id="struct-gallery-card"):
+            yield Label("", id="struct-gallery-title")
+            yield Label("", id="struct-gallery-hint")
         with Horizontal(id="modal-buttons"):
             yield Button("Close", id="close-btn")
 
@@ -736,10 +782,19 @@ class LayerDetailModal(ModalScreen):
             return f"{_one(lo)}–{_one(hi)}"
 
         # Diversity metrics — only meaningful once alignment has
-        # landed. Memoized + uses the .npz sidecar cache so we don't
-        # re-parse the FASTA on every cursor move.
+        # *completed* per the manifest. Reading `alignment.fasta`
+        # directly off disk means a stale or in-progress file (e.g.
+        # the alignment worker writing incrementally, or a
+        # leftover from a previous run) leaks numbers into a panel
+        # that the table row reports as not-yet-aligned. Trust the
+        # manifest — `n_aligned > 0` is the truth for "this set is
+        # actually aligned." Same gating applies to the %ID
+        # histogram in `_refresh_length_panel`.
         aln_path = self._project.homologs_set_dir(set_name) / "alignment.fasta"
-        metrics = self._cached_alignment_metrics(set_name, aln_path)
+        metrics = (
+            self._cached_alignment_metrics(set_name, aln_path)
+            if n_aligned else {}
+        )
         if metrics:
             ident = metrics.get("mean_identity")
             neff = metrics.get("neff_at_80")
@@ -763,17 +818,25 @@ class LayerDetailModal(ModalScreen):
                 import pandas as pd
                 tax = pd.read_parquet(tax_path)
                 tax_rows: list = []
+                n_total = len(tax)
                 if "domain" in tax.columns:
                     domain_counts = tax["domain"].dropna().value_counts().head(3)
-                    if len(domain_counts):
-                        tax_rows.append(self._kv(
-                            "Domains",
-                            " · ".join(
-                                f"{d} {n}" for d, n in domain_counts.items()
-                            ),
-                        ))
+                    n_classified = int(tax["domain"].notna().sum())
+                    n_unclassified = n_total - n_classified
+                    domain_parts = " · ".join(
+                        f"{d} {n}" for d, n in domain_counts.items()
+                    )
+                    if n_unclassified > 0:
+                        domain_parts += f" · Unclassified {n_unclassified}"
+                    if domain_parts:
+                        tax_rows.append(self._kv("Domains", domain_parts))
                 if "phylum" in tax.columns:
-                    phylum_counts = tax["phylum"].dropna().value_counts().head(3)
+                    # Modal is 140 cells wide (set-details column ~84)
+                    # so 5 phyla with `·` separators fit comfortably on
+                    # one line — the `, ` separator + 64-cell limit was
+                    # what forced wrap-orphans in the old layout, not
+                    # the phylum count itself.
+                    phylum_counts = tax["phylum"].dropna().value_counts().head(5)
                     if len(phylum_counts):
                         tax_rows.append(self._kv(
                             "Phyla",
@@ -891,6 +954,49 @@ class LayerDetailModal(ModalScreen):
             _section("Status")
             for label, jid, status in live_jobs:
                 rows.append(self._kv(f"{label} job", f"{jid} · {status}"))
+                # Pull the persisted job record once so we can surface
+                # database / preset / threads / submitted-when. Pure
+                # read; cheap (one JSON parse), guarded by `_job_info`.
+                info = _job_info(jid)
+                if not info:
+                    continue
+                params = info.get("parameters") or {}
+                if label == "Search":
+                    db = info.get("database") or remote.get("search_database")
+                    preset = info.get("preset")
+                    detail_bits = []
+                    if db:
+                        detail_bits.append(db)
+                    if preset:
+                        detail_bits.append(f"{preset} preset")
+                    if "threads" in params:
+                        detail_bits.append(f"{params['threads']} threads")
+                    if "s" in params:
+                        detail_bits.append(f"-s {params['s']}")
+                    if "num_iterations" in params:
+                        detail_bits.append(
+                            f"{params['num_iterations']}× iter"
+                        )
+                    if detail_bits:
+                        rows.append(self._kv(
+                            "Configuration", " · ".join(detail_bits)
+                        ))
+                elif label == "Align":
+                    method = info.get("method") or info.get("algorithm")
+                    detail_bits = []
+                    if method:
+                        detail_bits.append(method)
+                    if "threads" in params:
+                        detail_bits.append(f"{params['threads']} threads")
+                    if detail_bits:
+                        rows.append(self._kv(
+                            "Configuration", " · ".join(detail_bits)
+                        ))
+                submitted = info.get("submitted_at")
+                if submitted:
+                    rows.append(self._kv(
+                        "Submitted", _format_relative(submitted)
+                    ))
 
         # File listing dropped — the Export button handles "I want
         # the alignment somewhere" and the table already says
@@ -1633,7 +1739,7 @@ class LayerDetailModal(ModalScreen):
         from ..taxonomy import unresolved_seq_ids, write_fallback_fasta
 
         try:
-            ids = unresolved_seq_ids(self._project)
+            ids = unresolved_seq_ids(self._project, set_name)
         except Exception as e:  # noqa: BLE001
             self.app.call_from_thread(
                 self.notify, f"Fallback aborted: {e}",
@@ -1647,7 +1753,7 @@ class LayerDetailModal(ModalScreen):
             )
             return
 
-        fasta = write_fallback_fasta(self._project, ids)
+        fasta = write_fallback_fasta(self._project, ids, set_name)
         if fasta is None:
             self.app.call_from_thread(
                 self.notify, "Couldn't stage fallback FASTA "
@@ -2480,9 +2586,20 @@ class LayerDetailModal(ModalScreen):
 
         # Two stacked panes: split available height between them so
         # both fit. Length always renders; identity renders below it
-        # whenever the alignment is on disk.
+        # only when the manifest says alignment has actually completed
+        # for THIS set. We don't trust on-disk presence alone — a
+        # stale `alignment.fasta` from an interrupted run or a
+        # mid-pull worker will exist before `n_aligned` flips, and
+        # otherwise leaks the previous set's identities into a freshly
+        # cursored row's chart.
         aln_path = self._project.homologs_set_dir(set_name) / "alignment.fasta"
-        has_alignment = aln_path.exists()
+        set_dict = next(
+            (s for s in self._project.homologs_sets()
+             if s.get("name") == set_name),
+            None,
+        )
+        n_aligned = (set_dict or {}).get("n_aligned", 0)
+        has_alignment = bool(n_aligned) and aln_path.exists()
 
         bins, height = self._chart_dims(n_charts=2 if has_alignment else 1)
         if has_alignment:

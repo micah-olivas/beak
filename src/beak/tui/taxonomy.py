@@ -493,13 +493,17 @@ def build_taxonomy_table(
 # merges the results back into the canonical table.
 
 
-def unresolved_seq_ids(project) -> List[str]:
-    """Sequence IDs in the active set's taxonomy.parquet with no organism.
+def unresolved_seq_ids(project, set_name: Optional[str] = None) -> List[str]:
+    """Sequence IDs in a set's taxonomy.parquet with no organism.
 
+    Uses ``set_name`` when provided; falls back to the active set.
     Returns an empty list when the parquet doesn't exist yet — callers
     should treat that as "build the canonical table first."
     """
-    cache = project.active_homologs_dir() / "taxonomy.parquet"
+    if set_name is not None:
+        cache = project.homologs_set_dir(set_name) / "taxonomy.parquet"
+    else:
+        cache = project.active_homologs_dir() / "taxonomy.parquet"
     if not cache.exists():
         return []
     try:
@@ -512,15 +516,21 @@ def unresolved_seq_ids(project) -> List[str]:
     return [str(s) for s in missing["sequence_id"].tolist() if s]
 
 
-def write_fallback_fasta(project, seq_ids: List[str]) -> Optional[Path]:
+def write_fallback_fasta(
+    project, seq_ids: List[str], set_name: Optional[str] = None
+) -> Optional[Path]:
     """Stage a small FASTA with just the unresolved sequences.
 
-    Reads `homologs/sets/<set>/sequences.fasta` line-by-line and writes
-    only records whose header token matches a target ID. Returns the
-    path to the staged file, or None if no matching records were found.
-    Stable filename so re-runs overwrite cleanly.
+    Reads ``homologs/sets/<set>/sequences.fasta`` line-by-line and writes
+    only records whose header token matches a target ID. Uses ``set_name``
+    when provided; falls back to the active set. Returns the path to the
+    staged file, or None if no matching records were found. Stable
+    filename so re-runs overwrite cleanly.
     """
-    homologs_dir = project.active_homologs_dir()
+    if set_name is not None:
+        homologs_dir = project.homologs_set_dir(set_name)
+    else:
+        homologs_dir = project.active_homologs_dir()
     src = homologs_dir / "sequences.fasta"
     if not src.exists() or not seq_ids:
         return None
