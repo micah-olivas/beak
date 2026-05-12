@@ -1,4 +1,4 @@
-"""Modal for renaming a beak project — moves the directory + manifest."""
+"""Modal for editing a beak project's name and description."""
 
 from typing import Optional
 
@@ -12,7 +12,12 @@ from ...project import BeakProject, BeakProjectError
 
 
 class RenameProjectModal(ModalScreen[Optional[str]]):
-    """Edit a project's name. Dismisses with the new name on success."""
+    """Edit a project's name and description.
+
+    Dismisses with the (possibly unchanged) project name on success, or
+    None on cancel. A non-None result means *something* was saved, so
+    callers should refresh whatever displays project metadata.
+    """
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
@@ -21,18 +26,23 @@ class RenameProjectModal(ModalScreen[Optional[str]]):
         self._project = project
 
     def compose(self) -> ComposeResult:
+        proj_meta = self._project.manifest().get("project", {}) or {}
+        desc = proj_meta.get("description", "") or ""
         with Vertical(id="modal-body"):
-            yield Label("[bold]Rename project[/bold]", id="modal-title")
-            yield Label(
-                f"[dim]Current name: {self._project.name}[/dim]"
-            )
+            yield Label("[bold]Edit project[/bold]", id="modal-title")
             yield Label("")
-            yield Label("New name")
+            yield Label("Name")
             yield Input(value=self._project.name, id="name-input")
+            yield Label("Description")
+            yield Input(
+                value=desc,
+                placeholder="optional — one-line summary",
+                id="desc-input",
+            )
             yield Label("", id="status-line")
             with Horizontal(id="modal-buttons"):
                 yield Button("Cancel", id="cancel-btn")
-                yield Button("Rename", id="submit-btn", variant="primary")
+                yield Button("Save", id="submit-btn", variant="primary")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -45,19 +55,29 @@ class RenameProjectModal(ModalScreen[Optional[str]]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "name-input":
+            self.query_one("#desc-input", Input).focus()
+        elif event.input.id == "desc-input":
             self._submit()
 
     def _submit(self) -> None:
         new_name = self.query_one("#name-input", Input).value.strip()
+        new_desc = self.query_one("#desc-input", Input).value.strip()
         if not new_name:
             self._status("[red]Name is required.[/red]")
             return
+        if new_name != self._project.name:
+            try:
+                self._project.rename(new_name)
+            except BeakProjectError as e:
+                self._status(f"[red]{e}[/red]")
+                return
         try:
-            self._project.rename(new_name)
-        except BeakProjectError as e:
-            self._status(f"[red]{e}[/red]")
+            with self._project.mutate() as m:
+                m.setdefault("project", {})["description"] = new_desc
+        except Exception as e:  # noqa: BLE001
+            self._status(f"[red]Could not save description: {e}[/red]")
             return
-        self.dismiss(new_name)
+        self.dismiss(self._project.name)
 
     def _status(self, msg: str) -> None:
         self.query_one("#status-line", Label).update(msg)

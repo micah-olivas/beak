@@ -38,9 +38,11 @@ class ProjectDetailScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "Back"),
         Binding("r", "refresh", "Refresh"),
+        Binding("e", "edit_project", "Edit"),
         Binding("a", "view_alignment", "Alignment"),
         Binding("p", "view_pca", "PCA"),
         Binding("t", "view_taxonomy", "Taxonomy"),
+        Binding("i", "view_interplm", "InterPLM"),
         Binding("d", "toggle_domains", "Domains"),
         Binding("s", "toggle_ss", "SS"),
         # Conservation midpoint shift — replaces the inline colorbar's
@@ -134,8 +136,7 @@ class ProjectDetailScreen(Screen):
                     )
                     # Export button — writes CIF + .cxc for the active mode.
                     yield Button("Export", id="export-cxc-btn", compact=True)
-                # `struct-colorbar` is yielded *inside* StructureView so
-                # the gradient sits adjacent to the ribbon it's coloring.
+                yield Static("", id="struct-meta")
         yield SequenceView(self._project, classes="panel", id="sequence-view")
         yield Footer()
 
@@ -310,12 +311,44 @@ class ProjectDetailScreen(Screen):
     def action_back(self) -> None:
         self.app.pop_screen()
 
+    def action_edit_project(self) -> None:
+        from .rename_project import RenameProjectModal
+        self.app.push_screen(
+            RenameProjectModal(self._project), self._on_project_info_saved
+        )
+
+    def on_click(self, event) -> None:
+        if getattr(event.widget, "id", None) == "target-panel":
+            self.action_edit_project()
+            event.stop()
+
+    def _on_project_info_saved(self, new_name) -> None:
+        if new_name is None:
+            return
+        self.query_one("#target-panel", Static).update(self._target_panel())
+
     def action_refresh(self) -> None:
         self.query_one("#target-panel", Static).update(self._target_panel())
         # Layers panel: refresh local + kick off a remote poll if any jobs are pending.
         self.query_one(LayersPanel).force_refresh()
         self.query_one(SequenceView).reload()
         self.notify("Refreshed")
+
+    @staticmethod
+    def _format_struct_meta(source_label: str, meta: dict) -> str:
+        """Build the one-line dim info string for the #struct-meta row."""
+        if source_label.startswith("AlphaFold"):
+            return "[dim]AlphaFold · pLDDT confidence model[/dim]"
+        parts = []
+        res = meta.get("resolution")
+        if res is not None:
+            parts.append(f"{res:.1f} Å")
+        method = meta.get("method")
+        if method:
+            parts.append(method)
+        if parts:
+            return "[dim]" + " · ".join(parts) + "[/dim]"
+        return ""
 
     def on_structure_view_cif_loaded(self, message: StructureView.CifLoaded) -> None:
         # Structure CIF just landed on disk — pull SS + pLDDT into the sequence view.
@@ -329,6 +362,13 @@ class ProjectDetailScreen(Screen):
             except Exception:
                 pass
         self.query_one(SequenceView).reload()
+        # Populate the structure metadata info row.
+        try:
+            sv = self.query_one(StructureView)
+            info_text = self._format_struct_meta(sv._source_label, message.meta)
+            self.query_one("#struct-meta", Static).update(info_text)
+        except Exception:
+            pass
         # Reflect the loaded structure's source in the controls row:
         try:
             sv = self.query_one(StructureView)
@@ -591,6 +631,13 @@ class ProjectDetailScreen(Screen):
             pass  # don't let a manifest write failure break the UI
 
     def on_layer_row_clicked(self, message) -> None:
+        if message.layer_name == "features":
+            from .interplm_view import InterPLMScreen
+            self.app.push_screen(
+                InterPLMScreen(self._project),
+                lambda _: self.query_one(LayersPanel).refresh_state(),
+            )
+            return
         from .layer_detail import LayerDetailModal
         self.app.push_screen(
             LayerDetailModal(self._project, message.layer_name),
@@ -686,6 +733,12 @@ class ProjectDetailScreen(Screen):
             self.app.push_screen(
                 SubmitComparativeModal(self._project),
                 self._on_comparative_built,
+            )
+        elif message.pill_id == "features-pill":
+            from .interplm_view import InterPLMScreen
+            self.app.push_screen(
+                InterPLMScreen(self._project),
+                lambda _: self.query_one(LayersPanel).refresh_state(),
             )
         elif message.pill_id == "import-pill":
             from .import_experiment import ImportExperimentModal
@@ -868,6 +921,10 @@ class ProjectDetailScreen(Screen):
             )
             return
         self.app.push_screen(TaxonomyViewerScreen(self._project))
+
+    def action_view_interplm(self) -> None:
+        from .interplm_view import InterPLMScreen
+        self.app.push_screen(InterPLMScreen(self._project))
 
     def action_toggle_domains(self) -> None:
         # Keybinding shortcut — the panel pill is the discoverable affordance.

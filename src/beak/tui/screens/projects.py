@@ -770,7 +770,7 @@ class ProjectListScreen(Screen):
     def _on_project_renamed(self, new_name) -> None:
         if not new_name:
             return
-        self.notify(f"Renamed to '{new_name}'", timeout=4)
+        self.notify(f"Project updated: {new_name}", timeout=4)
         self._populate()
 
     def action_delete_project(self) -> None:
