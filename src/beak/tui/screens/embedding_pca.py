@@ -13,9 +13,9 @@ import numpy as np
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.screen import Screen
-from textual.containers import Horizontal
-from textual.widgets import Footer, Header, Label, Select, Static
+from textual.screen import ModalScreen, Screen
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Button, Footer, Header, Label, Select, Static
 
 
 _AXIS_W = 8        # cells reserved on the left for the y-axis label/ticks
@@ -167,6 +167,259 @@ def _classify_trait(raw_values):
     return "categorical", str_values, {"categories": categories}
 
 
+class _TaxonFilterModal(ModalScreen):
+    """Two-pane list picker: rank list (left) + value list (right).
+
+    Dismisses with:
+      ("apply", rank, value) — apply this filter and recompute
+      ("clear",)             — remove the active filter
+      None                   — cancelled, no change
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("left", "focus_ranks", "← Ranks", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    _TaxonFilterModal {
+        align: center middle;
+    }
+    _TaxonFilterModal #filter-panel {
+        width: 64;
+        height: 22;
+        padding: 1 2;
+        background: $panel;
+        border: solid #2E86AB;
+    }
+    _TaxonFilterModal #filter-title {
+        text-align: center;
+        margin-bottom: 1;
+    }
+    _TaxonFilterModal #lists-row {
+        height: 1fr;
+    }
+    _TaxonFilterModal #rank-col {
+        width: 20;
+        margin-right: 2;
+    }
+    _TaxonFilterModal #rank-list {
+        height: 1fr;
+        border: solid $primary-darken-2;
+    }
+    _TaxonFilterModal #rank-list:focus-within {
+        border: solid $primary;
+    }
+    _TaxonFilterModal #value-col {
+        width: 1fr;
+    }
+    _TaxonFilterModal #value-list {
+        height: 1fr;
+        border: solid $primary-darken-2;
+    }
+    _TaxonFilterModal #value-list:focus-within {
+        border: solid $primary;
+    }
+    _TaxonFilterModal .col-label {
+        color: $text-muted;
+        height: 1;
+        margin-bottom: 0;
+    }
+    _TaxonFilterModal #hint-line {
+        text-align: center;
+        color: $text-muted;
+        height: 1;
+        margin-top: 1;
+    }
+    _TaxonFilterModal #filter-buttons {
+        height: 3;
+        align: center middle;
+    }
+    _TaxonFilterModal Button {
+        margin: 0 1;
+    }
+    """
+
+    def __init__(
+        self,
+        available_ranks: List[str],
+        full_tax_levels: Dict[str, List[Optional[str]]],
+        current_rank: Optional[str] = None,
+        current_value: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+        self._available_ranks = available_ranks
+        self._initial_rank = current_rank
+        self._initial_value = current_value
+        # Sorted unique non-null values per rank from the full (unfiltered)
+        # taxonomy so the picker always shows all options.
+        self._rank_values: Dict[str, List[str]] = {}
+        for rank in available_ranks:
+            labels = full_tax_levels.get(rank, [])
+            vals = sorted({l for l in labels if l})
+            self._rank_values[rank] = vals
+        # Sequence count per (rank, value) for the info suffix.
+        self._rank_counts: Dict[str, Dict[str, int]] = {}
+        for rank in available_ranks:
+            labels = full_tax_levels.get(rank, [])
+            counts: Dict[str, int] = {}
+            for lbl in labels:
+                if lbl:
+                    counts[lbl] = counts.get(lbl, 0) + 1
+            self._rank_counts[rank] = counts
+        # Per-rank saved value so navigating back to a rank restores where
+        # the user left off.
+        self._saved_value: Dict[str, str] = {}
+        if current_rank and current_value:
+            self._saved_value[current_rank] = current_value
+        self._has_existing = current_rank is not None and current_value is not None
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import ListView, ListItem
+        with Vertical(id="filter-panel"):
+            yield Label("[bold]Filter PCA by taxon[/bold]", id="filter-title")
+            with Horizontal(id="lists-row"):
+                with Vertical(id="rank-col"):
+                    yield Label("rank", classes="col-label")
+                    yield ListView(
+                        *[
+                            ListItem(Label(rank))
+                            for rank in self._available_ranks
+                        ],
+                        id="rank-list",
+                    )
+                with Vertical(id="value-col"):
+                    yield Label("value", classes="col-label", id="value-col-label")
+                    yield ListView(id="value-list")
+            yield Static(
+                "[dim]↑↓ navigate  ·  ↵ rank→values→apply  ·  ← back[/dim]",
+                id="hint-line",
+            )
+            with Horizontal(id="filter-buttons"):
+                yield Button("Cancel", id="cancel-btn")
+                if self._has_existing:
+                    yield Button("Clear filter", id="clear-btn", variant="warning")
+                yield Button("Apply", id="apply-btn", variant="primary")
+
+    def on_mount(self) -> None:
+        from textual.widgets import ListView
+        rank_list = self.query_one("#rank-list", ListView)
+        rank_list.focus()
+        # Set initial rank cursor and populate value list.
+        start_rank_idx = 0
+        if self._initial_rank in self._available_ranks:
+            start_rank_idx = self._available_ranks.index(self._initial_rank)
+        # call_after_refresh so the ListView has rendered before we move.
+        self.call_after_refresh(self._init_cursors, start_rank_idx)
+
+    def _init_cursors(self, rank_idx: int) -> None:
+        from textual.widgets import ListView
+        rank_list = self.query_one("#rank-list", ListView)
+        rank_list.index = rank_idx
+        # Populate value list for this rank. Setting index fires Highlighted
+        # which calls _repopulate_value_list, but call directly here too
+        # to be safe on mount before the first render cycle.
+        rank = self._available_ranks[rank_idx] if rank_idx < len(self._available_ranks) else None
+        if rank:
+            self._repopulate_value_list(rank)
+
+    # ---- helpers ----
+
+    def _active_rank(self) -> Optional[str]:
+        from textual.widgets import ListView
+        try:
+            rank_list = self.query_one("#rank-list", ListView)
+            idx = rank_list.index
+            if idx is not None and 0 <= idx < len(self._available_ranks):
+                return self._available_ranks[idx]
+        except Exception:
+            pass
+        return None
+
+    def _active_value(self) -> Optional[str]:
+        from textual.widgets import ListView
+        rank = self._active_rank()
+        if rank is None:
+            return None
+        try:
+            value_list = self.query_one("#value-list", ListView)
+            idx = value_list.index
+            vals = self._rank_values.get(rank, [])
+            if idx is not None and 0 <= idx < len(vals):
+                return vals[idx]
+        except Exception:
+            pass
+        return None
+
+    def _repopulate_value_list(self, rank: str) -> None:
+        from textual.widgets import ListView, ListItem
+        try:
+            value_list = self.query_one("#value-list", ListView)
+            label = self.query_one("#value-col-label", Label)
+        except Exception:
+            return
+        vals = self._rank_values.get(rank, [])
+        counts = self._rank_counts.get(rank, {})
+        value_list.clear()
+        for val in vals:
+            n = counts.get(val, 0)
+            value_list.append(ListItem(Label(f"{val}  [dim]({n})[/dim]")))
+        label.update(f"value  [dim]({len(vals)})[/dim]")
+        # Restore saved position for this rank if available.
+        saved = self._saved_value.get(rank)
+        if saved and saved in vals:
+            value_list.index = vals.index(saved)
+
+    # ---- events ----
+
+    def on_list_view_highlighted(self, event) -> None:
+        from textual.widgets import ListView
+        if event.list_view.id == "rank-list":
+            rank = self._active_rank()
+            if rank is not None:
+                self._repopulate_value_list(rank)
+        elif event.list_view.id == "value-list":
+            # Save position so navigating away and back restores it.
+            rank = self._active_rank()
+            value = self._active_value()
+            if rank and value:
+                self._saved_value[rank] = value
+
+    def on_list_view_selected(self, event) -> None:
+        from textual.widgets import ListView
+        if event.list_view.id == "rank-list":
+            # Enter on rank → move focus to value list.
+            self.query_one("#value-list", ListView).focus()
+        elif event.list_view.id == "value-list":
+            # Enter on value → apply filter.
+            self._do_apply()
+
+    # ---- actions ----
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_focus_ranks(self) -> None:
+        from textual.widgets import ListView
+        self.query_one("#rank-list", ListView).focus()
+
+    def _do_apply(self) -> None:
+        rank = self._active_rank()
+        value = self._active_value()
+        if rank and value:
+            self.dismiss(("apply", rank, value))
+        else:
+            self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-btn":
+            self.dismiss(None)
+        elif event.button.id == "clear-btn":
+            self.dismiss(("clear",))
+        elif event.button.id == "apply-btn":
+            self._do_apply()
+
+
 class _PCABody(Static):
     def __init__(self, parent_view: "EmbeddingPCAScreen", **kwargs) -> None:
         super().__init__("", **kwargs)
@@ -210,6 +463,7 @@ class EmbeddingPCAScreen(Screen):
         Binding("c", "cycle_color", "Color"),
         Binding("left_square_bracket", "rank_prev", "Rank ←"),
         Binding("right_square_bracket", "rank_next", "Rank →"),
+        Binding("f", "open_filter", "Filter"),
         # Model selection used to cycle on `m`; replaced with a Select
         # dropdown above the canvas because (a) discoverability is
         # better when the available models are visible at once, and
@@ -341,6 +595,13 @@ class EmbeddingPCAScreen(Screen):
         # Last hovered point index, so identical mouse-move events
         # don't churn the sub_title.
         self._last_hover_idx: Optional[int] = None
+        # Active taxon filter. When set, `_load` runs PCA only on the
+        # sequences whose taxonomy matches `_filter_value` at `_filter_rank`.
+        # `_full_tax_levels` is the unfiltered taxonomy so the filter modal
+        # always shows all available values regardless of what's active.
+        self._filter_rank: Optional[str] = None
+        self._filter_value: Optional[str] = None
+        self._full_tax_levels: Dict[str, List[Optional[str]]] = {}
         # Set in `action_back` so post-pop worker callbacks (the
         # `_load_async_done` hop) skip touching unmounted widgets.
         #
@@ -351,7 +612,6 @@ class EmbeddingPCAScreen(Screen):
         self._user_closing: bool = False
 
     def compose(self) -> ComposeResult:
-        from textual.containers import Vertical
         yield Header()
         with Horizontal(id="pca-row"):
             yield _PCABody(self, id="pca-body")
@@ -499,6 +759,75 @@ class EmbeddingPCAScreen(Screen):
         self._update_title()
         self.query_one("#pca-body", _PCABody).refresh(); self._refresh_legend()
 
+    def action_open_filter(self) -> None:
+        if not self._full_tax_levels:
+            self.notify(
+                "No taxonomy data — load taxonomy first.", timeout=4
+            )
+            return
+        available = [r for r in _RANK_ORDER if r in self._full_tax_levels]
+        if not available:
+            self.notify("No taxonomy ranks available.", timeout=3)
+            return
+        modal = _TaxonFilterModal(
+            available_ranks=available,
+            full_tax_levels=self._full_tax_levels,
+            current_rank=self._filter_rank,
+            current_value=self._filter_value,
+        )
+        self.app.push_screen(modal, self._on_filter_result)
+
+    def _on_filter_result(self, result) -> None:
+        if result is None:
+            return
+        if result[0] == "clear":
+            self._filter_rank = None
+            self._filter_value = None
+        else:
+            _, rank, value = result
+            self._filter_rank = rank
+            self._filter_value = value
+        self._pcs = None
+        self._var_ratio = None
+        self._target_idx = None
+        self._tax_levels = {}
+        self._color_cache = {}
+        self._error = None
+        self._n_dropped = 0
+        self._update_title()
+        try:
+            self.query_one("#pca-body", _PCABody).refresh()
+        except Exception:
+            pass
+        self._load_async()
+
+    def _run_pca_on_subset(self, pkl_path: Path, keep_ids: set):
+        """Fit 2-component PCA on a subset of the pickle's sequences.
+
+        Not cached — intended for interactive filtered views. Returns the
+        same ``(coords, var_ratio, seq_ids, n_dropped)`` tuple as
+        ``load_or_compute_pca_2d``, or None when the subset is too small.
+        """
+        from sklearn.decomposition import PCA
+        from ...embeddings import load_mean_embeddings
+
+        df = load_mean_embeddings(pkl_path)
+        if df.empty:
+            return None
+        df = df[df.index.isin(keep_ids)]
+        if df.empty:
+            return None
+        n_before = len(df)
+        df = df.dropna()
+        n_dropped = n_before - len(df)
+        if df.shape[0] < 2 or df.shape[1] < 2:
+            return None
+        model = PCA(n_components=2, random_state=0)
+        coords = model.fit_transform(df.values).astype("float32")
+        var_ratio = model.explained_variance_ratio_.astype("float32")
+        seq_ids = [str(s) for s in df.index]
+        return coords, var_ratio, seq_ids, int(n_dropped)
+
     def _set_model(self, name: str) -> None:
         """Switch active embedding model and recompute PCA.
 
@@ -518,6 +847,7 @@ class EmbeddingPCAScreen(Screen):
         self._var_ratio = None
         self._target_idx = None
         self._tax_levels = {}
+        self._full_tax_levels = {}
         self._color_cache = {}
         self._error = None
         self._n_dropped = 0
@@ -613,6 +943,11 @@ class EmbeddingPCAScreen(Screen):
         if self._active_model:
             short = self._active_model.split("/")[-1]
             model_seg = f"  ·  model: {short}"
+        filter_seg = ""
+        if self._filter_rank and self._filter_value:
+            filter_seg = (
+                f"  ·  [{self._filter_rank}: {self._filter_value}]"
+            )
         # Source set lives at the front of the subtitle so it's the
         # first thing scanned. Switching homolog sets and re-entering
         # PCA visibly changes this string, which makes the
@@ -620,7 +955,7 @@ class EmbeddingPCAScreen(Screen):
         active_set = self._project.active_set_name()
         self.app.sub_title = (
             f"PCA · {self._project.name}/{active_set} ({n} seqs)"
-            f"{var}{dropped}{model_seg}{color}"
+            f"{var}{dropped}{model_seg}{color}{filter_seg}"
         )
 
     def _load(self) -> None:
@@ -679,26 +1014,54 @@ class EmbeddingPCAScreen(Screen):
         # invalidates the cache automatically.
         try:
             from ...embeddings import load_or_compute_pca_2d
-            result = load_or_compute_pca_2d(pkls[0])
+            result_full = load_or_compute_pca_2d(pkls[0])
         except Exception as e:  # noqa: BLE001
             self._error = f"PCA failed: {e}"
             return
 
-        if result is None:
+        if result_full is None:
             self._error = (
                 "Need at least 2 sequences with valid embeddings for PCA."
             )
             return
 
-        coords, var_ratio, seq_ids, n_dropped = result
+        full_coords, full_var, all_seq_ids, full_n_dropped = result_full
+
+        # Full taxonomy — always loaded from the complete sequence set so
+        # the filter modal always offers every available taxon value.
+        full_tax_levels, full_tax_temps = self._load_taxonomy(all_seq_ids)
+        self._full_tax_levels = full_tax_levels
+
+        # If a taxon filter is active, recompute PCA on the matching subset.
+        if self._filter_rank and self._filter_value:
+            labels = full_tax_levels.get(
+                self._filter_rank, [None] * len(all_seq_ids)
+            )
+            keep_ids = {
+                sid for sid, lbl in zip(all_seq_ids, labels)
+                if lbl == self._filter_value
+            }
+            filtered = self._run_pca_on_subset(pkls[0], keep_ids)
+            if filtered is None:
+                self._error = (
+                    f"Too few sequences in '{self._filter_value}' "
+                    f"({len(keep_ids)} matching) for PCA."
+                )
+                return
+            coords, var_ratio, seq_ids, n_dropped = filtered
+            # Taxonomy for the filtered subset only.
+            self._tax_levels, self._tax_temps = self._load_taxonomy(seq_ids)
+        else:
+            coords, var_ratio, seq_ids, n_dropped = (
+                full_coords, full_var, list(all_seq_ids), full_n_dropped
+            )
+            self._tax_levels = full_tax_levels
+            self._tax_temps = full_tax_temps
+
         self._pcs = coords
         self._var_ratio = var_ratio
         self._n_dropped = n_dropped
         self._seq_ids = list(seq_ids)
-
-        # Match each PCA row against its taxonomy row by sequence_id, so
-        # the per-point colors line up regardless of FASTA ordering.
-        self._tax_levels, self._tax_temps = self._load_taxonomy(seq_ids)
         self._available_ranks = [
             rank for rank in _RANK_ORDER if rank in self._tax_levels
         ]
