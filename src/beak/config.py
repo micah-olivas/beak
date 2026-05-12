@@ -121,6 +121,25 @@ def get_docker_config() -> Dict:
     }
 
 
+def get_compute_threads(default: int = 8) -> int:
+    """Default thread cap for remote MMseqs2 jobs.
+
+    MMseqs2 with no `--threads` defaults to every core on the box,
+    which is a problem on a shared remote server. Read
+    ``compute.threads`` from config; fall back to ``default`` (8) so
+    a fresh user doesn't hog the server before they've configured
+    anything. Per-job overrides via ``mmseqs_params={'threads': N}``
+    still win — this is only the default.
+    """
+    config = load_config()
+    val = (config.get('compute') or {}).get('threads')
+    try:
+        n = int(val)
+        return n if n >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def config_exists() -> bool:
     """Check if a config file exists."""
     return CONFIG_PATH.exists()

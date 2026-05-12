@@ -196,6 +196,12 @@ class MMseqsSearch(RemoteJobManager):
 
         final_params.update(mmseqs_params)
 
+        # Thread cap — MMseqs2 with no `--threads` defaults to every
+        # core on the box, which monopolizes a shared remote server.
+        # `setdefault` so an explicit per-job override still wins.
+        from ..config import get_compute_threads
+        final_params.setdefault('threads', get_compute_threads())
+
         # Resolve database path
         db_path = self._resolve_database(database)
 

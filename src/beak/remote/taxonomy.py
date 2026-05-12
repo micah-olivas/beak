@@ -207,6 +207,13 @@ class MMseqsTaxonomy(RemoteJobManager):
         remote_query = f"{remote_job_path}/query.fasta"
         self.conn.put(query_file, remote_query)
 
+        # Thread cap — same shared-server reasoning as MMseqsSearch.
+        # Apply via mmseqs_params so an explicit caller override
+        # (e.g. `mmseqs_params={'threads': 32}`) wins.
+        from ..config import get_compute_threads
+        mmseqs_params = dict(mmseqs_params or {})
+        mmseqs_params.setdefault('threads', get_compute_threads())
+
         # Format parameters
         param_str = []
         if tax_lineage:
