@@ -23,18 +23,21 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import Horizontal
 from textual.screen import Screen
 from textual.widgets import Footer, Header, Static
+from ..widgets.colorbar import Colorbar
 
 
 _ID_COL_WIDTH = 22
 _PAN_STEP = 10
 _PAGE_ROWS = 10
+# Width of the per-row identity bar drawn to the right of the %ID text.
+_BAR_W = 10
 # Cells reserved at the right of each row for the per-sequence
-# %identity-to-target suffix. Format is `   42.3%` → 8 chars (2-space
-# gutter + 5-char number with one decimal + `%`). The 5-char number
-# field accommodates `100.0` for an exact-match homolog.
-_IDENT_SUFFIX_W = 8
+# %identity-to-target suffix: 2-space gutter + 5-char number with one
+# decimal + `%` + 1 separator + _BAR_W bar chars.
+_IDENT_SUFFIX_W = 9 + _BAR_W
 # Cells of top padding inside `_AlignmentBody` (mirrors the CSS
 # `padding: 1 2` declaration). Used by the click-handler to translate
 # event.y from the widget's outer-box origin to content-row origin.
@@ -50,6 +53,14 @@ _PHYLUM_PALETTE = [
     "#FF9F45", "#3DCFD4", "#FF6B9D", "#7DD87D", "#65CBF3",
     "#FFA62B", "#9D7DD8",
 ]
+
+
+def _identity_bar_color(pct: float) -> str:
+    if pct < 30:
+        return "#FF6B6B"
+    if pct < 60:
+        return "#FFD93D"
+    return "#6BCF7F"
 
 
 def _stack_seqs_to_bytes(
@@ -73,13 +84,15 @@ def _stack_seqs_to_bytes(
     if max_len is None:
         max_len = max(len(s) for _, s in sequences)
     n = len(sequences)
-    out = np.full((n, max_len), ord("-"), dtype=np.uint8)
-    for i, (_, s) in enumerate(sequences):
-        b = s.upper().encode("ascii", "replace")
-        b = b[:max_len]
-        if b:
-            out[i, : len(b)] = np.frombuffer(b, dtype=np.uint8)
-    return out
+    if max_len == 0:
+        return np.zeros((n, 0), dtype=np.uint8)
+    # Build one contiguous buffer then frombuffer in a single call —
+    # ~4× faster than per-row frombuffer + slice-assign on 20k seqs.
+    raw = b"".join(
+        s.upper().encode("ascii", "replace")[:max_len].ljust(max_len, b"-")
+        for _, s in sequences
+    )
+    return np.frombuffer(raw, dtype=np.uint8).reshape(n, max_len).copy()
 
 
 # Pre-computed alphabet bytes shared by the column-statistics loops.
@@ -89,6 +102,7 @@ _GAP_CODES = (ord("-"), ord("."))
 
 def _identity_per_row(
     sequences: List[Tuple[str, str]],
+    arr: Optional[np.ndarray] = None,
 ) -> List[Optional[float]]:
     """Per-row %identity to the target row (sequences[0]).
 
@@ -106,11 +120,15 @@ def _identity_per_row(
     positions) was O(N·L) with constant-time inner work; for a 20k×500
     alignment that's ~5 s of Python overhead. The numpy version is
     one broadcast and a sum, ~30 ms on the same input.
+
+    Pass ``arr`` (pre-built uint8 matrix) to skip the encode step when
+    the caller already has the array from a prior operation.
     """
     if not sequences:
         return []
     n = len(sequences)
-    arr = _stack_seqs_to_bytes(sequences)
+    if arr is None:
+        arr = _stack_seqs_to_bytes(sequences)
     target = arr[0]
     target_valid = (target != _GAP_CODES[0]) & (target != _GAP_CODES[1])
     if not target_valid.any():
@@ -260,6 +278,12 @@ class _AlignmentBody(Static):
 class AlignmentViewerScreen(Screen):
     """Full-screen alignment view."""
 
+    # Skip auto-focus: the only focusable descendant is the Colorbar,
+    # whose left/right bindings (midpoint shift) shadow this screen's
+    # left/right pan bindings whenever it has focus. Same fix
+    # ProjectDetailScreen uses (see detail.py).
+    AUTO_FOCUS = ""
+
     BINDINGS = [
         Binding("escape",   "back",        "Back"),
         Binding("space",    "cycle_color", "Color"),
@@ -302,6 +326,8 @@ class AlignmentViewerScreen(Screen):
         background: $surface;
         border-top: solid #2E86AB;
     }
+    AlignmentViewerScreen #aln-phylum { width: 1fr; }
+    AlignmentViewerScreen #aln-colorbar { display: none; height: 2; }
     """
 
     # `plddt` and `sasa` color each column by the *target's* per-residue
@@ -414,7 +440,9 @@ class AlignmentViewerScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield _AlignmentBody(self, id="aln-body")
-        yield Static("", id="aln-legend")
+        with Horizontal(id="aln-legend"):
+            yield Static("", id="aln-phylum")
+            yield Colorbar(id="aln-colorbar")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -449,11 +477,10 @@ class AlignmentViewerScreen(Screen):
 
         if records:
             self._sequences = records
-            self._displayed = (
-                self._ungap(records, self._gap_threshold)
-                if self._gap_threshold is not None and self._aligned
-                else list(records)
-            )
+            if self._gap_threshold is not None and self._aligned:
+                self._displayed, _ = self._ungap(records, self._gap_threshold)
+            else:
+                self._displayed = list(records)
         elif target_seq:
             self._sequences = [(target_id, target_seq)]
             self._displayed = list(self._sequences)
@@ -461,7 +488,14 @@ class AlignmentViewerScreen(Screen):
 
         self._update_title()
         try:
-            self.query_one("#aln-legend", Static).update(self._render_legend())
+            self.query_one("#aln-phylum", Static).update(self._render_legend())
+        except Exception:
+            pass
+        try:
+            cb = self.query_one("#aln-colorbar", Colorbar)
+            cb.set_mode("conservation")
+            cb.set_midpoint(self._midpoint)
+            cb.display = (self._color_mode == "conservation")
         except Exception:
             pass
         # Pre-load BLOSUM62 + parquet rows in the background so the
@@ -592,23 +626,28 @@ class AlignmentViewerScreen(Screen):
         screen is closing).
         """
         # ---- Phase A: per-column / per-row caches ----
+        # Build the uint8 matrix once; share it across all three helpers
+        # to avoid three separate GIL-holding encode loops (~200 ms on
+        # a 20k-seq alignment).
+        _phase_a_arr: Optional[np.ndarray] = None
+        if self._displayed:
+            try:
+                _phase_a_arr = _stack_seqs_to_bytes(self._displayed)
+            except Exception:
+                pass
         try:
-            self._col_conservation = (
-                self._compute_column_conservation(self._displayed)
-                if self._aligned else None
-            )
+            # Single pass for conservation + logo (same 20-AA count matrix).
+            self._rebuild_column_caches(arr=_phase_a_arr)
         except Exception:
             self._col_conservation = None
         try:
             self._row_identity_pct = (
-                _identity_per_row(self._displayed) if self._displayed else []
+                _identity_per_row(self._displayed, arr=_phase_a_arr)
+                if self._displayed else []
             )
         except Exception:
             self._row_identity_pct = []
-        try:
-            self._rebuild_logo_cache()
-        except Exception:
-            pass
+        _phase_a_arr = None  # release early; the large arr is no longer needed
         self._schedule_ui(self._refresh_body)
 
         # ---- Phase B: diversity stats + taxonomy + structure scalars ----
@@ -731,6 +770,27 @@ class AlignmentViewerScreen(Screen):
             # other color modes to work.
             return
 
+        # PDB structures often have partial coverage so the length check
+        # above fails for pLDDT. Fall back to the AlphaFold CIF for
+        # pLDDT scores when the primary structure is a PDB hit — AF's
+        # B-factor column carries real pLDDT confidence values and always
+        # covers the full sequence.
+        if self._target_plddt is None:
+            af_cif = (
+                self._project.path / "structures"
+                / f"{target_uniprot}_AF.cif"
+            )
+            if af_cif.exists():
+                try:
+                    from ..structure import load_ca_coords
+                    _, plddt_af = load_ca_coords(af_cif)
+                    if len(plddt_af) == len(target_seq):
+                        self._target_plddt = np.asarray(
+                            plddt_af, dtype=np.float32
+                        )
+                except Exception:
+                    pass
+
         self._col_to_target_pos = self._build_col_to_target_pos(target_seq)
 
     def _build_col_to_target_pos(
@@ -745,11 +805,18 @@ class AlignmentViewerScreen(Screen):
         sometimes reorder MSAs and we'd otherwise color homolog
         positions with the target's pLDDT.
         """
-        if not self._sequences:
+        # Use _displayed (the current ungapped view) so column indices in
+        # the rendered output match the col_map. Building from _sequences
+        # (original alignment) produces an N_original-length map, but
+        # rendering passes ungapped column indices 0..N_ungapped-1 —
+        # these hit the wrong (often all-gap) original columns and return
+        # pos=-1 for every cell, silently dropping all pLDDT/SASA color.
+        sequences = self._displayed or self._sequences
+        if not sequences:
             return None
         target_upper = target_seq.upper()
         target_aln: Optional[str] = None
-        for _, seq in self._sequences:
+        for _, seq in sequences:
             if seq.upper().replace("-", "").replace(".", "") == target_upper:
                 target_aln = seq
                 break
@@ -758,7 +825,7 @@ class AlignmentViewerScreen(Screen):
             # follows. Better than refusing to color when an external
             # tool kept the target first but didn't match exactly
             # (e.g. case folding by an aligner).
-            target_aln = self._sequences[0][1]
+            target_aln = sequences[0][1]
 
         n_cols = len(target_aln)
         out = np.full(n_cols, -1, dtype=np.int32)
@@ -776,29 +843,103 @@ class AlignmentViewerScreen(Screen):
         and the current gap threshold. Cheap when no ungap is active."""
         if self._gap_threshold is None or not self._aligned:
             self._displayed = list(self._sequences)
+            # Build the array once; reused by all three stat helpers below.
+            arr: np.ndarray = (
+                _stack_seqs_to_bytes(self._sequences) if self._sequences
+                else np.zeros((0, 0), dtype=np.uint8)
+            )
         else:
-            self._displayed = self._ungap(self._sequences, self._gap_threshold)
+            self._displayed, arr = self._ungap(self._sequences, self._gap_threshold)
         # `_displayed` changed under us — drop the per-row Text cache
         # so the next paint rebuilds rows from the new column space.
         # Without this, ungap appears to no-op because the body keeps
         # serving Texts built from the pre-ungap `_displayed`.
         self._row_cache = {}
         self._row_cache_key = None
-        self._col_conservation = (
-            self._compute_column_conservation(self._displayed)
-            if self._aligned else None
-        )
+        # Single combined pass for conservation + logo: both need the
+        # same 20-AA count matrix — computing it once halves that cost.
+        self._rebuild_column_caches(arr=arr)
         # Per-row %identity to target — precomputed once per
         # `_displayed` change so the per-frame paint is just a list
         # lookup, not an O(L) loop. Cost: O(N·L) on rebuild, ~100 ms
         # for 25k rows × 1000 cols. Aligned to `_displayed` indices
         # (so [0] is target, None there).
         self._row_identity_pct: List[Optional[float]] = (
-            _identity_per_row(self._displayed) if self._displayed else []
+            _identity_per_row(self._displayed, arr=arr) if self._displayed else []
         )
-        self._rebuild_logo_cache()
+        # Rebuild the column→target mapping so pLDDT/SASA colors use
+        # ungapped column indices, not the original alignment's columns.
+        if self._target_plddt is not None or self._target_sasa is not None:
+            self._col_to_target_pos = self._build_col_to_target_pos(
+                self._project.target_sequence() or ""
+            )
 
-    def _rebuild_logo_cache(self) -> None:
+    def _rebuild_column_caches(self, arr: Optional[np.ndarray] = None) -> None:
+        """Recompute conservation + logo caches in a single 20-AA pass.
+
+        Both ``_col_conservation`` and the logo arrays need the same
+        ``(20, L)`` per-AA count matrix — computing it once halves the
+        cost versus calling the two helpers independently.
+
+        Pass ``arr`` (pre-built uint8 matrix for ``_displayed``) to also
+        skip the encode step.
+        """
+        if not self._displayed:
+            self._col_conservation = None if not self._aligned else self._col_conservation
+            self._logo_top = []
+            self._logo_level = []
+            self._logo_freq = []
+            return
+        if arr is None:
+            arr = _stack_seqs_to_bytes(self._displayed)
+        n_seq, cols = arr.shape
+        if cols == 0:
+            self._col_conservation = (
+                np.zeros(0, dtype=np.float32) if self._aligned else None
+            )
+            self._logo_top = []
+            self._logo_level = []
+            self._logo_freq = []
+            return
+
+        gap_mask = (arr == _GAP_CODES[0]) | (arr == _GAP_CODES[1])
+        n_valid = (~gap_mask).sum(axis=0)
+
+        # Single 20-AA pass shared by conservation and logo.
+        counts = np.zeros((len(_AA_BYTES), cols), dtype=np.int32)
+        for i, aa in enumerate(_AA_BYTES):
+            counts[i] = (arr == aa).sum(axis=0)
+        top_idx = counts.argmax(axis=0)
+        top_count = counts.max(axis=0)
+        freqs_arr = np.where(
+            n_valid > 0, top_count.astype(np.float32) / np.maximum(n_valid, 1), 0.0,
+        )
+
+        if self._aligned:
+            self._col_conservation = np.where(
+                n_valid > 0,
+                top_count.astype(np.float32) / np.maximum(n_valid, 1) * 100.0,
+                0.0,
+            ).astype(np.float32)
+        else:
+            self._col_conservation = None
+
+        n_glyphs = len(_BAR_GLYPHS)
+        levels_arr = np.minimum(
+            n_glyphs - 1,
+            np.round(freqs_arr * (n_glyphs - 1)).astype(int),
+        )
+        # `top` falls back to space for all-gap columns so the logo row
+        # paints blank glyphs there rather than smuggling an arbitrary
+        # AA through with `freq=0`.
+        self._logo_top = [
+            chr(int(_AA_BYTES[int(top_idx[c])])) if n_valid[c] > 0 else " "
+            for c in range(cols)
+        ]
+        self._logo_level = levels_arr.tolist()
+        self._logo_freq = freqs_arr.tolist()
+
+    def _rebuild_logo_cache(self, arr: Optional[np.ndarray] = None) -> None:
         """Precompute (top-char, intensity-level) per alignment column.
 
         Without this the logo + consensus rows walk the full sequence
@@ -806,6 +947,9 @@ class AlignmentViewerScreen(Screen):
         the dominant cost when scrolling, even for a few-hundred-row
         alignment. Building it once per `_displayed` change collapses
         the per-frame work to a slice + markup join.
+
+        Pass ``arr`` (pre-built uint8 matrix for ``_displayed``) to skip
+        the encode step when the caller already holds the array.
         """
         if not self._displayed:
             self._logo_top: List[str] = []
@@ -820,7 +964,8 @@ class AlignmentViewerScreen(Screen):
         # divides by the per-column non-gap total. Replaces the prior
         # per-column Python loop with Counter — roughly 100× faster on
         # a 20k×500 alignment (~700 ms → ~7 ms).
-        arr = _stack_seqs_to_bytes(self._displayed)
+        if arr is None:
+            arr = _stack_seqs_to_bytes(self._displayed)
         n_seq, cols = arr.shape
 
         gap_mask = (arr == _GAP_CODES[0]) | (arr == _GAP_CODES[1])
@@ -852,8 +997,15 @@ class AlignmentViewerScreen(Screen):
         self._logo_level = levels_arr.tolist()
         self._logo_freq = freqs_arr.tolist()
 
-    def _ungap(self, sequences: List[Tuple[str, str]], threshold: float) -> List[Tuple[str, str]]:
+    def _ungap(
+        self,
+        sequences: List[Tuple[str, str]],
+        threshold: float,
+    ) -> Tuple[List[Tuple[str, str]], np.ndarray]:
         """Drop columns where gap-fraction ≥ `threshold`. Vectorised.
+
+        Returns ``(filtered_sequences, filtered_arr)`` so callers can
+        reuse the uint8 matrix for downstream stats without re-encoding.
 
         Encodes once into a uint8 ``(N, L)`` matrix via the shared
         helper (which is ~10× faster than building an N-length list
@@ -861,24 +1013,29 @@ class AlignmentViewerScreen(Screen):
         slices and decodes the kept columns in one pass per row.
         """
         if not sequences:
-            return []
+            return [], np.zeros((0, 0), dtype=np.uint8)
         arr = _stack_seqs_to_bytes(sequences)
         n_seq, max_len = arr.shape
+        empty = [(ident, "") for ident, _ in sequences]
         if max_len == 0:
-            return [(ident, "") for ident, _ in sequences]
+            return empty, arr
         gap_mask = (arr == _GAP_CODES[0]) | (arr == _GAP_CODES[1])
         gap_frac = gap_mask.sum(axis=0) / max(n_seq, 1)
         keep = gap_frac < threshold
         if not keep.any():
-            return [(ident, "") for ident, _ in sequences]
+            return empty, arr[:, :0]
         kept = arr[:, keep]
-        return [
+        seqs = [
             (ident, kept[i].tobytes().decode("ascii", "replace"))
             for i, (ident, _) in enumerate(sequences)
         ]
+        return seqs, kept
 
     @staticmethod
-    def _compute_column_conservation(seqs: List[Tuple[str, str]]) -> np.ndarray:
+    def _compute_column_conservation(
+        seqs: List[Tuple[str, str]],
+        arr: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """Per-column identity fraction in [0, 100], skipping gap-only cols.
 
         Vectorised across all standard 20 AAs: for each AA, compute
@@ -886,10 +1043,14 @@ class AlignmentViewerScreen(Screen):
         previous per-column Python+Counter version was the dominant
         cost when cycling ungap on a 20k-sequence MSA; this finishes
         in tens of milliseconds.
+
+        Pass ``arr`` (pre-built uint8 matrix) to skip the encode step
+        when the caller already holds the array.
         """
-        if not seqs:
-            return np.zeros(0, dtype=np.float32)
-        arr = _stack_seqs_to_bytes(seqs)
+        if arr is None:
+            if not seqs:
+                return np.zeros(0, dtype=np.float32)
+            arr = _stack_seqs_to_bytes(seqs)
         n_seq, max_len = arr.shape
         if max_len == 0:
             return np.zeros(0, dtype=np.float32)
@@ -1126,6 +1287,12 @@ class AlignmentViewerScreen(Screen):
         self._color_mode = self._COLOR_MODES[(idx + 1) % len(self._COLOR_MODES)]
         self._update_title()
         self._refresh_body()
+        try:
+            self.query_one("#aln-colorbar", Colorbar).display = (
+                self._color_mode == "conservation"
+            )
+        except Exception:
+            pass
 
     def action_midpoint_down(self) -> None:
         self._shift_midpoint(-self._MIDPOINT_STEP)
@@ -1157,6 +1324,22 @@ class AlignmentViewerScreen(Screen):
         try:
             with self._project.mutate() as m:
                 m.setdefault("view", {})["aln_midpoint"] = new_mid
+        except Exception:
+            pass
+        self._update_title()
+        self._refresh_body()
+        try:
+            self.query_one("#aln-colorbar", Colorbar).set_midpoint(self._midpoint)
+        except Exception:
+            pass
+
+    def on_colorbar_midpoint_changed(self, event: Colorbar.MidpointChanged) -> None:
+        if event.midpoint == self._midpoint:
+            return
+        self._midpoint = event.midpoint
+        try:
+            with self._project.mutate() as m:
+                m.setdefault("view", {})["aln_midpoint"] = self._midpoint
         except Exception:
             pass
         self._update_title()
@@ -1203,7 +1386,7 @@ class AlignmentViewerScreen(Screen):
         if self._user_closing:
             return
         try:
-            self.query_one("#aln-legend", Static).update(self._render_legend())
+            self.query_one("#aln-phylum", Static).update(self._render_legend())
         except Exception:
             pass
 
@@ -1244,6 +1427,7 @@ class AlignmentViewerScreen(Screen):
             seq_w,
             self._color_mode,
             self._midpoint,
+            len(self._row_identity_pct),
         )
         if cache_key != self._row_cache_key:
             self._row_cache = {}
@@ -1255,13 +1439,13 @@ class AlignmentViewerScreen(Screen):
 
         body = Text(no_wrap=True, overflow="ellipsis")
 
-        # --- Ruler row: "  col  ............:....|...... %ID"
+        # --- Ruler row: "  col  ............:....|...... %ID  % ID    "
         body.append(
             f"  {'col':>{_ID_COL_WIDTH - 2}}  ", style="dim"
         )
         body.append(self._ruler_text(self._col_offset, seq_w))
         body.append(
-            f"  {'%ID':>{_IDENT_SUFFIX_W - 2}}\n", style="dim"
+            f"  {'%ID':>6}{'% ID':^{1 + _BAR_W}}\n", style="dim"
         )
         body.append("\n")
 
@@ -1350,11 +1534,14 @@ class AlignmentViewerScreen(Screen):
         )
         row.append(self._color_segment_text(visible_seq, self._col_offset))
         if pct is not None:
-            row.append(f"  {pct:5.1f}%", style="dim")
+            row.append(f"  {pct:5.1f}% ", style="dim")
+            filled = max(0, min(_BAR_W, round(pct / 100.0 * _BAR_W)))
+            if filled:
+                row.append("█" * filled, style=_identity_bar_color(pct))
+            if filled < _BAR_W:
+                row.append("░" * (_BAR_W - filled), style="dim")
         else:
-            row.append(
-                f"  {'—':>{_IDENT_SUFFIX_W - 2}}", style="dim"
-            )
+            row.append(f"  {'—':>6} {'░' * _BAR_W}", style="dim")
         self._row_cache[others_idx] = row
         return row
 

@@ -78,7 +78,17 @@ class Colorbar(Static):
         bar = f"{tag} [dim]0[/dim]{''.join(cells)}[dim]100[/dim]"
         if self.has_focus and self._mode == "conservation":
             bar += "  [italic dim]← → adjust[/italic dim]"
-        return bar
+
+        if self._mode != "conservation":
+            return bar
+
+        # Second row: ▼ positioned under the midpoint cell.
+        # prefix_len = visible chars before the first bar cell (no padding offset —
+        # Textual applies padding outside the rendered content).
+        prefix_len = len(f"{label} mid={int(self._midpoint)} 0")
+        cell_idx = int(round((self._midpoint / 100) * (_BAR_CELLS - 1)))
+        arrow_row = " " * (prefix_len + cell_idx) + "[dim]▼[/dim]"
+        return f"{bar}\n{arrow_row}"
 
     def on_click(self) -> None:
         self.focus()
