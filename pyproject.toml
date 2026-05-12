@@ -45,12 +45,20 @@ dependencies = [
     "tomli>=1.0; python_version < '3.11'",
     "tomli-w>=1.0",
     "textual>=0.50",
+    "torch",
+    "transformers",
+    "huggingface_hub",
 ]
 
 [project.scripts]
 beak = "beak.cli:main"
 
 [project.optional-dependencies]
+interplm = [
+    "torch",
+    "transformers",
+    "huggingface_hub",
+]
 dev = [
     "pytest",
     "black",

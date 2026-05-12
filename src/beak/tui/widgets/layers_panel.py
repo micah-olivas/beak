@@ -32,7 +32,7 @@ from ...project import BeakProject
 # Pfam domains run automatically on first project view (cheap hmmscan), so
 # they don't need a manual layer affordance. Same goes for structures —
 # AlphaFold fetch is automatic via StructureView.
-_LAYER_ORDER = ("target", "homologs", "embeddings", "structures", "experiments")
+_LAYER_ORDER = ("target", "homologs", "embeddings", "features", "structures", "experiments")
 _POLL_SECONDS = 15.0
 _JOBS_DB = Path.home() / ".beak" / "jobs.json"
 _BEAK_BLUE = "#2E86AB"
@@ -354,6 +354,9 @@ class LayersPanel(Vertical):
                     elif layer == "embeddings":
                         yield Pill(id="embed-pill")
                         yield Pill(id="embeddings-status-pill")
+                    elif layer == "features":
+                        yield Pill(id="features-pill")
+                        yield Pill(id="features-status-pill")
                     elif layer == "experiments":
                         yield Pill(id="import-pill")
                 yield Label("", classes="layer-count", id=f"count-{layer}")
@@ -372,6 +375,29 @@ class LayersPanel(Vertical):
         self.set_interval(
             self._PILL_MARQUEE_TICK_SECONDS, self._tick_pill_marquees
         )
+        # Concept-job progress updates land in interplm.py at unknown
+        # cadence (every Fabric line from the remote streamer). A 2s
+        # tick is fast enough that progress feels live without burning
+        # the CPU on widget queries.
+        self.set_interval(2.0, self._tick_concepts_status)
+
+    def _tick_concepts_status(self) -> None:
+        """Refresh the features row if anything concepts-related is running.
+
+        Also auto-expires terminal (done/failed) states after 30s so a
+        stale "concepts done" pill doesn't sit there indefinitely.
+        """
+        from ... import interplm
+        import time as _time
+        active = interplm.get_active_concepts_jobs()
+        if not active:
+            return
+        now = _time.time()
+        for (m, l), rec in list(active.items()):
+            if rec.get("status") in ("done", "failed"):
+                if now - rec.get("updated_at", now) > 30:
+                    interplm._clear_concepts_progress(m, l)
+        self._refresh_features_action()
 
     def _tick_pill_marquees(self) -> None:
         """Advance every active long-text pill by one cell."""
@@ -395,6 +421,7 @@ class LayersPanel(Vertical):
 
         self._refresh_homologs_action(manifest)
         self._refresh_embeddings_action(manifest)
+        self._refresh_features_action()
         self._refresh_experiments_action(manifest)
 
         self.border_subtitle = (
@@ -460,6 +487,11 @@ class LayersPanel(Vertical):
             if n_other:
                 label += f"  [dim]· +{n_other} other set{'s' if n_other > 1 else ''}[/dim]"
             return label
+        if layer == "features":
+            from ... import interplm
+            if interplm.is_cached(self._project.path):
+                return "[dim]layer 6 · SAE[/dim]"
+            return ""
         if layer == "structures":
             d = self._project.path / "structures"
             if d.exists():
@@ -486,6 +518,9 @@ class LayersPanel(Vertical):
             # other sets' embeddings don't count for the row state.
             active_emb = self._project.active_embeddings_set() or {}
             return bool(active_emb.get("n_embeddings"))
+        if layer == "features":
+            from ... import interplm
+            return interplm.is_cached(self._project.path)
         if layer == "domains":
             return bool(data.get("n_hits") or data.get("hits"))
         if layer == "structures":
@@ -544,9 +579,12 @@ class LayersPanel(Vertical):
                     pending.setdefault("align", []).append(jid)
             tax = manifest.get("taxonomy") or {}
             t_remote = tax.get("remote") or {}
-            if not tax.get("n_assigned"):
-                jid = t_remote.get("job_id")
-                if jid:
+            jid = t_remote.get("job_id")
+            if jid:
+                # Poll if the initial taxonomy has never landed, OR if a
+                # fallback job was submitted after the initial run (indicated
+                # by fallback_n_seqs being set in the manifest).
+                if not tax.get("n_assigned") or tax.get("fallback_n_seqs"):
                     pending.setdefault("tax", []).append(jid)
 
         for s in self._project.embeddings_sets():
@@ -664,6 +702,53 @@ class LayersPanel(Vertical):
             diff_pill.show(label, color=_BEAK_BLUE, value="diff")
         else:
             diff_pill.hide_pill()
+
+    def _refresh_features_action(self) -> None:
+        try:
+            pill = self.query_one("#features-pill", Pill)
+            status_pill = self.query_one("#features-status-pill", Pill)
+        except Exception:
+            return
+        from ... import interplm
+
+        # Concept-job state takes precedence — if anything is running, the
+        # row's primary affordance is "see the running job", not "compute".
+        active = interplm.get_active_concepts_jobs()
+        running = [
+            (m, l, rec) for (m, l), rec in active.items()
+            if rec.get("status") == "running"
+        ]
+        if running:
+            m, l, rec = running[0]
+            cfg = interplm._MODELS.get(m, {})
+            short = (rec.get("message") or "running").split("…")[0][:40]
+            status_pill.show(
+                f"concepts {cfg.get('label', m)} L{l} · {short}",
+                color="yellow", value="running",
+            )
+            pill.hide_pill()
+            return
+
+        # Recently-finished states linger briefly so the user sees them.
+        terminal = [
+            (m, l, rec) for (m, l), rec in active.items()
+            if rec.get("status") in ("done", "failed")
+        ]
+        if terminal:
+            m, l, rec = terminal[0]
+            color = "green" if rec.get("status") == "done" else "red"
+            cfg = interplm._MODELS.get(m, {})
+            status_pill.show(
+                f"concepts {cfg.get('label', m)} L{l} · {rec.get('status')}",
+                color=color, value="done",
+            )
+        else:
+            status_pill.hide_pill()
+
+        if interplm.is_cached(self._project.path):
+            pill.hide_pill()
+        else:
+            pill.show("Compute", color=_BEAK_BLUE, value="compute")
 
     def _refresh_experiments_action(self, manifest: dict) -> None:
         try:
@@ -1236,6 +1321,13 @@ class LayersPanel(Vertical):
                     f"via MMseqs LCA.",
                     timeout=6,
                 )
+            # Clear fallback_n_seqs so the polling guard doesn't
+            # re-enqueue this already-pulled job on the next tick.
+            try:
+                with self._project.mutate() as m:
+                    m.get("taxonomy", {}).pop("fallback_n_seqs", None)
+            except Exception:
+                pass
 
             # MMseqs LCA may surface organisms the UniProt path missed —
             # rebuild traits to pick them up.
