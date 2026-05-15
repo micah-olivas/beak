@@ -35,6 +35,12 @@ PDBE_BATCH_SIZE = 100
 MAX_RETRIES = 3
 RCSB_DELAY = 0.05
 PDBE_DELAY = 0.2
+# Per-request socket timeouts. Without these, a stalled PDBe / RCSB /
+# AlphaFold endpoint hangs the calling worker forever and the UI screen
+# can't recover. Downloads get a longer budget than metadata fetches
+# because CIFs of >5k-residue assemblies can be 10+ MB on slow links.
+HTTP_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120
 
 METHOD_PRIORITY = {
     "X-ray diffraction": 1,
@@ -266,7 +272,7 @@ def _get_sifts_for_uniprot(uniprot_id: str) -> List[dict]:
 
     for attempt in range(MAX_RETRIES):
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
                 result = json.loads(response.read().decode('utf-8'))
                 return _parse_best_structures_response(result)
         except urllib.error.HTTPError as e:
@@ -420,12 +426,25 @@ def _make_filename(row) -> str:
 
 
 def _download_file(url: str, dest_path: str) -> None:
-    """Download a single file with retry logic."""
+    """Download a single file with retry logic.
+
+    Streams the response body to disk via shutil.copyfileobj so we can
+    enforce a socket timeout (urlretrieve doesn't expose one) and so
+    we can delete a half-written file on any mid-transfer failure —
+    otherwise the next load would happily parse the corrupt CIF.
+    """
+    import shutil
     for attempt in range(MAX_RETRIES):
         try:
-            urllib.request.urlretrieve(url, dest_path)
+            with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as resp:
+                with open(dest_path, 'wb') as out:
+                    shutil.copyfileobj(resp, out)
             return
         except urllib.error.HTTPError as e:
+            # Partial file may exist from an earlier successful header
+            # read followed by a body failure — purge before retrying
+            # so a 429-then-success doesn't keep stale bytes around.
+            _unlink_if_exists(dest_path)
             if e.code == 429:
                 retry_after = int(e.headers.get('Retry-After', 5))
                 if attempt < MAX_RETRIES - 1:
@@ -436,8 +455,21 @@ def _download_file(url: str, dest_path: str) -> None:
                     f"Structure not found: {url}"
                 ) from e
             raise
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError, OSError):
+            _unlink_if_exists(dest_path)
             if attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt)
                 continue
             raise
+
+
+def _unlink_if_exists(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Best-effort cleanup — caller is already handling the
+        # original network error and shouldn't be derailed by an
+        # unlink failure on the partial file.
+        pass

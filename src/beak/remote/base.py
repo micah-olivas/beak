@@ -21,6 +21,12 @@ from typing import Dict, Optional
 # level + RLock so an outer mutate-style helper can call the same db
 # inside the same thread without deadlocking.
 _JOB_DB_LOCK = threading.RLock()
+# Serialise writers to `~/beak_projects/.index.json`. Without it, two
+# threads racing `_update_projects_index` can both stage `.tmp` against
+# the same path: thread A's `os.replace` succeeds, thread B's then
+# raises `FileNotFoundError` (its tmp got renamed out from under it),
+# or one writer's open-truncate clobbers the other's in-flight stage.
+_PROJECTS_INDEX_LOCK = threading.RLock()
 
 
 def _tail_lines(text: str, n: int) -> str:
@@ -453,17 +459,27 @@ class RemoteJobManager:
                             job_type: str, name: str):
         """Add/update project in index"""
         index_file = self.LOCAL_PROJECTS_DIR / ".index.json"
-        index = self._get_projects_index()
-
-        index[job_id] = {
-            'project_dir': str(project_dir),
-            'job_type': job_type,
-            'name': name,
-            'created': datetime.now().isoformat()
-        }
-
-        with open(index_file, 'w') as f:
-            json.dump(index, f, indent=2)
+        # Atomic write: tmp + fsync + replace inside _PROJECTS_INDEX_LOCK.
+        # The lock serializes read-modify-write so a second writer can't
+        # race a stale read with a fresh write; the tmp+replace makes the
+        # individual write torn-state-free. Mirrors `_save_job_db`.
+        with _PROJECTS_INDEX_LOCK:
+            index = self._get_projects_index()
+            index[job_id] = {
+                'project_dir': str(project_dir),
+                'job_type': job_type,
+                'name': name,
+                'created': datetime.now().isoformat()
+            }
+            tmp = index_file.with_suffix(index_file.suffix + '.tmp')
+            with open(tmp, 'w') as f:
+                json.dump(index, f, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, index_file)
 
     def create_project(self, job_id: str, job_type: str,
                     name: Optional[str] = None,
@@ -490,8 +506,19 @@ class RemoteJobManager:
             'created': datetime.now().isoformat()
         }
 
-        with open(project_dir / ".metadata.json", 'w') as f:
+        # Atomic write: tmp + fsync + replace. Project metadata is
+        # read on every project list/open, so a corrupt write breaks
+        # the project for the user with no way to recover via the UI.
+        meta_path = project_dir / ".metadata.json"
+        meta_tmp = meta_path.with_suffix(meta_path.suffix + '.tmp')
+        with open(meta_tmp, 'w') as f:
             json.dump(metadata, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(meta_tmp, meta_path)
 
         if query_file:
             shutil.copy2(query_file, project_dir / "input.fasta")

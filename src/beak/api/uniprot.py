@@ -21,6 +21,10 @@ UNIPROT_FASTA_URL = "https://rest.uniprot.org/uniprotkb/{accession}.fasta"
 
 MAX_RETRIES = 3
 DEFAULT_PAGE_SIZE = 500
+# Per-request socket timeout. UniProt's REST endpoint sometimes hangs
+# on slow connections — without this, the worker thread blocks forever
+# and the calling TUI screen never recovers.
+HTTP_TIMEOUT = 30
 
 
 def fetch_uniprot(accession: str, output_dir: Optional[str] = None) -> str:
@@ -37,7 +41,7 @@ def fetch_uniprot(accession: str, output_dir: Optional[str] = None) -> str:
     url = UNIPROT_FASTA_URL.format(accession=accession)
 
     try:
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
             fasta_content = response.read().decode('utf-8')
     except urllib.error.HTTPError as e:
         if e.code in (400, 404):
@@ -151,7 +155,7 @@ def _fetch_page(url: str) -> tuple:
             req = urllib.request.Request(url)
             req.add_header('Accept', 'application/json')
 
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 next_url = _parse_link_header(response.headers.get('Link', ''))
                 return data.get('results', []), next_url
