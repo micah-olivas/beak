@@ -25,6 +25,15 @@ _SS_COLORS = {
     'E': '#FFD93D',
 }
 
+# IUPAC one-letter amino-acid codes in standard order. Used by the
+# cycle_highlight() method on SequenceView.
+_AA_LETTERS = "ACDEFGHIKLMNPQRSTVWY"
+
+# Color for the per-position dot drawn above each occurrence of the
+# highlighted residue. Amber stands out against every color mode's
+# palette without clashing.
+_HIGHLIGHT_COLOR = "#FFA62B"
+
 # Cycle through these for sequential Pfam domains. The structure view
 # uses the same palette (via `tui.structure.DOMAIN_PALETTE`) so a
 # residue's domain reads as the same color whether you're looking at
@@ -101,6 +110,9 @@ class SequenceView(Vertical):
         view_prefs = project.manifest().get("view") or {}
         self._show_domains: bool = bool(view_prefs.get("show_domains", False))
         self._show_ss: bool = bool(view_prefs.get("show_ss", False))
+        # Single-residue highlight: when set, draws a colored dot above
+        # every occurrence of this letter in the wrapped sequence.
+        self._highlight_residue: Optional[str] = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="seq-scroll"):
@@ -112,6 +124,41 @@ class SequenceView(Vertical):
             yield Static("", id="seq-ss-key")
             yield Static("", id="seq-spacer")
             yield Static("", id="seq-domains-key")
+
+    def cycle_highlight(self, backward: bool = False) -> None:
+        """Step to the next (or previous) amino acid; wraps through None."""
+        if self._highlight_residue is None:
+            self._highlight_residue = (
+                _AA_LETTERS[-1] if backward else _AA_LETTERS[0]
+            )
+        else:
+            idx = _AA_LETTERS.find(self._highlight_residue)
+            next_idx = idx - 1 if backward else idx + 1
+            if next_idx < 0 or next_idx >= len(_AA_LETTERS):
+                self._highlight_residue = None
+            else:
+                self._highlight_residue = _AA_LETTERS[next_idx]
+        self._refresh_title()
+        self._refresh_view()
+
+    def on_click(self, event) -> None:
+        """Clicks on the top border (where `border_title` is rendered)
+        advance the highlight cycle. Right-click steps backward; any
+        button on the bottom border (`border_subtitle` / colorbar) is
+        ignored so the gradient legend stays read-only.
+
+        The ``widget is self`` guard rejects events that bubbled up from
+        a child (the scroll body, the footer); without it Textual could
+        forward a click on the first visible sequence row to this
+        handler with the original child-local coordinates, and y=0 of
+        the child sits well below our border.
+        """
+        if getattr(event, "widget", None) is not self:
+            return
+        if event.y != 0:
+            return
+        self.cycle_highlight(backward=(getattr(event, "button", 1) == 3))
+        event.stop()
 
     def on_mount(self) -> None:
         # Paint the border legend before any data loads so the gradient
@@ -257,6 +304,7 @@ class SequenceView(Vertical):
         # update so conservation midpoint changes show up in the corner
         # without waiting for the next mode toggle.
         self._refresh_subtitle()
+        self._refresh_title()
 
     def toggle_ss(self) -> bool:
         if not self._ss:
@@ -433,6 +481,21 @@ class SequenceView(Vertical):
                     else:
                         out.append(" ")
                 out.append("\n")
+            # Residue-highlight track: a single dot above every position
+            # in this chunk where the sequence letter matches the picker.
+            # Drawn last so it sits immediately above the sequence row
+            # (closer = easier eye-tracking when scanning for matches).
+            if self._highlight_residue:
+                out.append("      ")
+                for aa in seq_chunk:
+                    if aa.upper() == self._highlight_residue:
+                        out.append(
+                            "·",
+                            style=Style(color=_HIGHLIGHT_COLOR, bold=True),
+                        )
+                    else:
+                        out.append(" ")
+                out.append("\n")
 
             # Position labels in muted style, sequence chunk per-AA.
             out.append(f"{start + 1:>5}", style="dim")
@@ -508,6 +571,21 @@ class SequenceView(Vertical):
                 parts.append(f"[{color}]{seg}[/{color}]")
                 i = j
         return "".join(parts)
+
+    def _refresh_title(self) -> None:
+        """Show the current highlight residue + occurrence count in the
+        top border line, matching the colorbar-in-border pattern used by
+        `border_subtitle`. The empty state advertises the click affordance
+        so the border-as-interactive-element stays discoverable."""
+        if not self._highlight_residue:
+            self.border_title = "[dim] click to highlight residue [/dim]"
+            return
+        count = self._sequence.upper().count(self._highlight_residue)
+        self.border_title = (
+            f" [{_HIGHLIGHT_COLOR}]·[/{_HIGHLIGHT_COLOR}] "
+            f"[bold]{self._highlight_residue}[/bold] "
+            f"[dim]({count}) · click to cycle[/dim] "
+        )
 
     def _refresh_subtitle(self) -> None:
         """Render the colorbar legend on the panel's bottom-right border.

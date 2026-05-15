@@ -52,7 +52,6 @@ class ProjectDetailScreen(Screen):
         # gradient legend itself for at-a-glance discovery.
         Binding("[", "midpoint_down", "−mid"),
         Binding("]", "midpoint_up",   "+mid"),
-        # Search → Layers panel pill. Color → sequence-panel dropdown.
     ]
 
     def __init__(self, project: BeakProject) -> None:
