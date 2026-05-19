@@ -85,10 +85,35 @@ def doctor():
 
     disk = results.get('disk', {})
     if disk:
-        console.print(
-            f"\n[dim]Disk: {disk.get('available', '?')} available "
-            f"of {disk.get('total', '?')} total[/dim]"
-        )
+        avail = disk.get('available', '?')
+        total = disk.get('total', '?')
+        pct_str = disk.get('used_pct') or ''
+        try:
+            used_pct = int(pct_str.rstrip('%'))
+            free_pct = 100 - used_pct
+        except (TypeError, ValueError):
+            used_pct = None
+
+        if used_pct is None:
+            console.print(f"\n[dim]Disk: {avail} available of {total} total[/dim]")
+        else:
+            # Tiny inline bar — used segment carries one accent color that
+            # shifts from brand-blue → amber → red as free space tightens.
+            # Free segment stays dim so the bar reads as background.
+            bar_width = 14
+            filled = max(1, min(bar_width - 1, round(bar_width * used_pct / 100)))
+            empty = bar_width - filled
+            if free_pct < 5:
+                accent = "red"
+            elif free_pct < 15:
+                accent = "yellow"
+            else:
+                accent = BEAK_BLUE
+            bar = f"[{accent}]{'█' * filled}[/]{'░' * empty}"
+            console.print(
+                f"\n[dim]Disk[/dim]  {bar}  "
+                f"[dim]{avail} free of {total} · {free_pct}% free[/dim]"
+            )
 
     console.print()
     if results['ok']:

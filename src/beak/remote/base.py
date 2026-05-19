@@ -224,10 +224,18 @@ class RemoteJobManager:
 
         m = re.search(pattern, text)
         if m:
-            return m.group(1)
-        # Fall back to the first line, but keep it short so the table stays
-        # readable.
-        return text.split('\n')[0][:40]
+            version = m.group(1)
+        else:
+            # Fall back to the first line, but keep it short so the table
+            # stays readable.
+            version = text.split('\n')[0][:40]
+
+        # Some tools (e.g. mmseqs built from source) report a full git SHA
+        # as their version string. Shorten any pure-hex token of >=12 chars
+        # to a git-style 7-char short SHA so the column stays scannable.
+        if re.fullmatch(r'[0-9a-fA-F]{12,}', version):
+            version = version[:7]
+        return version
 
     def verify_remote(self, verbose: bool = True) -> Dict:
         """
@@ -321,6 +329,9 @@ class RemoteJobManager:
                     'total': parts[1],
                     'used': parts[2],
                     'available': parts[3],
+                    # df -h column 5 is "Use%" (e.g. "86%"); may be absent
+                    # on some BusyBox builds, so be defensive.
+                    'used_pct': parts[4] if len(parts) >= 5 else None,
                 }
                 if verbose:
                     print(f"  ✓ Disk space: {parts[3]} available")
