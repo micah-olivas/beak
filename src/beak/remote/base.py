@@ -197,7 +197,7 @@ class RemoteJobManager:
         Returns None if the tool isn't on PATH. Returns an empty string if
         the tool exists but we can't extract a usable version (so callers
         can still report it as found)."""
-        exists = self.conn.run(f'command -v {tool}', hide=True, warn=True)
+        exists = self.conn.run(f'command -v {tool}', hide=True, warn=True, timeout=5)
         if not exists.ok:
             return None
 
@@ -207,7 +207,17 @@ class RemoteJobManager:
         else:
             cmd, pattern = probe
 
-        result = self.conn.run(cmd, hide=True, warn=True)
+        # Wrap the probe in a subshell with stdin from /dev/null. Some tools
+        # (notably `muscle 5` when invoked with no arguments) read FASTA from
+        # stdin and will hang forever waiting for input otherwise. The
+        # client-side `timeout` is a belt-and-braces guard so a future
+        # misbehaving probe can't wedge `beak doctor`.
+        safe_cmd = f'( {cmd} ) < /dev/null'
+        try:
+            result = self.conn.run(safe_cmd, hide=True, warn=True, timeout=10)
+        except Exception:
+            return ''
+
         text = (result.stdout or '').strip()
         if not text:
             return ''

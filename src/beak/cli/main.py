@@ -50,6 +50,7 @@ def doctor():
     db_table.add_column("Database", style="bold")
     db_table.add_column("Status")
     db_table.add_column("Age")
+    db_table.add_column("Path", style="dim")
 
     db_info = results.get('databases', {})
     if db_info.get('exists'):
@@ -57,22 +58,25 @@ def doctor():
         db_table.add_row(
             f"MMseqs2 ({db_count} dbs)",
             "[green]OK[/green]",
-            f"[dim]{db_info['path']}[/dim]",
+            "[dim]--[/dim]",
+            db_info['path'],
         )
     else:
         db_table.add_row(
             "MMseqs2",
             "[red]MISSING[/red]",
+            "[dim]--[/dim]",
             "[dim]directory not found[/dim]",
         )
 
     try:
         pfam_path = resolve_pfam_path(mgr.conn)
         age_str = get_remote_file_age(mgr.conn, f"{pfam_path}/{PFAM_HMM_FILE}")
-        db_table.add_row("Pfam-A", "[green]OK[/green]", age_str)
+        db_table.add_row("Pfam-A", "[green]OK[/green]", age_str, pfam_path)
     except FileNotFoundError:
         db_table.add_row(
             "Pfam-A",
+            "[dim]--[/dim]",
             "[dim]--[/dim]",
             "[dim]not installed (beak setup pfam)[/dim]",
         )
