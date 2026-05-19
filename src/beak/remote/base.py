@@ -171,6 +171,54 @@ class RemoteJobManager:
         'hmmpress': {'needed_by': 'pfam (database setup)', 'install': 'http://hmmer.org/'},
     }
 
+    # Per-tool version probes: (shell command, regex with one capture group).
+    # Several of these tools either don't accept `--version` (muscle, hmmscan,
+    # hmmpress) or print a banner instead of a clean version string (mmseqs,
+    # iqtree2, docker), so a single `<tool> --version` probe produces garbage
+    # in the doctor table. The regex extracts just the version token; if it
+    # doesn't match, we fall back to the first line of stdout.
+    VERSION_PROBES = {
+        'mmseqs':   ('mmseqs version 2>&1 | head -1',                r'(\S+)'),
+        'python3':  ('python3 --version 2>&1',                       r'Python\s+(\S+)'),
+        'clustalo': ('clustalo --version 2>&1',                      r'(\S+)'),
+        'mafft':    ('mafft --version 2>&1 | head -1',               r'v?(\d[\w.]*)'),
+        'muscle':   ('muscle 2>&1 | head -1',                        r'(?i)muscle\s+v?(\S+)'),
+        'iqtree2':  ('iqtree2 --version 2>&1 | head -1',             r'version\s+(\S+)'),
+        'iqtree':   ('iqtree --version 2>&1 | head -1',              r'version\s+(\S+)'),
+        'docker':   ('docker --version 2>&1',                        r'version\s+([\w.]+)'),
+        'seqkit':   ('seqkit version 2>&1',                          r'v?(\d[\w.]*)'),
+        'hmmscan':  ("hmmscan -h 2>&1 | grep -m1 '^# HMMER'",        r'HMMER\s+(\S+)'),
+        'hmmpress': ("hmmpress -h 2>&1 | grep -m1 '^# HMMER'",       r'HMMER\s+(\S+)'),
+    }
+
+    def _probe_tool_version(self, tool: str) -> Optional[str]:
+        """Run the version probe for `tool` and return a clean version string.
+
+        Returns None if the tool isn't on PATH. Returns an empty string if
+        the tool exists but we can't extract a usable version (so callers
+        can still report it as found)."""
+        exists = self.conn.run(f'command -v {tool}', hide=True, warn=True)
+        if not exists.ok:
+            return None
+
+        probe = self.VERSION_PROBES.get(tool)
+        if probe is None:
+            cmd, pattern = f'{tool} --version 2>&1 | head -1', r'(\S+\.\S+)'
+        else:
+            cmd, pattern = probe
+
+        result = self.conn.run(cmd, hide=True, warn=True)
+        text = (result.stdout or '').strip()
+        if not text:
+            return ''
+
+        m = re.search(pattern, text)
+        if m:
+            return m.group(1)
+        # Fall back to the first line, but keep it short so the table stays
+        # readable.
+        return text.split('\n')[0][:40]
+
     def verify_remote(self, verbose: bool = True) -> Dict:
         """
         Check which tools and databases are available on the remote server.
@@ -192,23 +240,13 @@ class RemoteJobManager:
         # Check tools
         for tool, info in all_tools.items():
             required = tool in self.REQUIRED_TOOLS
-            check = self.conn.run(
-                f'command -v {tool} 2>/dev/null && {tool} --version 2>&1 | head -1 || echo "__NOT_FOUND__"',
-                hide=True, warn=True
-            )
-            output = check.stdout.strip()
-            found = '__NOT_FOUND__' not in output
-
-            # Some tools don't support --version; just check command -v
-            if not found:
-                check2 = self.conn.run(f'command -v {tool}', hide=True, warn=True)
-                found = check2.ok
-                output = check2.stdout.strip() if found else ''
+            version = self._probe_tool_version(tool)
+            found = version is not None
 
             results['tools'][tool] = {
                 'found': found,
                 'required': required,
-                'version': output.split('\n')[-1] if found else None,
+                'version': version or None,
                 'needed_by': info['needed_by'],
                 'install': info['install'],
             }
