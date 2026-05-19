@@ -65,6 +65,8 @@ pip install -e .
 
 BEAK requires SSH access to a remote server with bioinformatics tools installed.
 
+> **If beak has already been configured on your remote** — i.e., someone else in your lab has installed the shared databases and tools — you can skip the manual checks below. Just point beak at the server with `beak config init`, then run `beak doctor` to verify everything you need is reachable from your account.
+
 **1. Generate SSH key (if you don't have one):**
 
 ```bash
