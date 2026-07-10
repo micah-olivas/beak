@@ -11,7 +11,7 @@ from pathlib import Path
 
 from contextlib import contextmanager
 from fabric import Connection
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 
@@ -787,6 +787,57 @@ class RemoteJobManager:
                 pass
         return 'SUBMITTED'
 
+    # Terminal states a job can settle into.
+    _TERMINAL_STATES = ('COMPLETED', 'FAILED', 'CANCELLED')
+
+    @staticmethod
+    def _parse_status_epochs(status_lines):
+        """Pull STARTED_EPOCH / ENDED_EPOCH (unix seconds) from status.txt.
+
+        Job scripts emit these on the *remote* clock, so an end−start diff is
+        the true compute duration — independent of the client clock, any
+        client-side polling gap, and timezone. Either may be None for jobs
+        submitted before the markers existed. Returns (started, ended).
+        """
+        started = ended = None
+        for line in status_lines:
+            line = line.strip()
+            if line.startswith('STARTED_EPOCH='):
+                try:
+                    started = int(line.split('=', 1)[1])
+                except ValueError:
+                    pass
+            elif line.startswith('ENDED_EPOCH='):
+                try:
+                    ended = int(line.split('=', 1)[1])
+                except ValueError:
+                    pass
+        return started, ended
+
+    @classmethod
+    def _compute_runtime(cls, job_info, status, status_lines, finished_at=None):
+        """Human runtime string, most accurate source first.
+
+        1. Remote epoch markers (start→end) — the true compute time.
+        2. A terminal job with no markers (submitted before this change):
+           the frozen ``finished_at`` stamp minus submit time.
+        3. Otherwise (still running, or no data): live now − submit.
+
+        Only case 3 grows over time; a finished job's runtime is stable and
+        no longer inflates when you check back long after it completed —
+        which is what produced the bogus multi-hour runtime after a
+        client-side reconnect gap.
+        """
+        started, ended = cls._parse_status_epochs(status_lines)
+        if started is not None and ended is not None and ended >= started:
+            return str(timedelta(seconds=ended - started))
+
+        submitted_at = datetime.fromisoformat(job_info['submitted_at'])
+        if status in cls._TERMINAL_STATES and finished_at:
+            end = datetime.fromisoformat(finished_at)
+            return str(end - submitted_at).split('.')[0]
+        return str(datetime.now() - submitted_at).split('.')[0]
+
     def status(self, job_id: str, verbose: bool = False) -> Dict:
         """
         Check job status
@@ -820,18 +871,22 @@ class RemoteJobManager:
 
         status = self._infer_status(job_info, is_running, status_lines)
 
-        # Calculate runtime
-        submitted_at = datetime.fromisoformat(job_info['submitted_at'])
-        runtime = str(datetime.now() - submitted_at).split('.')[0]
-
         # Update local DB. Lock held only over the in-memory mutation
         # — not over the SSH round-trip above — so concurrent polls
-        # don't serialize on each other's network latency.
+        # don't serialize on each other's network latency. Stamp
+        # finished_at the first time we observe a terminal state so
+        # runtime can freeze instead of growing on every later check.
+        finished_at = None
         with self._mutate_job_db() as db:
             entry = db.get(job_id)
             if entry is not None:
                 entry['status'] = status
                 entry['last_checked'] = datetime.now().isoformat()
+                if status in self._TERMINAL_STATES and not entry.get('finished_at'):
+                    entry['finished_at'] = datetime.now().isoformat()
+                finished_at = entry.get('finished_at')
+
+        runtime = self._compute_runtime(job_info, status, status_lines, finished_at)
 
         return {
             'job_id': job_id,
@@ -870,10 +925,6 @@ class RemoteJobManager:
         status_lines = status_result.stdout.strip().split('\n')
 
         status = self._infer_status(job_info, is_running, status_lines)
-
-        # Calculate runtime
-        submitted_at = datetime.fromisoformat(job_info['submitted_at'])
-        runtime = str(datetime.now() - submitted_at).split('.')[0]
 
         # Parse progress if running. Tools like Clustal Omega emit
         # progress lines using bare carriage returns (in-place
@@ -934,11 +985,17 @@ class RemoteJobManager:
 
         # Update local DB. Same locking discipline as `status()` —
         # lock only the in-memory mutation, not the SSH calls above.
+        finished_at = None
         with self._mutate_job_db() as db:
             entry = db.get(job_id)
             if entry is not None:
                 entry['status'] = status
                 entry['last_checked'] = datetime.now().isoformat()
+                if status in self._TERMINAL_STATES and not entry.get('finished_at'):
+                    entry['finished_at'] = datetime.now().isoformat()
+                finished_at = entry.get('finished_at')
+
+        runtime = self._compute_runtime(job_info, status, status_lines, finished_at)
 
         return {
             'job_id': job_id,
@@ -1163,8 +1220,31 @@ class RemoteJobManager:
 
     # ── Wait ────────────────────────────────────────────────────────
 
+    def _reconnect(self):
+        """Tear down and rebuild the SSH connection.
+
+        A long-lived poll loop holds one connection for the job's whole
+        duration; a transient network blip (e.g. ``Can't assign requested
+        address``) otherwise kills it. Closing and reopening gets a fresh
+        transport without rebuilding the manager.
+        """
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001 — closing a dead conn is best-effort
+            pass
+        self.conn.open()
+
+    # Connection errors worth a reconnect+retry rather than aborting a wait.
+    def _transient_conn_errors(self):
+        try:
+            from paramiko.ssh_exception import SSHException
+            return (OSError, EOFError, SSHException)
+        except Exception:  # noqa: BLE001 — paramiko always present via fabric
+            return (OSError, EOFError)
+
     def wait(self, job_id: str, check_interval: int = 30,
-             verbose: bool = True, show_progress: bool = False):
+             verbose: bool = True, show_progress: bool = False,
+             max_conn_retries: int = 5):
         """
         Wait for job completion
 
@@ -1173,6 +1253,10 @@ class RemoteJobManager:
             check_interval: Seconds between checks
             verbose: Print updates
             show_progress: Show detailed progress (uses print_detailed_status)
+            max_conn_retries: Consecutive transient SSH failures to tolerate
+                (reconnecting between each) before giving up. The remote job
+                is unaffected by a dropped client connection, so this only
+                guards the polling loop, not the job itself.
         """
         if show_progress:
             self.print_detailed_status(job_id, watch=True)
@@ -1181,8 +1265,26 @@ class RemoteJobManager:
         if verbose:
             print(f"Waiting for job {job_id}...")
 
+        transient = self._transient_conn_errors()
+        conn_failures = 0
+
         while True:
-            status_info = self.status(job_id)
+            try:
+                status_info = self.status(job_id)
+                conn_failures = 0
+            except transient as e:
+                conn_failures += 1
+                if conn_failures > max_conn_retries:
+                    raise
+                if verbose:
+                    print(f"  connection dropped ({e}); reconnecting "
+                          f"[{conn_failures}/{max_conn_retries}]...")
+                try:
+                    self._reconnect()
+                except transient:
+                    pass  # next iteration retries; job keeps running remotely
+                time.sleep(min(check_interval, 5 * conn_failures))
+                continue
 
             if verbose:
                 print(f"  [{status_info['runtime']}] {status_info['status']}")
@@ -1283,6 +1385,7 @@ class RemoteJobManager:
         remote_path = job_db[job_id]['remote_path']
         self.conn.run(
             f'echo "Job cancelled: $(date)" >> {remote_path}/status.txt && '
+            f'echo "ENDED_EPOCH=$(date +%s)" >> {remote_path}/status.txt && '
             f'echo "CANCELLED" >> {remote_path}/status.txt',
             hide=True, warn=True,
         )
