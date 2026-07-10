@@ -192,3 +192,83 @@ class TestMachineOutput:
         assert res.exit_code == 0
         assert 'HUMAN confirmation line' in res.output
         assert '{' not in res.output             # no JSON leaked into human mode
+
+
+class _StatusMgr:
+    def status(self, job_id):
+        print("MANAGER CHATTER")   # simulates a manager raw print
+        return {'job_id': job_id, 'name': 'j', 'status': 'RUNNING',
+                'runtime': '0:01:00', 'job_type': 'search'}
+
+
+class _SearchResultsMgr:
+    JOB_TYPE = 'search'
+
+    def get_results(self, job_id, parse=False):
+        print("✓ Downloaded 164 hit sequences")   # manager chatter
+        return "/proj/hits.fasta"
+
+    def get_project_dir(self, job_id):
+        return "/proj"
+
+
+def _split_runner():
+    """CliRunner with stdout/stderr separated, across Click versions."""
+    try:
+        return CliRunner(mix_stderr=False)     # Click < 8.2
+    except TypeError:
+        return CliRunner()                     # Click >= 8.2 (already separate)
+
+
+def _stderr(res):
+    try:
+        return res.stderr
+    except (ValueError, Exception):
+        return ""
+
+
+class TestMonitorJson:
+    """--json for the read commands: status / results / jobs."""
+
+    def test_status_json_emits_flat_object(self, monkeypatch):
+        monkeypatch.setattr('beak.cli.jobs.get_manager', lambda **k: _StatusMgr())
+        res = _split_runner().invoke(main, ['status', 'abc12345', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.stdout.strip())
+        assert obj['status'] == 'RUNNING' and obj['job_id'] == 'abc12345'
+
+    def test_status_json_keeps_chatter_off_stdout(self, monkeypatch):
+        monkeypatch.setattr('beak.cli.jobs.get_manager', lambda **k: _StatusMgr())
+        res = _split_runner().invoke(main, ['status', 'abc12345', '--json'])
+        assert 'CHATTER' not in res.stdout       # stdout is pure JSON
+        assert 'CHATTER' in _stderr(res)         # chatter routed to stderr
+
+    def test_results_json_reports_path_not_preview(self, monkeypatch):
+        monkeypatch.setattr('beak.cli.jobs.get_manager', lambda **k: _SearchResultsMgr())
+        res = _split_runner().invoke(main, ['results', 'abc12345', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.stdout.strip())
+        assert obj == {'job_id': 'abc12345', 'job_type': 'search',
+                       'results_path': '/proj/hits.fasta'}
+        assert 'Downloaded' not in res.stdout    # manager chatter not on stdout
+
+    def test_jobs_json_emits_array(self, tmp_path, monkeypatch):
+        beak_dir = tmp_path / ".beak"
+        beak_dir.mkdir()
+        (beak_dir / "jobs.json").write_text(json.dumps({
+            "abc12345": {"job_type": "search", "name": "s1",
+                         "status": "COMPLETED",
+                         "submitted_at": "2026-07-09T10:00:00"},
+        }))
+        monkeypatch.setattr(Path, 'home', staticmethod(lambda: tmp_path))
+        res = _split_runner().invoke(main, ['jobs', '--no-refresh', '--json'])
+        assert res.exit_code == 0
+        arr = json.loads(res.stdout.strip())
+        assert isinstance(arr, list) and arr[0]['id'] == 'abc12345'
+        assert arr[0]['status'] == 'COMPLETED'
+
+    def test_jobs_json_empty_when_no_db(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(Path, 'home', staticmethod(lambda: tmp_path))
+        res = _split_runner().invoke(main, ['jobs', '--json'])
+        assert res.exit_code == 0
+        assert json.loads(res.stdout.strip()) == []

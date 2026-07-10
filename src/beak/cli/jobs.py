@@ -1,11 +1,26 @@
 """Job management commands: jobs, status, log, cancel, results."""
 
+import contextlib
 import json
+import sys
 import click
 from pathlib import Path
 
 from .main import main
-from ._common import get_manager
+from ._common import get_manager, json_mode, emit_json
+
+
+@contextlib.contextmanager
+def _stdout_to_stderr():
+    """Route any manager chatter to stderr so stdout stays clean JSON.
+
+    The remote managers print progress lines (e.g. "✓ Downloaded ...")
+    from inside get_results()/download(). In machine mode we still want
+    those visible for debugging, just not on the stdout channel the
+    agent parses.
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        yield
 
 
 @main.command()
@@ -16,7 +31,10 @@ from ._common import get_manager
               help='Filter by status (RUNNING, COMPLETED, FAILED, etc.)')
 @click.option('--no-refresh', is_flag=True,
               help='Skip the automatic remote refresh of non-terminal jobs')
-def jobs(job_type, status_filter, no_refresh):
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the job list as a JSON array on stdout.')
+@click.pass_context
+def jobs(ctx, job_type, status_filter, no_refresh, json_local):
     """List all jobs.
 
     By default, connects to the remote server once to refresh the status of
@@ -24,16 +42,17 @@ def jobs(job_type, status_filter, no_refresh):
     CANCELLED) are read from the local cache without network calls. Pass
     --no-refresh to skip the refresh entirely (e.g. when offline).
     """
+    use_json = json_mode(ctx, json_local)
     db_path = Path.home() / ".beak" / "jobs.json"
     if not db_path.exists():
-        click.echo("No jobs found.")
+        emit_json([]) if use_json else click.echo("No jobs found.")
         return
 
     with open(db_path) as f:
         job_db = json.load(f)
 
     if not job_db:
-        click.echo("No jobs found.")
+        emit_json([]) if use_json else click.echo("No jobs found.")
         return
 
     refreshed_count = 0
@@ -49,21 +68,23 @@ def jobs(job_type, status_filter, no_refresh):
                 # so use a lightweight one (search) to avoid ESMEmbeddings'
                 # Docker preflight on every `beak jobs` call.
                 mgr = get_manager(job_type='search')
-                for jid in active_ids:
-                    old = job_db[jid].get('status', 'UNKNOWN')
-                    result = mgr.status(jid)
-                    if result['status'] != old:
-                        refreshed_count += 1
+                with _stdout_to_stderr() if use_json else contextlib.nullcontext():
+                    for jid in active_ids:
+                        old = job_db[jid].get('status', 'UNKNOWN')
+                        result = mgr.status(jid)
+                        if result['status'] != old:
+                            refreshed_count += 1
                 # Reload job_db after status() calls updated it
                 with open(db_path) as f:
                     job_db = json.load(f)
             except Exception as e:
                 refresh_error = str(e)
 
-    if refreshed_count:
-        click.echo(f"Refreshed {refreshed_count} job(s)\n")
-    elif refresh_error:
-        click.echo(f"(Could not refresh: {refresh_error}; showing cached state)\n")
+    if not use_json:
+        if refreshed_count:
+            click.echo(f"Refreshed {refreshed_count} job(s)\n")
+        elif refresh_error:
+            click.echo(f"(Could not refresh: {refresh_error}; showing cached state)\n")
 
     rows = []
     for job_id, info in job_db.items():
@@ -82,6 +103,10 @@ def jobs(job_type, status_filter, no_refresh):
             'status': jstatus,
             'submitted': info.get('submitted_at', '')[:19],
         })
+
+    if use_json:
+        emit_json(rows)
+        return
 
     if not rows:
         click.echo("No matching jobs.")
@@ -109,11 +134,23 @@ def jobs(job_type, status_filter, no_refresh):
 @click.option('--verbose', '-v', is_flag=True, help='Show detailed progress')
 @click.option('--watch', '-w', is_flag=True, help='Live-updating status display')
 @click.option('--interval', default=2.0, help='Refresh interval in seconds (with --watch)')
-def status(job_id, verbose, watch, interval):
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the job status as a JSON object on stdout.')
+@click.pass_context
+def status(ctx, job_id, verbose, watch, interval, json_local):
     """Check job status"""
     from .display import print_status, watch_status
 
     mgr = get_manager(job_id=job_id)
+
+    if json_mode(ctx, json_local):
+        # Emit the flat status() dict (stable schema: job_id, name, status,
+        # runtime, job_type) rather than the nested detailed_status. --watch
+        # is a live human display and is ignored in machine mode.
+        with _stdout_to_stderr():
+            info = mgr.status(job_id)
+        emit_json(info)
+        return
 
     if watch:
         watch_status(mgr, job_id, interval=interval)
@@ -160,9 +197,18 @@ def cancel(job_id):
               help='(search jobs) Build hits_taxonomy.tsv on the remote via '
                    '`mmseqs convertalis` if it is missing, then download. '
                    'Use this for searches submitted before taxonomy-by-default.')
-def results(job_id, parse, with_taxonomy):
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit downloaded result paths as a JSON object on stdout.')
+@click.pass_context
+def results(ctx, job_id, parse, with_taxonomy, json_local):
     """Download job results."""
     mgr = get_manager(job_id=job_id)
+
+    if json_mode(ctx, json_local):
+        with _stdout_to_stderr():
+            payload = _results_json(mgr, job_id, with_taxonomy)
+        emit_json(payload)
+        return
 
     # Embeddings have a richer results story than "print the DataFrame" —
     # they produce a pickle the user loads in Python, so show a summary
@@ -188,6 +234,52 @@ def results(job_id, parse, with_taxonomy):
     # when missing (useful for pre-taxonomy-by-default searches).
     if mgr.JOB_TYPE == 'search':
         _maybe_show_search_taxonomy(mgr, job_id, force_build=with_taxonomy)
+
+
+def _results_json(mgr, job_id: str, with_taxonomy: bool) -> dict:
+    """Build the machine-readable results payload: on-disk paths, no previews.
+
+    Downloads the artefacts (like the human path does) and reports where
+    they landed so an agent reads the files itself. Never emits truncated
+    data. Any manager progress printing is redirected to stderr by the
+    caller so stdout carries only the JSON object.
+    """
+    payload = {'job_id': job_id, 'job_type': mgr.JOB_TYPE}
+
+    if mgr.JOB_TYPE == 'embeddings':
+        d = Path(mgr.download(job_id))
+        files = {}
+        for key, fname in (
+            ('mean_embeddings', 'mean_embeddings.pkl'),
+            ('per_token_embeddings', 'per_token_embeddings.pkl'),
+            ('failed', 'failed.tsv'),
+            ('taxonomy', 'hits_taxonomy.tsv'),
+        ):
+            p = d / fname
+            if p.exists() and p.stat().st_size > 0:
+                files[key] = str(p)
+        payload['results_dir'] = str(d)
+        payload['files'] = files
+        return payload
+
+    if hasattr(mgr, 'get_results'):
+        payload['results_path'] = str(mgr.get_results(job_id, parse=False))
+    elif hasattr(mgr, 'download'):
+        payload['results_path'] = str(mgr.download(job_id))
+    else:
+        payload['error'] = 'Results download not supported for this job type.'
+
+    if mgr.JOB_TYPE == 'search':
+        try:
+            if with_taxonomy:
+                mgr.get_hit_taxonomy(job_id, refresh=False)
+            tsv = Path(mgr.get_project_dir(job_id)) / 'hits_taxonomy.tsv'
+            if tsv.exists() and tsv.stat().st_size > 0:
+                payload['taxonomy_path'] = str(tsv)
+        except Exception:  # noqa: BLE001 — taxonomy is opportunistic
+            pass
+
+    return payload
 
 
 def _maybe_show_search_taxonomy(mgr, job_id: str, force_build: bool = False):

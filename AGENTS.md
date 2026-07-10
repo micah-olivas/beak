@@ -56,12 +56,17 @@ of parsing. If you'd rather poll yourself (e.g. to do other work meanwhile),
 submit with `--json` alone (status `"SUBMITTED"`) and read `~/.beak/jobs.json`
 as below.
 
-## Read `~/.beak/jobs.json` directly — it is the machine-readable surface
+## Reading job state
 
-Every submitted job is recorded in `~/.beak/jobs.json`, a JSON object keyed by
-the 8-character `job_id`. Parse this file for state rather than scraping the
-Rich-formatted output of `beak jobs` / `beak status`, which is built for humans
-(ANSI color, box-drawing, glyphs).
+Two equivalent machine-readable surfaces:
+
+- `beak status <id> --json` emits `{job_id, name, status, runtime, job_type}`;
+  `beak jobs --json` emits a JSON array of `{id, name, type, status, submitted}`.
+  Both hit the remote to refresh non-terminal jobs. (Without `--json` these
+  render Rich tables built for humans — ANSI color, box-drawing, glyphs.)
+- `~/.beak/jobs.json`, a JSON object keyed by the 8-character `job_id`, is the
+  same state on disk. Read it directly when you want state **without** a remote
+  round-trip (offline, or to avoid an SSH call per poll).
 
 ```bash
 # State of one job
@@ -91,10 +96,15 @@ beak log a1b2c3d4         # remote job log; use to diagnose a FAILED job
 
 Results are written to disk; do not read them out of terminal output.
 
-- `beak results <id>` (no flags) downloads results and prints `✓ Results at:
-  <path>`. Capture that path and read the file (FASTA / TSV / parquet) yourself.
-- `beak results <id> --parse` prints a **truncated** preview (20 rows). Use it
-  only to eyeball completion, never to capture data.
+- `beak results <id> --json` downloads the artefacts and emits their on-disk
+  paths as one object: `{job_id, job_type, results_path, [taxonomy_path]}`.
+  Embeddings jobs instead report `{job_id, job_type, results_dir, files}` where
+  `files` maps `mean_embeddings` / `per_token_embeddings` / `failed` /
+  `taxonomy` to paths. Read those files yourself.
+- `beak results <id>` (no flags) is the human form: downloads and prints
+  `✓ Results at: <path>`.
+- `beak results <id> --parse` prints a **truncated** preview (20 rows) — for
+  eyeballing only, never to capture data.
 - For programmatic full results, the Python API returns the complete object:
   `from beak.remote import BeakSession; BeakSession().search.get_results(id)`
   yields the full `pandas.DataFrame`.
@@ -138,11 +148,11 @@ Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|bro
             beak embeddings <fa> [-m MODEL] [--layer N]
             # all four also take: --json  --wait  --interval <sec>
 
-Monitor     beak jobs                  # list (human display; prefer jobs.json)
-            beak status <id>           # one job (human display; prefer jobs.json)
-            beak log <id>              # remote log (use for FAILED diagnosis)
+Monitor     beak jobs --json           # JSON array of all jobs
+            beak status <id> --json    # JSON status of one job
+            beak log <id>              # remote log (human text; FAILED diagnosis)
 
-Fetch       beak results <id>          # prints "✓ Results at: <path>"
+Fetch       beak results <id> --json   # JSON of downloaded result paths
 
 Projects    beak project init <name> --uniprot <id> | --sequence <fa>
             beak project list
@@ -170,10 +180,9 @@ before parsing:
 | `2`  | Usage error (bad/missing arguments)                             |
 | `3`  | Remote unreachable (connection/timeout/SSH failure)            |
 
-## Known rough edges (roadmap)
+## Known rough edges
 
-Machine output currently covers the **submit** commands. Still human-only:
-
-- **`beak status` / `beak results` have no `--json` mode.** Read
-  `~/.beak/jobs.json` for state, and take the result path from the plain
-  `beak results <id>` line (or the Python API) for data — as described above.
+Machine output (`--json`) now covers the full job loop: submit, `status`,
+`jobs`, and `results`. Still human-only, by design (no agent contract needed):
+`beak log` (free-form remote text), `beak doctor`, and the `beak project`
+commands. Add `--json` there if an agent workflow comes to need it.
