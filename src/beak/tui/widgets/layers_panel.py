@@ -350,6 +350,7 @@ class LayersPanel(Vertical):
                         yield Pill(id="align-pill")
                         yield Pill(id="tax-pill")
                         yield Pill(id="diff-pill")
+                        yield Pill(id="tax-cluster-pill")
                         yield Pill(id="homologs-status-pill")
                     elif layer == "embeddings":
                         yield Pill(id="embed-pill")
@@ -600,6 +601,7 @@ class LayersPanel(Vertical):
         align_pill = self.query_one("#align-pill", Pill)
         tax_pill = self.query_one("#tax-pill", Pill)
         diff_pill = self.query_one("#diff-pill", Pill)
+        tax_cluster_pill = self.query_one("#tax-cluster-pill", Pill)
         status_pill = self.query_one("#homologs-status-pill", Pill)
 
         # All homolog state now lives in the active set, not flat under
@@ -622,6 +624,7 @@ class LayersPanel(Vertical):
             align_pill.hide_pill()
             tax_pill.hide_pill()
             diff_pill.hide_pill()
+            tax_cluster_pill.hide_pill()
             if search_jid:
                 status = self._lookup_status(search_jid)
                 color = _STATUS_STYLES.get(status, "dim")
@@ -640,6 +643,7 @@ class LayersPanel(Vertical):
             align_pill.hide_pill()
             tax_pill.hide_pill()
             diff_pill.hide_pill()
+            tax_cluster_pill.hide_pill()
             status = self._lookup_status(align_jid)
             color = _STATUS_STYLES.get(status, "dim")
             status_pill.show(
@@ -658,6 +662,7 @@ class LayersPanel(Vertical):
             if not n_aligned:
                 align_pill.hide_pill()
             tax_pill.hide_pill()
+            tax_cluster_pill.hide_pill()
             return
 
         # No remote job in flight — but the local UniProt-REST taxonomy
@@ -702,6 +707,17 @@ class LayersPanel(Vertical):
             diff_pill.show(label, color=_BEAK_BLUE, value="diff")
         else:
             diff_pill.hide_pill()
+
+        # Taxonomic clustering needs an alignment + a taxonomy.parquet
+        # (the clade labels come from its lineage ranks). Same cheap stat
+        # check as the differential pill.
+        tax_parquet = self._project.active_homologs_dir() / "taxonomy.parquet"
+        if n_aligned and tax_parquet.exists():
+            txc = manifest.get("taxonomic") or {}
+            label = "TaxClust*" if txc.get("active_rank") else "TaxClust"
+            tax_cluster_pill.show(label, color=_BEAK_BLUE, value="tax-cluster")
+        else:
+            tax_cluster_pill.hide_pill()
 
     def _refresh_features_action(self) -> None:
         try:

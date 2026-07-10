@@ -479,6 +479,27 @@ def differential_color(score: float, scale: float = 0.5) -> str:
     return f"#{r:02X}{g:02X}{b:02X}"
 
 
+def taxonomic_color(score: float, scale: float = 1.0) -> str:
+    """Sequential gradient for unsigned taxonomic-clustering scores in [0, 1].
+
+    Unlike the two-group differential (which is signed and diverging),
+    taxonomic clustering is a multi-clade magnitude — there is no
+    enrichment *direction*, only strength. So this is a single-hue ramp:
+    neutral panel grey (no clade structure, residue variation is
+    clade-blind) up to saturated magenta (fully clade-partitioned — the
+    position's residue is essentially predicted by which clade a sequence
+    belongs to). Magenta keeps it visually distinct from conservation and
+    the red/blue differential palette. Inputs are expected pre-normalised
+    to [0, 1] by the view (uncertainty coefficient as-is; z-scores scaled
+    to their own max).
+    """
+    t = max(0.0, min(1.0, float(score) / scale)) if scale > 0 else 0.0
+    r = int(0x55 + (0xE0 - 0x55) * t)
+    g = int(0x55 + (0x40 - 0x55) * t)
+    b = int(0x55 + (0xFB - 0x55) * t)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
 # Domain palette used by the sequence view's domain bars; we share it
 # here so structure-view residues color in lock-step with the sequence
 # view when Pfam mode is active.
@@ -535,6 +556,8 @@ def color_for_mode(score: float, mode: str = "plddt", midpoint: float = 50.0) ->
         return sasa_color(score)
     if mode == "differential":
         return differential_color(score)
+    if mode == "taxonomic":
+        return taxonomic_color(score)
     if mode == "pfam":
         return pfam_color(score)
     if mode == "bfactor":

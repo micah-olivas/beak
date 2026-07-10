@@ -96,6 +96,7 @@ class ProjectDetailScreen(Screen):
                          ("cons", "conservation"),
                          ("SASA", "sasa"),
                          ("diff", "differential"),
+                         ("tax", "taxonomic"),
                          ("Pfam", "pfam")],
                         value=self._color_mode,
                         id="color-select",
@@ -434,6 +435,7 @@ class ProjectDetailScreen(Screen):
             ("cons", "conservation"),
             ("SASA", "sasa"),
             ("diff", "differential"),
+            ("tax", "taxonomic"),
             ("Pfam", "pfam"),
         ]
         sel.set_options(options)
@@ -733,6 +735,12 @@ class ProjectDetailScreen(Screen):
                 SubmitComparativeModal(self._project),
                 self._on_comparative_built,
             )
+        elif message.pill_id == "tax-cluster-pill":
+            from .submit_taxonomic import SubmitTaxonomicModal
+            self.app.push_screen(
+                SubmitTaxonomicModal(self._project),
+                self._on_taxonomic_built,
+            )
         elif message.pill_id == "features-pill":
             from .interplm_view import InterPLMScreen
             self.app.push_screen(
@@ -892,6 +900,33 @@ class ProjectDetailScreen(Screen):
             self.notify(
                 "Differential built but couldn't load — try toggling Color "
                 "to 'Differential'.",
+                severity="warning", timeout=8,
+            )
+        self.query_one(LayersPanel).refresh_state()
+
+    def _on_taxonomic_built(self, rank) -> None:
+        if not rank:
+            return
+        sv = self.query_one(StructureView)
+        if sv.set_color_mode("taxonomic"):
+            self._color_mode = "taxonomic"
+            self._save_view_pref("color_mode", "taxonomic")
+            try:
+                self.query_one("#color-select", Select).value = "taxonomic"
+            except Exception:
+                pass
+            try:
+                seq = self.query_one(SequenceView)
+                seq.set_color_mode("taxonomic")
+            except Exception:
+                pass
+            from ..comparative import active_taxonomic_label
+            label = active_taxonomic_label(self._project) or rank
+            self.notify(f"Taxonomic clustering: {label}", timeout=6)
+        else:
+            self.notify(
+                "Taxonomic scores built but couldn't load — try toggling "
+                "Color to 'tax'.",
                 severity="warning", timeout=8,
             )
         self.query_one(LayersPanel).refresh_state()
