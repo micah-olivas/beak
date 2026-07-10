@@ -42,6 +42,53 @@ def _tail_lines(text: str, n: int) -> str:
     return "\n".join(lines[-n:])
 
 
+def _parse_load_probe(loadavg_out, nproc_out, mem_out, gpu_out):
+    """Parse raw stdout of the server-load probes into a dict.
+
+    Pure (no I/O) so it is unit-testable. Any field whose probe failed or
+    was unparseable is omitted rather than guessed. Expected inputs:
+      loadavg_out : contents of /proc/loadavg ("0.5 0.4 0.3 1/23 456")
+      nproc_out   : `nproc` output ("8")
+      mem_out     : `free -m` Mem row reduced to "<total> <available>"
+      gpu_out     : `nvidia-smi` CSV rows "util, mem_used, mem_total"
+    """
+    load = {}
+
+    fields = (loadavg_out or '').split()
+    if len(fields) >= 3:
+        try:
+            load['load_1m'] = float(fields[0])
+            load['load_5m'] = float(fields[1])
+            load['load_15m'] = float(fields[2])
+        except ValueError:
+            pass
+
+    nproc = (nproc_out or '').strip()
+    if nproc.isdigit():
+        load['n_cpus'] = int(nproc)
+        if load.get('load_1m') is not None and load['n_cpus']:
+            load['load_per_cpu'] = round(load['load_1m'] / load['n_cpus'], 2)
+
+    mem = (mem_out or '').split()
+    if len(mem) >= 2 and mem[0].isdigit() and mem[1].isdigit():
+        load['mem_total_mb'] = int(mem[0])
+        load['mem_available_mb'] = int(mem[1])
+
+    gpus = []
+    for line in (gpu_out or '').strip().splitlines():
+        cells = [c.strip() for c in line.split(',')]
+        if len(cells) == 3 and all(c.replace('.', '', 1).isdigit() for c in cells):
+            gpus.append({
+                'util_pct': float(cells[0]),
+                'mem_used_mb': int(float(cells[1])),
+                'mem_total_mb': int(float(cells[2])),
+            })
+    if gpus:
+        load['gpus'] = gpus
+
+    return load
+
+
 class RemoteJobManager:
     """Base class for remote job management.
 
@@ -335,6 +382,27 @@ class RemoteJobManager:
                 }
                 if verbose:
                     print(f"  ✓ Disk space: {parts[3]} available")
+
+        # Server load. Per-job CPU is already thread-capped, so this exists
+        # to let a caller gauge job *count* and other users' load (which the
+        # local job db can't see) before fanning out more jobs. The parsing
+        # is factored into _parse_load_probe() so it can be tested without SSH.
+        def _out(cmd):
+            r = self.conn.run(cmd, hide=True, warn=True)
+            return r.stdout if r.ok else ''
+
+        load = _parse_load_probe(
+            _out('cat /proc/loadavg 2>/dev/null'),
+            _out('nproc 2>/dev/null'),
+            _out("free -m 2>/dev/null | awk '/^Mem:/{print $2, $NF}'"),
+            _out('nvidia-smi --query-gpu=utilization.gpu,memory.used,'
+                 'memory.total --format=csv,noheader,nounits 2>/dev/null'),
+        )
+        if load:
+            results['load'] = load
+            if verbose and load.get('load_per_cpu') is not None:
+                print(f"  Load: {load['load_1m']} "
+                      f"({load['load_per_cpu']}/cpu over {load['n_cpus']} cpus)")
 
         if verbose:
             print()

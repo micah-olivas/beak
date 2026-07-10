@@ -37,6 +37,7 @@ def doctor(ctx, json_local):
             'tools': results.get('tools', {}),
             'databases': results.get('databases', {}),
             'disk': results.get('disk', {}),
+            'load': results.get('load', {}),
         }
         try:
             payload['pfam'] = {'installed': True,
@@ -143,6 +144,21 @@ def doctor(ctx, json_local):
                 f"\n[dim]Disk[/dim]  {bar}  "
                 f"[dim]{avail} free of {total} · {free_pct}% free[/dim]"
             )
+
+    load = results.get('load', {})
+    if load.get('load_per_cpu') is not None:
+        lpc = load['load_per_cpu']
+        # Green under half-loaded, amber approaching saturation, red over.
+        accent = "red" if lpc >= 1.0 else "yellow" if lpc >= 0.7 else "green"
+        line = (f"[dim]Load[/dim]  [{accent}]{lpc:g}/cpu[/]  "
+                f"[dim]({load['load_1m']:g} over {load['n_cpus']} cpus)[/dim]")
+        if load.get('mem_available_mb') is not None:
+            line += (f"  [dim]· {load['mem_available_mb'] // 1024} GB "
+                     f"of {load['mem_total_mb'] // 1024} GB free[/dim]")
+        if load.get('gpus'):
+            busy = sum(1 for g in load['gpus'] if g['util_pct'] >= 50)
+            line += f"  [dim]· {len(load['gpus'])} GPU, {busy} busy[/dim]"
+        console.print(line)
 
     console.print()
     if results['ok']:

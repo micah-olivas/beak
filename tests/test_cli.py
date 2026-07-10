@@ -7,6 +7,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from beak.cli import main, cli_entry
+from beak.remote.base import _parse_load_probe
 
 
 @pytest.fixture
@@ -339,3 +340,70 @@ class TestDryRun:
         assert res.exit_code == 0
         assert 'DRY RUN' in res.output
         assert 'algorithm: clustalo' in res.output
+
+
+class TestLoadProbeParsing:
+    """_parse_load_probe: raw probe stdout -> structured load dict."""
+
+    def test_full(self):
+        load = _parse_load_probe(
+            "0.80 0.60 0.50 2/300 12345",   # /proc/loadavg
+            "8",                            # nproc
+            "16000 4000",                   # free -m: total available
+            "10, 2048, 40960\n95, 39000, 40960",  # 2 GPUs
+        )
+        assert load['load_1m'] == 0.8 and load['load_15m'] == 0.5
+        assert load['n_cpus'] == 8 and load['load_per_cpu'] == 0.1
+        assert load['mem_total_mb'] == 16000 and load['mem_available_mb'] == 4000
+        assert len(load['gpus']) == 2
+        assert load['gpus'][1]['util_pct'] == 95.0
+        assert load['gpus'][0]['mem_total_mb'] == 40960
+
+    def test_cpu_only_no_gpu(self):
+        load = _parse_load_probe("1.0 1.0 1.0", "4", "", "")
+        assert load['load_per_cpu'] == 0.25
+        assert 'gpus' not in load and 'mem_total_mb' not in load
+
+    def test_all_empty(self):
+        assert _parse_load_probe("", "", "", "") == {}
+
+    def test_garbage_is_omitted_not_guessed(self):
+        assert _parse_load_probe("not a number", "abc", "x y", "bad,csv") == {}
+
+
+class _DoctorConn:
+    host = 'srv.example'
+
+
+class _DoctorMgr:
+    def __init__(self, ok=True):
+        self._ok = ok
+        self.conn = _DoctorConn()
+
+    def verify_remote(self, verbose=False):
+        return {'ok': self._ok, 'tools': {}, 'databases': {}, 'disk': {},
+                'load': {'load_1m': 0.8, 'n_cpus': 8, 'load_per_cpu': 0.1,
+                         'mem_total_mb': 16000, 'mem_available_mb': 4000}}
+
+
+def _no_pfam(conn):
+    raise FileNotFoundError()
+
+
+class TestDoctorJson:
+    def test_includes_load_and_pfam(self, monkeypatch):
+        monkeypatch.setattr('beak.cli._common.get_manager', lambda **k: _DoctorMgr(True))
+        monkeypatch.setattr('beak.remote.hmmer.resolve_pfam_path', _no_pfam)
+        res = _split_runner().invoke(main, ['doctor', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.stdout.strip())
+        assert obj['ok'] is True
+        assert obj['load']['load_per_cpu'] == 0.1
+        assert obj['pfam'] == {'installed': False, 'path': None}
+
+    def test_exit_nonzero_when_not_ok(self, monkeypatch):
+        monkeypatch.setattr('beak.cli._common.get_manager', lambda **k: _DoctorMgr(False))
+        monkeypatch.setattr('beak.remote.hmmer.resolve_pfam_path', _no_pfam)
+        res = _split_runner().invoke(main, ['doctor', '--json'])
+        assert res.exit_code == 1
+        assert json.loads(res.stdout.strip())['ok'] is False

@@ -138,6 +138,26 @@ not every few seconds, and set generous timeouts. Order-of-magnitude, for a
 
 Benchmark on the actual remote before hard-coding timeouts.
 
+## Shared-server etiquette
+
+The remote is shared. Be a considerate neighbor:
+
+- **Submit expensive jobs one at a time.** Prefer `--wait` (which serializes
+  naturally) over firing many jobs at once. Each search/taxonomy job uses up to
+  `compute.threads` (default 8) CPUs, so N concurrent jobs ≈ 8N cores plus N
+  copies of the database in RAM — a handful of parallel searches and an IQ-TREE
+  can saturate a box.
+- **Check load before fanning out.** `beak doctor --json` reports a `load`
+  object: `{load_1m, load_5m, load_15m, n_cpus, load_per_cpu, mem_total_mb,
+  mem_available_mb, gpus:[{util_pct, mem_used_mb, mem_total_mb}]}`. Hold off on
+  new submissions when `load_per_cpu` is near or above 1.0, memory is tight, or
+  (for embeddings) the GPUs are busy.
+- **Cap your own concurrency.** Count RUNNING jobs in `beak jobs --json` (or
+  `~/.beak/jobs.json`) and keep simultaneous heavy jobs small — 2–3 is usually
+  plenty, one is safest on a busy box.
+- **Preview first.** `--dry-run` prints a job's plan (and, for embeddings, its
+  output size) without submitting — sanity-check before committing compute.
+
 ## Command reference (agent-relevant subset)
 
 ```
