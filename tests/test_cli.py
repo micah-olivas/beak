@@ -1,11 +1,12 @@
 """Smoke tests for beak CLI using click.testing.CliRunner."""
 
 import json
+import sys
 import pytest
 from pathlib import Path
 from click.testing import CliRunner
 
-from beak.cli import main
+from beak.cli import main, cli_entry
 
 
 @pytest.fixture
@@ -272,3 +273,34 @@ class TestMonitorJson:
         res = _split_runner().invoke(main, ['jobs', '--json'])
         assert res.exit_code == 0
         assert json.loads(res.stdout.strip()) == []
+
+
+class TestErrorJson:
+    """cli_entry() renders errors as JSON on stdout in --json mode."""
+
+    def test_error_as_json_on_stdout(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, 'argv',
+                            ['beak', 'search', '/no/such.fasta',
+                             '--db', 'uniref90', '--json'])
+        with pytest.raises(SystemExit) as ei:
+            cli_entry()
+        assert ei.value.code == 2                       # usage error
+        obj = json.loads(capsys.readouterr().out.strip())
+        assert obj['exit_code'] == 2
+        assert 'File not found' in obj['error']
+
+    def test_error_stays_human_without_json(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, 'argv',
+                            ['beak', 'search', '/no/such.fasta', '--db', 'uniref90'])
+        with pytest.raises(SystemExit) as ei:
+            cli_entry()
+        assert ei.value.code == 2
+        cap = capsys.readouterr()
+        assert cap.out.strip() == ''                    # nothing on stdout
+        assert 'File not found' in cap.err              # message on stderr
+
+    def test_success_exits_zero(self, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', ['beak', '--help'])
+        with pytest.raises(SystemExit) as ei:
+            cli_entry()
+        assert ei.value.code == 0

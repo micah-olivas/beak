@@ -52,7 +52,7 @@ dependencies = [
 ]
 
 [project.scripts]
-beak = "beak.cli:main"
+beak = "beak.cli:cli_entry"
 
 [project.optional-dependencies]
 interplm = [

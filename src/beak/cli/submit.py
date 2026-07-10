@@ -42,6 +42,11 @@ def _finish_submit(ctx, mgr, job_id, job_type, job_name,
             'status': status,
         })
     if wait and status != 'COMPLETED':
+        if use_json:
+            # The status object (status=FAILED/CANCELLED/…) was just emitted;
+            # exit non-zero without raising a ClickException so the entry
+            # wrapper doesn't also print a separate error object.
+            raise SystemExit(1)
         raise JobFailed(f"Job {job_id} ended in state {status}")
 
 

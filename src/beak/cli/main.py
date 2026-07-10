@@ -15,17 +15,42 @@ def main(ctx, json_mode):
 
 
 @main.command()
-def doctor():
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the environment report as a JSON object on stdout.')
+@click.pass_context
+def doctor(ctx, json_local):
     """Check remote server for required tools and databases"""
     from .theme import get_console, BEAK_BLUE
-    from ._common import get_manager, get_remote_file_age
+    from ._common import get_manager, get_remote_file_age, json_mode, emit_json
     from ..remote.hmmer import resolve_pfam_path, PFAM_HMM_FILE
     from rich.table import Table
 
-    console = get_console()
     mgr = get_manager(job_type='search')
     results = mgr.verify_remote(verbose=False)
 
+    if json_mode(ctx, json_local):
+        # Preflight payload: an agent gates submission on `ok` (and the
+        # nonzero exit) before spending remote compute.
+        payload = {
+            'ok': bool(results.get('ok')),
+            'remote_host': mgr.conn.host,
+            'tools': results.get('tools', {}),
+            'databases': results.get('databases', {}),
+            'disk': results.get('disk', {}),
+        }
+        try:
+            payload['pfam'] = {'installed': True,
+                               'path': resolve_pfam_path(mgr.conn)}
+        except FileNotFoundError:
+            payload['pfam'] = {'installed': False, 'path': None}
+        emit_json(payload)
+        # Bare exit code (not ctx.exit / ClickException) so behavior is
+        # identical under CliRunner and the real console-script wrapper.
+        if not payload['ok']:
+            raise SystemExit(1)
+        return
+
+    console = get_console()
     console.print(f"\n[brand]BEAK Doctor[/brand]")
     console.print(f"[dim]Remote: {mgr.conn.host}[/dim]\n")
 

@@ -38,8 +38,9 @@ per-command (`beak search … --json`) or before the subcommand
 
 ```bash
 # 1. Preflight — confirm the remote is configured and reachable
-beak config show          # is a host/user set?
-beak doctor               # are the required remote tools + databases present?
+beak config show                 # is a host/user set?
+beak doctor --json               # {ok, tools, databases, disk, pfam}; exit 0 if ok, 1 if not
+# Gate the rest on `.ok` (or on `$? == 0`) before spending remote compute.
 
 # 2. Submit + block + parse — one call, one JSON object on stdout
 beak search query.fasta --db uniref90 --name my_search --json --wait --interval 30
@@ -140,7 +141,7 @@ Benchmark on the actual remote before hard-coding timeouts.
 
 ```
 Preflight   beak config show          # current config
-            beak doctor               # remote tools + database check
+            beak doctor --json        # {ok, tools, databases, disk, pfam}; nonzero exit if not ok
 
 Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|broad|twilight]
             beak taxonomy <fa> --db <alias> [--name N]
@@ -180,9 +181,14 @@ before parsing:
 | `2`  | Usage error (bad/missing arguments)                             |
 | `3`  | Remote unreachable (connection/timeout/SSH failure)            |
 
+In `--json` mode a failure also prints `{"error": "...", "exit_code": N}` on
+stdout (in addition to setting the exit code), so a stdout-only consumer still
+sees the failure. Commands that already emitted a result object (`status
+--json`, a failed `--wait`) just set the exit code and print nothing further.
+
 ## Known rough edges
 
-Machine output (`--json`) now covers the full job loop: submit, `status`,
-`jobs`, and `results`. Still human-only, by design (no agent contract needed):
-`beak log` (free-form remote text), `beak doctor`, and the `beak project`
+Machine output (`--json`) covers the full job loop — submit, `status`, `jobs`,
+`results` — plus `doctor` for preflight. Still human-only, by design (no agent
+contract needed): `beak log` (free-form remote text) and the `beak project`
 commands. Add `--json` there if an agent workflow comes to need it.
