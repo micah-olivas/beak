@@ -85,11 +85,17 @@ class TestParseLineageDf:
         df = pd.DataFrame({'lineage': [
             'd_Bacteria;p_Proteobacteria;g_Escherichia',
             'd_Archaea;p_Euryarchaeota;g_Methanococcus',
-            '',  # empty should produce all-None ranks
+            '',  # empty row -> missing ranks
         ]})
         out = parse_lineage_df(df)
-        assert list(out['domain']) == ['Bacteria', 'Archaea', None]
-        assert list(out['genus']) == ['Escherichia', 'Methanococcus', None]
+        # The empty row yields a missing value whose sentinel differs by
+        # pandas version (None on the <3.0 object dtype, NaN on the 3.0
+        # default `str` dtype), so assert on the populated values plus
+        # isna() rather than an exact comparison against None.
+        assert list(out['domain'][:2]) == ['Bacteria', 'Archaea']
+        assert list(out['genus'][:2]) == ['Escherichia', 'Methanococcus']
+        assert out['domain'].isna().tolist() == [False, False, True]
+        assert out['genus'].isna().tolist() == [False, False, True]
 
 
 class TestLoadHitTaxonomy:

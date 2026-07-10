@@ -9,6 +9,26 @@ This document describes what works **today**. Rough edges and their roadmap are
 listed at the end; where a feature is missing, the workaround here is the
 supported path until it lands.
 
+## Environment
+
+BEAK runs from a project-local virtualenv at `.venv/`. There is no activation
+step for an agent — invoke the interpreter and CLI by path so every call uses
+the right environment regardless of shell state:
+
+```bash
+# One-time setup (Python >= 3.8; 3.11 recommended)
+python3.11 -m venv .venv
+./.venv/bin/pip install -e ".[dev]"
+
+# Thereafter, always invoke by path — never bare `python`/`beak`, which may
+# resolve to an unrelated system or conda interpreter:
+./.venv/bin/beak doctor
+./.venv/bin/python -m pytest tests/ -q
+```
+
+Do not rely on `conda activate` or a globally-installed `beak`; the `.venv`
+paths above are the supported entry points.
+
 ## The loop (machine mode)
 
 The submit commands accept `--json` (structured stdout), `--wait` (block until a
