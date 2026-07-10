@@ -169,6 +169,7 @@ class MMseqsSearch(RemoteJobManager):
            database: str,
            job_name: Optional[str] = None,
            preset: Optional[str] = None,
+           quiet: bool = False,
            **mmseqs_params) -> str:
         """Submit a new MMseqs2 search job"""
         job_id = str(uuid.uuid4())[:8]
@@ -316,7 +317,8 @@ rm -rf {remote_job_path}/tmp
                 'parameters': final_params,
             }
 
-        print(f"✓ Submitted {job_name} → {database} ({job_id})")
+        if not quiet:
+            print(f"✓ Submitted {job_name} → {database} ({job_id})")
 
         return job_id
 

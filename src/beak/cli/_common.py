@@ -5,6 +5,31 @@ import click
 from pathlib import Path
 
 
+class JobFailed(click.ClickException):
+    """A job reached a non-COMPLETED terminal state (FAILED/CANCELLED/UNKNOWN)."""
+    exit_code = 1
+
+
+class RemoteUnreachable(click.ClickException):
+    """The remote server could not be reached (connection/timeout/OS error)."""
+    exit_code = 3
+
+
+def json_mode(ctx, local=False):
+    """True when machine-readable output is requested.
+
+    ORs a per-command ``--json`` flag (`local`) with the group-level
+    ``--json`` carried on ``ctx.obj``, so both `beak --json search ...`
+    and `beak search --json ...` work.
+    """
+    return bool(local or (ctx.obj or {}).get('json'))
+
+
+def emit_json(payload):
+    """Write one JSON object to stdout (the machine-output channel)."""
+    click.echo(json.dumps(payload))
+
+
 def get_manager(job_id=None, job_type=None):
     """Create the appropriate manager for a job_id or job_type.
 
@@ -48,7 +73,7 @@ def get_manager(job_id=None, job_type=None):
     try:
         return cls()
     except (ConnectionError, TimeoutError, OSError) as e:
-        raise click.ClickException(f"Cannot connect to remote server: {e}")
+        raise RemoteUnreachable(f"Cannot connect to remote server: {e}")
 
 
 def get_hmmer_manager():
@@ -80,7 +105,7 @@ def get_hmmer_manager():
         )
         return conn, HmmerScan(connection=conn)
     except (ConnectionError, TimeoutError, OSError) as e:
-        raise click.ClickException(f"Cannot connect to remote server: {e}")
+        raise RemoteUnreachable(f"Cannot connect to remote server: {e}")
 
 
 def auto_name_from_pfam(query_file: str, job_type: str) -> str:

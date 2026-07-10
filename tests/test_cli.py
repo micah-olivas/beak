@@ -115,3 +115,80 @@ class TestJobsCommand:
         assert result.exit_code == 0
         assert 'abc123' in result.output
         assert 'test_search' in result.output
+
+
+class _FakeMgr:
+    """Stand-in job manager: no SSH, deterministic ids and terminal state."""
+
+    def __init__(self, final='COMPLETED'):
+        self.final = final
+
+    def submit(self, *args, quiet=False, **kwargs):
+        # Mirrors the real managers: they print a human line unless quiet.
+        if not quiet:
+            print("HUMAN confirmation line")
+        return "deadbeef"
+
+    def wait(self, job_id, check_interval=30, verbose=True):
+        return self.final
+
+
+@pytest.fixture
+def query_fasta(tmp_path):
+    fa = tmp_path / "q.fasta"
+    fa.write_text(">q\nMKTAYIAKQR\n")
+    return str(fa)
+
+
+class TestMachineOutput:
+    """--json / --wait / exit-code contract for agent-driven submission."""
+
+    def _patch(self, monkeypatch, final='COMPLETED'):
+        monkeypatch.setattr('beak.cli.submit.get_manager',
+                            lambda **k: _FakeMgr(final))
+
+    def test_submit_flags_present_on_all_commands(self, runner):
+        for cmd in ('search', 'taxonomy', 'align', 'embeddings'):
+            out = runner.invoke(main, [cmd, '--help']).output
+            for flag in ('--json', '--wait', '--interval'):
+                assert flag in out, f"{flag} missing on {cmd}"
+
+    def test_json_submit_emits_single_clean_object(self, runner, monkeypatch, query_fasta):
+        self._patch(monkeypatch)
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'j1', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.output.strip())   # must be exactly one JSON object
+        assert obj == {'job_id': 'deadbeef', 'job_type': 'search',
+                       'name': 'j1', 'status': 'SUBMITTED'}
+        assert 'HUMAN' not in res.output        # quiet suppressed the human line
+
+    def test_group_level_flag_also_works(self, runner, monkeypatch, query_fasta):
+        self._patch(monkeypatch)
+        res = runner.invoke(main, ['--json', 'search', query_fasta,
+                                   '--db', 'uniref90', '--name', 'j2'])
+        assert res.exit_code == 0
+        assert json.loads(res.output.strip())['name'] == 'j2'
+
+    def test_wait_completed_exits_zero(self, runner, monkeypatch, query_fasta):
+        self._patch(monkeypatch, final='COMPLETED')
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'j3', '--json', '--wait'])
+        assert res.exit_code == 0
+        assert json.loads(res.output.strip())['status'] == 'COMPLETED'
+
+    def test_wait_failed_exits_one(self, runner, monkeypatch, query_fasta):
+        self._patch(monkeypatch, final='FAILED')
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'j4', '--json', '--wait'])
+        assert res.exit_code == 1                # JobFailed
+        line = next(l for l in res.output.splitlines() if l.strip().startswith('{'))
+        assert json.loads(line)['status'] == 'FAILED'
+
+    def test_human_mode_unchanged(self, runner, monkeypatch, query_fasta):
+        self._patch(monkeypatch)
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'j5'])
+        assert res.exit_code == 0
+        assert 'HUMAN confirmation line' in res.output
+        assert '{' not in res.output             # no JSON leaked into human mode

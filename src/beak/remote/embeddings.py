@@ -444,7 +444,8 @@ class ESMEmbeddings(RemoteJobManager):
                repr_layers: List[int] = [-1],
                include_mean: bool = True,
                include_per_tok: bool = False,
-               gpu_id=0) -> str:
+               gpu_id=0,
+               quiet: bool = False) -> str:
         """
         Submit ESM embedding generation job.
 
@@ -571,7 +572,8 @@ class ESMEmbeddings(RemoteJobManager):
             }
 
         model_info = self.AVAILABLE_MODELS[model]
-        print(f"✓ Submitted {job_name} → {model_info['name']} ({job_id})")
+        if not quiet:
+            print(f"✓ Submitted {job_name} → {model_info['name']} ({job_id})")
 
         return job_id
 

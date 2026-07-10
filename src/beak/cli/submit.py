@@ -4,7 +4,45 @@ import click
 from pathlib import Path
 
 from .main import main
-from ._common import get_manager, auto_name_from_pfam
+from ._common import (
+    get_manager, auto_name_from_pfam, json_mode, emit_json, JobFailed,
+)
+
+
+def _machine_options(f):
+    """Attach the shared agent-facing flags (--json / --wait / --interval)."""
+    f = click.option('--json', 'json_local', is_flag=True,
+                     help='Emit the job as JSON on stdout.')(f)
+    f = click.option('--wait', is_flag=True,
+                     help='Block until the job reaches a terminal state.')(f)
+    f = click.option('--interval', default=30, show_default=True,
+                     help='Seconds between status checks when --wait is set.')(f)
+    return f
+
+
+def _finish_submit(ctx, mgr, job_id, job_type, job_name,
+                   json_local=False, wait=False, interval=30):
+    """Shared post-submit flow: optional blocking wait, JSON emission, exit code.
+
+    In human mode the manager already printed its own confirmation and
+    ``wait()`` prints progress, so this only adds machine output. In JSON
+    mode the manager was called with ``quiet=True`` and we emit exactly one
+    JSON object here. A non-COMPLETED terminal state raises ``JobFailed``
+    (exit 1) so an agent never reads a failed/cancelled job as success.
+    """
+    use_json = json_mode(ctx, json_local)
+    status = 'SUBMITTED'
+    if wait:
+        status = mgr.wait(job_id, check_interval=interval, verbose=not use_json)
+    if use_json:
+        emit_json({
+            'job_id': job_id,
+            'job_type': job_type,
+            'name': job_name,
+            'status': status,
+        })
+    if wait and status != 'COMPLETED':
+        raise JobFailed(f"Job {job_id} ended in state {status}")
 
 
 # Known embedding dimensions — used for upfront size estimation.
@@ -120,7 +158,10 @@ _EMBEDDING_SIZE_WARN_BYTES = 5 * 1024 ** 3  # 5 GB
               help='Search preset')
 @click.option('--uniprot', is_flag=True,
               help='Treat QUERY as a UniProt accession ID instead of a file path')
-def search(query, database, job_name, preset, uniprot):
+@_machine_options
+@click.pass_context
+def search(ctx, query, database, job_name, preset, uniprot,
+           json_local, wait, interval):
     """Submit an MMseqs2 search job.
 
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
@@ -142,7 +183,10 @@ def search(query, database, job_name, preset, uniprot):
     kwargs = {}
     if preset:
         kwargs['preset'] = preset
-    mgr.submit(query_file, database=database, job_name=job_name, **kwargs)
+    job_id = mgr.submit(query_file, database=database, job_name=job_name,
+                        quiet=json_mode(ctx, json_local), **kwargs)
+    _finish_submit(ctx, mgr, job_id, 'search', job_name,
+                   json_local=json_local, wait=wait, interval=interval)
 
 
 @main.command()
@@ -152,7 +196,10 @@ def search(query, database, job_name, preset, uniprot):
 @click.option('--no-lineage', is_flag=True, help='Skip lineage parsing')
 @click.option('--uniprot', is_flag=True,
               help='Treat QUERY as a UniProt accession ID instead of a file path')
-def taxonomy(query, database, job_name, no_lineage, uniprot):
+@_machine_options
+@click.pass_context
+def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
+             json_local, wait, interval):
     """Submit an MMseqs2 taxonomy job.
 
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
@@ -171,8 +218,11 @@ def taxonomy(query, database, job_name, no_lineage, uniprot):
         job_name = auto_name_from_pfam(query_file, 'taxonomy')
 
     mgr = get_manager(job_type='taxonomy')
-    mgr.submit(query_file, database=database, job_name=job_name,
-               tax_lineage=not no_lineage)
+    job_id = mgr.submit(query_file, database=database, job_name=job_name,
+                        tax_lineage=not no_lineage,
+                        quiet=json_mode(ctx, json_local))
+    _finish_submit(ctx, mgr, job_id, 'taxonomy', job_name,
+                   json_local=json_local, wait=wait, interval=interval)
 
 
 @main.command()
@@ -183,7 +233,10 @@ def taxonomy(query, database, job_name, no_lineage, uniprot):
               help='Alignment algorithm (default: clustalo)')
 @click.option('--format', 'output_format', default=None,
               help='Output format (default depends on algorithm)')
-def align(input_file, job_name, algorithm, output_format):
+@_machine_options
+@click.pass_context
+def align(ctx, input_file, job_name, algorithm, output_format,
+          json_local, wait, interval):
     """Submit a multiple sequence alignment job"""
     if job_name is None:
         job_name = auto_name_from_pfam(input_file, 'align')
@@ -192,7 +245,10 @@ def align(input_file, job_name, algorithm, output_format):
     kwargs = {'algorithm': algorithm}
     if output_format:
         kwargs['output_format'] = output_format
-    mgr.submit(input_file, job_name=job_name, **kwargs)
+    job_id = mgr.submit(input_file, job_name=job_name,
+                        quiet=json_mode(ctx, json_local), **kwargs)
+    _finish_submit(ctx, mgr, job_id, 'align', job_name,
+                   json_local=json_local, wait=wait, interval=interval)
 
 
 @main.command()
@@ -215,8 +271,11 @@ def align(input_file, job_name, algorithm, output_format):
                    'pick the GPU with the most free memory')
 @click.option('--list-models', is_flag=True,
               help='List available ESM models and exit')
-def embeddings(input_file, source_job_id, model, job_name, repr_layers,
-               include_per_tok, no_mean, gpu_id, list_models):
+@_machine_options
+@click.pass_context
+def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
+               include_per_tok, no_mean, gpu_id, list_models,
+               json_local, wait, interval):
     """Submit an ESM embedding-generation job.
 
     INPUT_FILE is a local FASTA file. Alternatively, use --from-job to
@@ -239,6 +298,8 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
         beak embeddings --list-models
     """
     from ..remote.embeddings import ESMEmbeddings
+
+    use_json = json_mode(ctx, json_local)
 
     if list_models:
         click.echo(ESMEmbeddings.list_models().to_string(index=False))
@@ -282,7 +343,7 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
         remote_input = _resolve_source_job_fasta(source_job_id)
         if job_name is None:
             job_name = f"embeddings_from_{source_job_id}"
-        mgr.submit(
+        job_id = mgr.submit(
             remote_input=remote_input,
             source_job_id=source_job_id,
             model=model,
@@ -291,24 +352,28 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
             include_mean=include_mean,
             include_per_tok=include_per_tok,
             gpu_id=resolved_gpu,
+            quiet=use_json,
         )
+        _finish_submit(ctx, mgr, job_id, 'embeddings', job_name,
+                       json_local=json_local, wait=wait, interval=interval)
         return
 
     # Local-FASTA path: validate structure and show a size estimate so
     # the user doesn't kick off a silent multi-hundred-GB job on --per-tok.
     n_seqs, total_len, max_len, min_len = _fasta_stats(input_file)
     avg_len = total_len // n_seqs
-    click.echo(
-        f"Input: {n_seqs:,} sequences "
-        f"(avg {avg_len} aa, min {min_len}, max {max_len})"
-    )
+    if not use_json:
+        click.echo(
+            f"Input: {n_seqs:,} sequences "
+            f"(avg {avg_len} aa, min {min_len}, max {max_len})"
+        )
 
     # ESM2's context window is 1024 tokens (1022 residues after the
     # CLS/EOS tokens). Sequences longer than that will fail per-seq
     # inside the container — the batch will keep going, but the user
     # should know up front.
     ESM_MAX_AA = 1022
-    if max_len > ESM_MAX_AA:
+    if max_len > ESM_MAX_AA and not use_json:
         n_long = _count_long_sequences(input_file, ESM_MAX_AA)
         click.echo(
             f"  [yellow]⚠  {n_long} sequence(s) exceed ESM's "
@@ -320,13 +385,15 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
     est_bytes = _estimate_embedding_bytes(
         n_seqs, total_len, model, len(layers), include_mean, include_per_tok,
     )
-    if est_bytes is not None:
+    if est_bytes is not None and not use_json:
         tag = ""
         if include_per_tok and include_mean:
             tag = " (mean + per-token)"
         elif include_per_tok:
             tag = " (per-token only)"
         click.echo(f"Estimated output size: ~{_humanize_bytes(est_bytes)}{tag}")
+        # The size confirmation reads from stdin; skip it in machine mode
+        # so an agent never blocks on a prompt it can't answer.
         if est_bytes > _EMBEDDING_SIZE_WARN_BYTES:
             click.confirm(
                 f"  ⚠  Output will exceed {_humanize_bytes(_EMBEDDING_SIZE_WARN_BYTES)}. Continue?",
@@ -336,7 +403,7 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
     if job_name is None:
         job_name = auto_name_from_pfam(input_file, 'embeddings')
 
-    mgr.submit(
+    job_id = mgr.submit(
         input_file=input_file,
         model=model,
         job_name=job_name,
@@ -344,7 +411,10 @@ def embeddings(input_file, source_job_id, model, job_name, repr_layers,
         include_mean=include_mean,
         include_per_tok=include_per_tok,
         gpu_id=gpu_id,
+        quiet=use_json,
     )
+    _finish_submit(ctx, mgr, job_id, 'embeddings', job_name,
+                   json_local=json_local, wait=wait, interval=interval)
 
 
 def _resolve_source_job_fasta(job_id: str) -> str:

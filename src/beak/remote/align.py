@@ -190,6 +190,7 @@ class Align(RemoteJobManager):
                job_name: Optional[str] = None,
                algorithm: str = 'clustalo',
                output_format: Optional[str] = None,
+               quiet: bool = False,
                **align_params) -> str:
         """
         Submit a multiple sequence alignment job.
@@ -304,7 +305,8 @@ fi
                 'parameters': align_params,
             }
 
-        print(f"✓ Submitted {job_name} [{algo_info['name']}] ({job_id})")
+        if not quiet:
+            print(f"✓ Submitted {job_name} [{algo_info['name']}] ({job_id})")
 
         return job_id
 

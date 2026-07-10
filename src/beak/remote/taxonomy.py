@@ -144,6 +144,7 @@ class MMseqsTaxonomy(RemoteJobManager):
            database: str = 'uniprotkb',
            job_name: Optional[str] = None,
            tax_lineage: bool = True,
+           quiet: bool = False,
            **mmseqs_params) -> str:
         """
         Submit a new MMseqs2 taxonomy assignment job
@@ -289,7 +290,8 @@ rm -rf {remote_job_path}/tmp {remote_job_path}/queryDB* {remote_job_path}/taxono
                 'parameters': {**mmseqs_params, 'tax_lineage': tax_lineage},
             }
 
-        print(f"✓ Submitted {job_name} → {database} ({job_id})")
+        if not quiet:
+            print(f"✓ Submitted {job_name} → {database} ({job_id})")
 
         return job_id
 

@@ -4,10 +4,14 @@ import click
 
 
 @click.group()
+@click.option('--json', 'json_mode', is_flag=True,
+              help='Emit machine-readable JSON on stdout instead of Rich output.')
 @click.version_option(package_name='beak')
-def main():
+@click.pass_context
+def main(ctx, json_mode):
     """BEAK - Biophysical and Evolutionary Analysis Kit"""
-    pass
+    ctx.ensure_object(dict)
+    ctx.obj['json'] = json_mode
 
 
 @main.command()
