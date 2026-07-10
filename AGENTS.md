@@ -218,6 +218,11 @@ sees the failure. Commands that already emitted a result object (`status
 Every agent-relevant command now takes `--json`: `doctor` (preflight), the four
 submit commands (with `--wait` / `--dry-run` / `--reuse`), `status`, `jobs`,
 `log`, `results`, and `project init/list/status`. Errors surface as
-`{"error", "exit_code"}` on stdout in `--json` mode. What's intentionally *not*
-built (and why) lives in the project TODO: hard concurrency enforcement,
-an MCP server, and typed Python-API return values — none are CLI-JSON gaps.
+`{"error", "exit_code"}` on stdout in `--json` mode.
+
+Two things are intentionally *not* built (neither is a CLI-JSON gap): an MCP
+server, and typed Python-API return values. Client-side concurrency enforcement
+was considered and rejected — the per-job thread cap, `--wait`, `--reuse`, and
+the `doctor` load signal already cover cooperative agents, and real multi-tenant
+limits belong at the server/scheduler layer (SLURM, cgroups), not a bypassable
+CLI flag.
