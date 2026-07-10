@@ -77,7 +77,11 @@ def annotate_temperature(
             f"({list(df.columns)})"
         )
 
-    out = df.copy()
+    # Drop any pre-existing growth_temp / temp_source so re-annotating an
+    # already-annotated frame (e.g. the project's stored taxonomy table)
+    # doesn't collide with the merge below and produce "_x"/"_y" suffixes.
+    # Makes the function idempotent; callers no longer need to pre-strip.
+    out = df.drop(columns=['growth_temp', 'temp_source'], errors='ignore').copy()
     if method == 'exact':
         # Build normalized join keys: genus_species and genus alone.
         # We do this on a copy so the original DataFrame isn't mutated.

@@ -29,6 +29,7 @@ dependencies = [
     "biopython",
     "gemmi",
     "pandas",
+    "pyarrow",
     "fabric>=3.0",
     "paramiko>=3.0",
     "holoviews",
