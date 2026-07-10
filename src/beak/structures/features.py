@@ -180,17 +180,28 @@ def _dssp_available():
 def _assign_secondary_structure(cif_path, chain_id):
     """Assign secondary structure: H (helix), E (strand), C (coil).
 
-    Uses DSSP if mkdssp is available, otherwise falls back to parsing
-    _struct_conf and _struct_sheet_range records from the mmCIF.
+    Uses DSSP if mkdssp is available and runs cleanly, otherwise falls
+    back to parsing _struct_conf and _struct_sheet_range records from
+    the mmCIF. A present-but-incompatible mkdssp (e.g. a version whose
+    output BioPython can't parse, which surfaces as a "bad lexical cast"
+    error) degrades to the mmCIF parse rather than propagating.
 
     Returns dict of {residue_number: 'H'|'E'|'C'}.
     """
-    if _dssp_available():
-        return _compute_dssp(cif_path, chain_id)
-    else:
+    if not _dssp_available():
         warnings.warn(
             "mkdssp not found; using mmCIF secondary structure annotations. "
             "Install mkdssp for DSSP-based assignment.",
+            stacklevel=2,
+        )
+        return _parse_ss_from_mmcif(cif_path, chain_id)
+
+    try:
+        return _compute_dssp(cif_path, chain_id)
+    except Exception as exc:  # noqa: BLE001 — any DSSP failure is non-fatal
+        warnings.warn(
+            f"mkdssp failed ({exc}); falling back to mmCIF secondary "
+            "structure annotations.",
             stacklevel=2,
         )
         return _parse_ss_from_mmcif(cif_path, chain_id)
