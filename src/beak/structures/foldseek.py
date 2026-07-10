@@ -10,19 +10,6 @@ from typing import List, Optional, Sequence
 import pandas as pd
 
 
-# Prebuilt databases foldseek can download via `foldseek databases`. Used to
-# populate `beak setup foldseek` help and validate the requested database.
-KNOWN_DATABASES = (
-    "PDB",
-    "Alphafold/UniProt",
-    "Alphafold/UniProt50",
-    "Alphafold/Proteome",
-    "Alphafold/Swiss-Prot",
-    "ESMAtlas30",
-    "CATH50",
-    "BFVD",
-)
-
 # Columns always requested from `foldseek easy-search --format-output`. Beyond
 # the default m8 set we add alntmscore (global structural similarity, 0-1),
 # lddt (local accuracy, 0-1), and query/target coverage — the fields worth
