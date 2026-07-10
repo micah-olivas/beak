@@ -21,12 +21,14 @@ def project():
               type=click.Path(exists=True, dir_okay=False),
               help='Local FASTA file with the target sequence.')
 @click.option('--description', default="", help='One-line project description.')
-def project_init(name, uniprot_id, sequence_file, description):
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the created project as a JSON object on stdout.')
+@click.pass_context
+def project_init(ctx, name, uniprot_id, sequence_file, description, json_local):
     """Create a new project with a target sequence."""
     from ..project import BeakProject, BeakProjectError
     from .theme import get_console
-
-    console = get_console()
+    from ._common import json_mode, emit_json
 
     try:
         proj = BeakProject.init(
@@ -39,6 +41,17 @@ def project_init(name, uniprot_id, sequence_file, description):
         raise click.ClickException(str(e))
 
     target = proj.manifest().get('target', {})
+
+    if json_mode(ctx, json_local):
+        emit_json({
+            'name': proj.name,
+            'path': str(proj.path),
+            'target': {k: target.get(k) for k in
+                       ('uniprot_id', 'gene_name', 'organism', 'length')},
+        })
+        return
+
+    console = get_console()
     console.print(f"\n[brand]Created project '{proj.name}'[/brand]")
     console.print(f"[dim]{proj.path}[/dim]\n")
     for label, key in (('Target', 'uniprot_id'), ('Gene', 'gene_name'),
@@ -49,14 +62,23 @@ def project_init(name, uniprot_id, sequence_file, description):
 
 
 @project.command('list')
-def project_list():
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the project list as a JSON array on stdout.')
+@click.pass_context
+def project_list(ctx, json_local):
     """List all known projects."""
     from rich.table import Table
     from ..project import BeakProject, PROJECTS_DIR
     from .theme import get_console, BEAK_BLUE
+    from ._common import json_mode, emit_json
+
+    projects = BeakProject.list_projects()
+
+    if json_mode(ctx, json_local):
+        emit_json([_project_summary(p) for p in projects])
+        return
 
     console = get_console()
-    projects = BeakProject.list_projects()
 
     if not projects:
         console.print(f"\n[dim]No projects yet under {PROJECTS_DIR}.[/dim]")
@@ -97,13 +119,16 @@ def project_list():
 
 @project.command('status')
 @click.argument('name')
-def project_status(name):
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the project status as a JSON object on stdout.')
+@click.pass_context
+def project_status(ctx, name, json_local):
     """Show layer state and disk usage for a project."""
     from rich.table import Table
     from ..project import BeakProject, BeakProjectError
     from .theme import get_console, BEAK_BLUE, STAGE_ICONS
+    from ._common import json_mode, emit_json
 
-    console = get_console()
     try:
         proj = BeakProject.load(name)
     except BeakProjectError as e:
@@ -113,6 +138,27 @@ def project_status(name):
     target = m.get('target', {})
     proj_meta = m.get('project', {})
 
+    _LAYERS = ('target', 'homologs', 'domains', 'structures', 'experiments')
+
+    if json_mode(ctx, json_local):
+        sizes = proj.disk_usage_by_layer()
+        emit_json({
+            'name': proj.name,
+            'path': str(proj.path),
+            'description': proj_meta.get('description') or None,
+            'target': {k: target.get(k) for k in
+                       ('uniprot_id', 'gene_name', 'organism', 'length')},
+            'layers': {
+                layer: {'present': bool(m.get(layer)),
+                        'size_bytes': sizes.get(layer, 0)}
+                for layer in _LAYERS
+            },
+            'status': proj.status_summary(),
+            'total_size_bytes': proj.disk_usage(),
+        })
+        return
+
+    console = get_console()
     console.print(f"\n[brand]Project: {proj.name}[/brand]")
     console.print(f"[dim]{proj.path}[/dim]")
     if proj_meta.get('description'):
@@ -134,7 +180,7 @@ def project_status(name):
     layers_table.add_column("Status")
     layers_table.add_column("Size", justify="right")
 
-    for layer in ('target', 'homologs', 'domains', 'structures', 'experiments'):
+    for layer in _LAYERS:
         present = bool(m.get(layer))
         icon = STAGE_ICONS['done'] if present else STAGE_ICONS['pending']
         size = sizes.get(layer, 0)
@@ -143,6 +189,27 @@ def project_status(name):
 
     console.print(layers_table)
     console.print(f"\n[dim]Total on disk: {_human_size(proj.disk_usage())}[/dim]\n")
+
+
+def _project_summary(proj) -> dict:
+    """One project's JSON summary for `project list --json`."""
+    m = proj.manifest()
+    target = m.get('target', {})
+    proj_meta = m.get('project', {})
+    created = proj_meta.get('created_at')
+    if isinstance(created, datetime):
+        created = created.isoformat()
+    return {
+        'name': proj.name,
+        'path': str(proj.path),
+        'target': target.get('uniprot_id') or target.get('uniprot_name'),
+        'gene_name': target.get('gene_name'),
+        'organism': target.get('organism'),
+        'length': target.get('length'),
+        'size_bytes': proj.cached_size(),
+        'status': proj.status_summary(),
+        'created_at': created,
+    }
 
 
 def _human_size(n: float) -> str:

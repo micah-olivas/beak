@@ -178,13 +178,13 @@ Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|bro
 
 Monitor     beak jobs --json           # JSON array of all jobs
             beak status <id> --json    # JSON status of one job
-            beak log <id>              # remote log (human text; FAILED diagnosis)
+            beak log <id> --json       # {job_id, lines, log} envelope (text stays text)
 
 Fetch       beak results <id> --json   # JSON of downloaded result paths
 
-Projects    beak project init <name> --uniprot <id> | --sequence <fa>
-            beak project list
-            beak project status <name>
+Projects    beak project init <name> (--uniprot <id> | --sequence <fa>) --json
+            beak project list --json   # array of project summaries
+            beak project status <name> --json   # target + per-layer state + sizes
 
 Avoid       beak ui, --watch, --follow, beak config init   # interactive / never-return
 ```
@@ -213,9 +213,11 @@ stdout (in addition to setting the exit code), so a stdout-only consumer still
 sees the failure. Commands that already emitted a result object (`status
 --json`, a failed `--wait`) just set the exit code and print nothing further.
 
-## Known rough edges
+## Machine-output coverage
 
-Machine output (`--json`) covers the full job loop — submit, `status`, `jobs`,
-`results` — plus `doctor` for preflight. Still human-only, by design (no agent
-contract needed): `beak log` (free-form remote text) and the `beak project`
-commands. Add `--json` there if an agent workflow comes to need it.
+Every agent-relevant command now takes `--json`: `doctor` (preflight), the four
+submit commands (with `--wait` / `--dry-run` / `--reuse`), `status`, `jobs`,
+`log`, `results`, and `project init/list/status`. Errors surface as
+`{"error", "exit_code"}` on stdout in `--json` mode. What's intentionally *not*
+built (and why) lives in the project TODO: hard concurrency enforcement,
+an MCP server, and typed Python-API return values — none are CLI-JSON gaps.

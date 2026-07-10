@@ -468,3 +468,54 @@ class TestReuse:
         res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
                                    '--name', 'x', '--json'])
         assert res.exit_code != 0            # tried to submit, no reuse
+
+
+class TestProjectJson:
+    """--json for the project management commands."""
+
+    def _projects_dir(self, tmp_path, monkeypatch):
+        d = tmp_path / 'projects'
+        d.mkdir()
+        monkeypatch.setattr('beak.project.project.PROJECTS_DIR', d)
+        return d
+
+    def test_list_empty_is_json_array(self, tmp_path, monkeypatch):
+        self._projects_dir(tmp_path, monkeypatch)
+        res = _split_runner().invoke(main, ['project', 'list', '--json'])
+        assert res.exit_code == 0
+        assert json.loads(res.stdout.strip()) == []
+
+    def test_init_list_status_roundtrip(self, tmp_path, monkeypatch):
+        self._projects_dir(tmp_path, monkeypatch)
+        fa = tmp_path / 't.fasta'
+        fa.write_text('>t\nMKTAYIAKQRQISFVK\n')
+
+        res = _split_runner().invoke(
+            main, ['project', 'init', 'myproj', '--sequence', str(fa), '--json'])
+        assert res.exit_code == 0, res.output
+        assert json.loads(res.stdout.strip())['name'] == 'myproj'
+
+        res = _split_runner().invoke(main, ['project', 'list', '--json'])
+        names = [p['name'] for p in json.loads(res.stdout.strip())]
+        assert 'myproj' in names
+
+        res = _split_runner().invoke(main, ['project', 'status', 'myproj', '--json'])
+        st = json.loads(res.stdout.strip())
+        assert st['name'] == 'myproj'
+        assert st['layers']['target']['present'] is True
+        assert st['layers']['homologs']['present'] is False
+
+
+class TestLogJson:
+    def test_log_json_envelope(self, monkeypatch):
+        class _LogMgr:
+            def get_log(self, job_id, lines=50):
+                print("Files in job directory:")
+                print("mmseqs.log (last 50 lines):\nstarted\nCOMPLETED")
+
+        monkeypatch.setattr('beak.cli.jobs.get_manager', lambda **k: _LogMgr())
+        res = _split_runner().invoke(main, ['log', 'abc12345', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.stdout.strip())
+        assert obj['job_id'] == 'abc12345' and obj['lines'] == 50
+        assert 'COMPLETED' in obj['log']

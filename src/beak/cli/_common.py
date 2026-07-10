@@ -26,8 +26,12 @@ def json_mode(ctx, local=False):
 
 
 def emit_json(payload):
-    """Write one JSON object to stdout (the machine-output channel)."""
-    click.echo(json.dumps(payload))
+    """Write one JSON object to stdout (the machine-output channel).
+
+    ``default=str`` is a safety net for stray non-JSON types (e.g. a
+    ``datetime`` from a manifest) so a payload never crashes mid-emit.
+    """
+    click.echo(json.dumps(payload, default=str))
 
 
 # Statuses worth reusing: a matching job that is pending, running, or already

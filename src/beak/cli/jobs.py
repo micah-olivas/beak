@@ -167,7 +167,10 @@ def status(ctx, job_id, verbose, watch, interval, json_local):
               help='Stream new log lines live until the job finishes (Ctrl-C to stop)')
 @click.option('--interval', default=2.0,
               help='Poll interval in seconds (with --follow)')
-def log(job_id, lines, follow, interval):
+@click.option('--json', 'json_local', is_flag=True,
+              help='Emit the log as a JSON envelope {job_id, lines, log} on stdout.')
+@click.pass_context
+def log(ctx, job_id, lines, follow, interval, json_local):
     """View job log.
 
     Without --follow, prints the last N lines and a directory listing.
@@ -176,6 +179,18 @@ def log(job_id, lines, follow, interval):
     the job reaches a terminal state.
     """
     mgr = get_manager(job_id=job_id)
+
+    if json_mode(ctx, json_local):
+        # The log is free-form remote text; wrap it in a structured envelope
+        # (with the job_id) so a stdout-parsing agent gets one JSON object.
+        # --follow is a live human stream and is ignored in machine mode.
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mgr.get_log(job_id, lines=lines)
+        emit_json({'job_id': job_id, 'lines': lines, 'log': buf.getvalue()})
+        return
+
     if follow:
         mgr.follow_log(job_id, interval=interval)
     else:
