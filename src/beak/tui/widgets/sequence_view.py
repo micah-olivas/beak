@@ -85,6 +85,7 @@ class SequenceView(Vertical):
         self._conservation: Optional[np.ndarray] = None
         self._sasa: Optional[np.ndarray] = None
         self._differential: Optional[np.ndarray] = None
+        self._taxonomic: Optional[np.ndarray] = None
         # Per-residue Pfam domain index (`-1` for unannotated positions).
         # Recomputed when domains are loaded; consumed by the "pfam"
         # color mode shared with the structure view.
@@ -200,6 +201,10 @@ class SequenceView(Vertical):
                 self._differential = None
             if self._differential is None:
                 return False
+        if mode == "taxonomic":
+            self._taxonomic = self._load_taxonomic_display()
+            if self._taxonomic is None:
+                return False
         if mode == "pfam" and (self._pfam_idx is None or not self._domains):
             return False
         self._color_mode = mode
@@ -219,9 +224,36 @@ class SequenceView(Vertical):
             return self._sasa
         if self._color_mode == "differential" and self._differential is not None:
             return self._differential
+        if self._color_mode == "taxonomic" and self._taxonomic is not None:
+            return self._taxonomic
         if self._color_mode == "pfam" and self._pfam_idx is not None:
             return self._pfam_idx
         return self._plddt
+
+    def _load_taxonomic_display(self) -> Optional[np.ndarray]:
+        """Load active taxonomic scores, normalised to [0, 1] for the palette.
+
+        Same normalisation as `StructureView._reload_taxonomic` so the
+        sequence strip and the ribbon agree: uncertainty coefficients pass
+        through clipped; z-scores are clamped to positive and scaled to
+        their own max.
+        """
+        try:
+            from ..comparative import load_active_taxonomic_scores
+            raw = load_active_taxonomic_scores(self._project)
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        kind = (self._project.manifest().get("taxonomic") or {}).get(
+            "active_score_kind"
+        )
+        disp = np.asarray(raw, dtype=float)
+        if kind == "permutation_zscore":
+            pos = np.clip(disp, 0.0, None)
+            m = float(pos.max()) if pos.size else 0.0
+            return pos / m if m > 0 else pos
+        return np.clip(disp, 0.0, 1.0)
 
     def _effective_mode(self) -> str:
         """Resolve the user-facing mode to the physical quantity rendered.
@@ -622,6 +654,8 @@ class SequenceView(Vertical):
         bar_cells = 10
         if eff_mode == "bfactor":
             bar_lo, bar_hi, hi_label = 0.0, 50.0, "50 Å²"
+        elif eff_mode == "taxonomic":
+            bar_lo, bar_hi, hi_label = 0.0, 1.0, "max"
         else:
             bar_lo, bar_hi, hi_label = 0.0, 100.0, "100"
         cells = []
@@ -637,6 +671,7 @@ class SequenceView(Vertical):
             "conservation": "cons",
             "sasa": "SASA",
             "differential": "diff",
+            "taxonomic": "tax",
         }.get(eff_mode, eff_mode)
 
         if eff_mode == "conservation":
