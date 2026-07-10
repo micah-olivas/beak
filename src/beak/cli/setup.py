@@ -144,10 +144,109 @@ def setup_pfam(system, custom_path, show_status, update):
     console.print(f"Path saved to config ([cyan]databases.pfam_path[/cyan])")
 
 
+@setup.command('foldseek')
+@click.option('--db', 'db_alias', default=None,
+              help='Database to download (e.g. pdb, afdb_swissprot, afdb50).')
+@click.option('--system', is_flag=True,
+              help='Install under the shared DB dir (/srv/...) so all users '
+                   'share it; may need write permission.')
+@click.option('--path', 'custom_path', default=None,
+              help='Custom remote install directory.')
+@click.option('--status', 'show_status', is_flag=True,
+              help='Show foldseek database status and exit.')
+@click.option('--update', is_flag=True,
+              help='Re-download even if the database already exists.')
+def setup_foldseek(db_alias, system, custom_path, show_status, update):
+    """Download a foldseek structure database on the remote server.
+
+    Default: installs to ~/beak_databases/foldseek/<db>/ on the remote.
+    With --system: installs under the shared /srv/... database directory.
+    The resolved prefix is saved to config as foldseek.db_path so
+    `beak foldseek` uses it by default.
+    """
+    from .theme import get_console
+    from ._common import get_manager
+    from ..config import set_config_value, get_foldseek_config
+    from ..remote.foldseek import FOLDSEEK_DATABASES
+
+    console = get_console()
+    mgr = get_manager(job_type='foldseek')
+    conn = mgr.conn
+
+    if show_status or not db_alias:
+        cfg = get_foldseek_config()
+        console.print("\n[brand]Foldseek Database Status[/brand]")
+        console.print(f"  Configured db: {cfg.get('db_path') or '[dim]not set[/dim]'}")
+        if cfg.get('db_name'):
+            console.print(f"  Name:          {cfg['db_name']}")
+        fs = conn.run('command -v foldseek', hide=True, warn=True)
+        console.print(f"  Remote binary: {'[green]found[/green]' if fs.ok else '[red]missing[/red]'}")
+        console.print()
+        console.print(mgr.list_databases().to_string(index=False))
+        console.print(
+            f"\n[dim]Downloadable: {', '.join(FOLDSEEK_DATABASES)}[/dim]\n"
+        )
+        return
+
+    if db_alias not in FOLDSEEK_DATABASES:
+        raise click.BadParameter(
+            f"Unknown database '{db_alias}'. Choices: "
+            f"{', '.join(FOLDSEEK_DATABASES)}",
+            param_hint="'--db'",
+        )
+
+    if not conn.run('command -v foldseek', hide=True, warn=True).ok:
+        raise click.ClickException(
+            "foldseek not found on the remote server. Install it with: "
+            "conda install -c conda-forge -c bioconda foldseek"
+        )
+
+    download_name, subdir = FOLDSEEK_DATABASES[db_alias]
+    if custom_path:
+        target_dir = custom_path
+    elif system:
+        target_dir = f"{mgr.DB_BASE_PATH}/{subdir}"
+    else:
+        target_dir = f"~/beak_databases/{subdir}"
+
+    if target_dir.startswith('~'):
+        home = conn.run('echo $HOME', hide=True).stdout.strip()
+        target_dir = home + target_dir[1:]
+    prefix = f"{target_dir}/db"
+
+    existing = conn.run(
+        f'[ -e {prefix}.dbtype ] && echo EXISTS || echo MISSING',
+        hide=True, warn=True,
+    )
+    if existing.stdout.strip() == 'EXISTS' and not update:
+        console.print(f"[green]Foldseek database already installed at {prefix}[/green]")
+        set_config_value('foldseek.db_path', prefix)
+        set_config_value('foldseek.db_name', db_alias)
+        console.print("Use [cyan]--update[/cyan] to re-download.")
+        return
+
+    console.print(f"[brand]Downloading {download_name} to {target_dir} on the remote[/brand]")
+    console.print("[dim]This can be large and slow; the call blocks until it finishes.[/dim]\n")
+    conn.run(f'mkdir -p {target_dir}', hide=True, warn=True)
+    result = conn.run(
+        f'cd {target_dir} && foldseek databases {download_name} {prefix} tmp',
+        hide=True, warn=True,
+    )
+    if not result.ok:
+        raise click.ClickException(
+            f"foldseek databases failed:\n{(result.stderr or '').strip()}"
+        )
+
+    set_config_value('foldseek.db_path', prefix)
+    set_config_value('foldseek.db_name', db_alias)
+    console.print(f"\n[green]Foldseek database ready at {prefix}[/green]")
+    console.print("Path saved to config ([cyan]foldseek.db_path[/cyan])")
+
+
 @main.command()
 @click.option('--type', 'db_type', default=None,
-              type=click.Choice(['search', 'taxonomy']),
-              help='Show databases for search or taxonomy')
+              type=click.Choice(['search', 'taxonomy', 'foldseek']),
+              help='Show databases for search, taxonomy, or foldseek')
 def databases(db_type):
     """List available remote databases"""
     if db_type == 'taxonomy' or db_type is None:
@@ -161,5 +260,13 @@ def databases(db_type):
             click.echo()
         mgr = get_manager(job_type='search')
         click.echo("Search databases:")
+        df = mgr.list_databases()
+        click.echo(df.to_string(index=False))
+
+    if db_type == 'foldseek' or db_type is None:
+        if db_type is None:
+            click.echo()
+        mgr = get_manager(job_type='foldseek')
+        click.echo("Foldseek databases:")
         df = mgr.list_databases()
         click.echo(df.to_string(index=False))

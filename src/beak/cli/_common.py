@@ -124,6 +124,7 @@ def get_manager(job_id=None, job_type=None):
         'taxonomy': 'beak.remote.taxonomy:MMseqsTaxonomy',
         'align': 'beak.remote.align:ClustalAlign',
         'embeddings': 'beak.remote.embeddings:ESMEmbeddings',
+        'foldseek': 'beak.remote.foldseek:RemoteFoldseek',
         'pipeline': 'beak.remote.pipeline:Pipeline',
     }
 

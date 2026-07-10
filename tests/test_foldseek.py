@@ -1,20 +1,17 @@
-"""Tests for local foldseek support.
+"""Tests for remote foldseek structural search.
 
-Pure unit tests: no foldseek binary, no subprocess, no network. Cover the
-m8 parser (the format contract with foldseek), the config getter, and
-binary resolution's fallback chain (monkeypatched ``shutil.which``).
+Pure unit tests: no SSH, no foldseek binary, no network. Cover the m8
+parser (the format contract), the config getter, and the RemoteFoldseek
+pure helpers — param formatting, remote-script building, and database
+alias resolution (via a bare instance so no connection is opened).
 """
 
 import pandas as pd
 import pytest
 
 from beak.config import get_foldseek_config, save_config
-from beak.structures.foldseek import (
-    DEFAULT_OUTPUT_COLUMNS,
-    FoldseekError,
-    parse_foldseek_m8,
-    resolve_foldseek_binary,
-)
+from beak.structures.foldseek import DEFAULT_OUTPUT_COLUMNS, parse_foldseek_m8
+from beak.remote.foldseek import FOLDSEEK_DATABASES, RemoteFoldseek
 
 
 @pytest.fixture
@@ -26,7 +23,6 @@ def tmp_config(tmp_path, monkeypatch):
     return config_file
 
 
-# A couple of realistic foldseek easy-search rows in the default column order.
 _SAMPLE_M8 = (
     "query\t1abc_A\t0.812\t210\t30\t2\t1\t210\t5\t214\t"
     "1.2e-40\t512\t0.94\t0.88\t0.98\t0.95\n"
@@ -48,7 +44,6 @@ class TestParseM8:
         assert df.loc[0, "alntmscore"] == pytest.approx(0.94)
         assert df.loc[0, "evalue"] == pytest.approx(1.2e-40)
         assert df.loc[0, "lddt"] == pytest.approx(0.88)
-        # Integer columns land as nullable Int64.
         assert df["alnlen"].dtype == "Int64"
         assert int(df.loc[0, "alnlen"]) == 210
 
@@ -62,13 +57,12 @@ class TestParseM8:
         assert len(df) == 2
 
     def test_custom_columns(self):
-        text = "query\t1abc_A\t0.9\n"
-        df = parse_foldseek_m8(text, columns=["query", "target", "alntmscore"])
+        df = parse_foldseek_m8("query\t1abc_A\t0.9\n",
+                               columns=["query", "target", "alntmscore"])
         assert list(df.columns) == ["query", "target", "alntmscore"]
         assert df.loc[0, "alntmscore"] == pytest.approx(0.9)
 
     def test_short_row_is_padded(self):
-        # Fewer fields than columns -> padded with NA, not dropped.
         df = parse_foldseek_m8("query\t1abc_A\n")
         assert len(df) == 1
         assert df.loc[0, "target"] == "1abc_A"
@@ -82,64 +76,74 @@ class TestParseM8:
 
 
 class TestGetFoldseekConfig:
-    def test_reads_all_keys(self, tmp_config):
-        save_config({'foldseek': {
-            'binary': '/opt/foldseek',
-            'db_path': '/data/fs/db',
-            'db_name': 'PDB',
-        }})
-        cfg = get_foldseek_config()
-        assert cfg == {
-            'binary': '/opt/foldseek',
-            'db_path': '/data/fs/db',
-            'db_name': 'PDB',
+    def test_reads_keys(self, tmp_config):
+        save_config({'foldseek': {'db_path': '/srv/fs/pdb/db', 'db_name': 'pdb'}})
+        assert get_foldseek_config() == {
+            'db_path': '/srv/fs/pdb/db', 'db_name': 'pdb',
         }
 
     def test_empty_when_unset(self, tmp_config):
         save_config({'connection': {'host': 'example.com'}})
-        assert get_foldseek_config() == {
-            'binary': None, 'db_path': None, 'db_name': None,
-        }
+        assert get_foldseek_config() == {'db_path': None, 'db_name': None}
 
     def test_no_file(self, tmp_config):
-        assert get_foldseek_config() == {
-            'binary': None, 'db_path': None, 'db_name': None,
-        }
+        assert get_foldseek_config() == {'db_path': None, 'db_name': None}
 
 
-class TestResolveBinary:
-    def test_explicit_on_path(self, monkeypatch):
-        monkeypatch.setattr(
-            'shutil.which',
-            lambda name: '/usr/bin/foldseek' if name == 'myfs' else None,
+class TestFormatParams:
+    def test_single_and_multi_char_flags(self):
+        s = RemoteFoldseek._format_params({'s': 9.5, 'e': 0.001, 'max_seqs': 1000})
+        assert '-s 9.5' in s
+        assert '-e 0.001' in s
+        assert '--max-seqs 1000' in s
+
+    def test_empty(self):
+        assert RemoteFoldseek._format_params({}) == ''
+
+
+class TestBuildJobScript:
+    def test_contains_easy_search_and_status_markers(self):
+        script = RemoteFoldseek._build_job_script(
+            '/home/u/beak_jobs/abc123',
+            '/home/u/beak_jobs/abc123/query.cif',
+            '/srv/fs/pdb/db',
+            '-s 9.5 --threads 8',
         )
-        assert resolve_foldseek_binary('myfs') == '/usr/bin/foldseek'
+        assert 'foldseek easy-search' in script
+        assert '/home/u/beak_jobs/abc123/query.cif' in script
+        assert '/srv/fs/pdb/db' in script
+        assert '/home/u/beak_jobs/abc123/results.m8' in script
+        assert "echo 'RUNNING'" in script
+        assert 'COMPLETED' in script and 'FAILED' in script
+        assert '--format-output' in script
+        # pipefail ensures foldseek's exit (not tee's) drives the marker.
+        assert 'set -o pipefail' in script
+        assert '-s 9.5 --threads 8' in script
 
-    def test_explicit_missing_raises(self, monkeypatch):
-        monkeypatch.setattr('shutil.which', lambda name: None)
-        with pytest.raises(FoldseekError):
-            resolve_foldseek_binary('/nope/foldseek')
+    def test_format_output_columns_match_parser(self):
+        script = RemoteFoldseek._build_job_script('p', 'q.cif', 'db', '')
+        assert ",".join(DEFAULT_OUTPUT_COLUMNS) in script
 
-    def test_config_binary_used(self, tmp_config, monkeypatch):
-        save_config({'foldseek': {'binary': '/opt/fs/foldseek'}})
-        monkeypatch.setattr(
-            'shutil.which',
-            lambda name: '/opt/fs/foldseek' if name == '/opt/fs/foldseek'
-            else None,
-        )
-        assert resolve_foldseek_binary() == '/opt/fs/foldseek'
 
-    def test_path_fallback(self, tmp_config, monkeypatch):
-        save_config({})
-        monkeypatch.setattr(
-            'shutil.which',
-            lambda name: '/usr/local/bin/foldseek' if name == 'foldseek'
-            else None,
-        )
-        assert resolve_foldseek_binary() == '/usr/local/bin/foldseek'
+class TestDatabaseResolution:
+    def _bare(self):
+        # Construct without __init__ so no SSH connection is opened; the
+        # methods under test only touch class attributes.
+        return RemoteFoldseek.__new__(RemoteFoldseek)
 
-    def test_not_found_raises(self, tmp_config, monkeypatch):
-        save_config({})
-        monkeypatch.setattr('shutil.which', lambda name: None)
-        with pytest.raises(FoldseekError):
-            resolve_foldseek_binary()
+    def test_available_dbs_derived_from_registry(self):
+        assert set(RemoteFoldseek.AVAILABLE_DBS) == set(FOLDSEEK_DATABASES)
+        for alias, (_, subdir) in FOLDSEEK_DATABASES.items():
+            assert RemoteFoldseek.AVAILABLE_DBS[alias] == f"{subdir}/db"
+
+    def test_alias_resolves_under_db_base(self):
+        mgr = self._bare()
+        resolved = mgr._resolve_database('pdb')
+        assert resolved == f"{RemoteFoldseek.DB_BASE_PATH}/foldseek/pdb/db"
+
+    def test_absolute_path_passthrough(self):
+        mgr = self._bare()
+        assert mgr._resolve_database('/data/custom/db') == '/data/custom/db'
+
+    def test_job_type(self):
+        assert RemoteFoldseek.JOB_TYPE == 'foldseek'

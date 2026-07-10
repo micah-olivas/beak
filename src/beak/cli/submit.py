@@ -258,6 +258,94 @@ def search(ctx, query, database, job_name, preset, uniprot,
 
 @main.command()
 @click.argument('query', required=True)
+@click.option('--db', 'database', default=None,
+              help='Foldseek DB alias (e.g. pdb, afdb_swissprot) or remote '
+                   'prefix. Defaults to the configured foldseek.db_path.')
+@click.option('--name', 'job_name', default=None, help='Job name')
+@click.option('--sensitivity', '-s', type=float, default=None,
+              help='Foldseek sensitivity (default: foldseek default, 9.5).')
+@click.option('--evalue', '-e', type=float, default=None,
+              help='E-value threshold (default: foldseek default, 0.001).')
+@click.option('--max-seqs', type=int, default=None,
+              help='Max target hits to report (foldseek --max-seqs).')
+@click.option('--uniprot', is_flag=True,
+              help='Treat QUERY as a UniProt accession and fetch its '
+                   'AlphaFold structure instead of reading a file.')
+@_machine_options
+@click.pass_context
+def foldseek(ctx, query, database, job_name, sensitivity, evalue, max_seqs,
+             uniprot, json_local, wait, interval, dry_run, reuse):
+    """Submit a foldseek structural-search job (remote).
+
+    QUERY is a path to a structure file (mmCIF/PDB), or a UniProt accession
+    if --uniprot is set. Foldseek runs on the remote against a database on
+    the remote; pull hits with `beak results <id>`.
+    """
+    from ..config import get_foldseek_config
+
+    database = database or get_foldseek_config().get('db_path')
+    if not database:
+        raise click.UsageError(
+            "No foldseek database. Pass --db <alias|prefix> or run "
+            "`beak setup foldseek --db pdb` to download one."
+        )
+
+    if uniprot:
+        from ..tui.structure import fetch_alphafold
+        import tempfile
+        try:
+            query_file = str(fetch_alphafold(query, Path(tempfile.mkdtemp())))
+        except Exception as e:  # noqa: BLE001 — surface fetch failure cleanly
+            raise click.BadParameter(
+                f"Could not fetch AlphaFold structure for '{query}': {e}",
+                param_hint="'QUERY'",
+            )
+        if job_name is None:
+            job_name = f"{query}_foldseek"
+    else:
+        query_file = query
+        if not Path(query_file).exists():
+            raise click.BadParameter(f"File not found: {query_file}", param_hint="'QUERY'")
+
+    if dry_run:
+        _emit_plan(ctx, {
+            'job_type': 'foldseek', 'query': query_file, 'database': database,
+            'name': job_name or '(auto)',
+        }, json_local)
+        return
+
+    fp = job_fingerprint('foldseek', query_file, {
+        'database': database, 'sensitivity': sensitivity,
+        'evalue': evalue, 'max_seqs': max_seqs,
+    })
+    if reuse:
+        existing = find_reusable_job(fp)
+        if existing:
+            _emit_reuse(ctx, existing, json_local)
+            return
+
+    if job_name is None:
+        from ..remote.naming import generate_readable_name
+        job_name = f"foldseek_{generate_readable_name()}"
+
+    params = {}
+    if sensitivity is not None:
+        params['s'] = sensitivity
+    if evalue is not None:
+        params['e'] = evalue
+    if max_seqs is not None:
+        params['max_seqs'] = max_seqs
+
+    mgr = get_manager(job_type='foldseek')
+    job_id = mgr.submit(query_file, database=database, job_name=job_name,
+                        quiet=json_mode(ctx, json_local), **params)
+    _finish_submit(ctx, mgr, job_id, 'foldseek', job_name,
+                   json_local=json_local, wait=wait, interval=interval,
+                   fingerprint=fp)
+
+
+@main.command()
+@click.argument('query', required=True)
 @click.option('--db', 'database', default='uniprotkb', help='Database alias')
 @click.option('--name', 'job_name', default=None, help='Job name')
 @click.option('--no-lineage', is_flag=True, help='Skip lineage parsing')

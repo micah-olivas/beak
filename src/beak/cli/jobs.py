@@ -25,7 +25,8 @@ def _stdout_to_stderr():
 
 @main.command()
 @click.option('--type', 'job_type', default=None,
-              type=click.Choice(['search', 'taxonomy', 'align', 'embeddings', 'pipeline']),
+              type=click.Choice(['search', 'taxonomy', 'align', 'embeddings',
+                                 'foldseek', 'pipeline']),
               help='Filter by job type')
 @click.option('--status', 'status_filter', default=None,
               help='Filter by status (RUNNING, COMPLETED, FAILED, etc.)')

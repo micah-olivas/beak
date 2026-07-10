@@ -100,21 +100,20 @@ def get_database_config() -> Dict:
 
 
 def get_foldseek_config() -> Dict:
-    """Get local foldseek configuration from config.
+    """Get foldseek database configuration from config.
 
-    Foldseek runs locally (not on the remote), so unlike ``pfam_path``
-    these point at the *local* filesystem.
+    Foldseek runs on the remote server (like MMseqs2), so ``db_path`` is a
+    *remote* target-database prefix — the default used by ``beak foldseek``
+    when ``--db`` is omitted. Written by ``beak setup foldseek``, mirroring
+    how ``databases.pfam_path`` records the remote Pfam location.
 
     Returns:
-        Dict with keys: binary (path to the foldseek executable, or None
-        to fall back to $PATH), db_path (target database prefix), db_name
-        (which prebuilt database db_path holds, for display). Any may be
-        None.
+        Dict with keys: db_path (remote database prefix), db_name (which
+        database db_path holds, for display). Either may be None.
     """
     config = load_config()
     fs = config.get('foldseek', {})
     return {
-        'binary': fs.get('binary'),
         'db_path': fs.get('db_path'),
         'db_name': fs.get('db_name'),
     }
