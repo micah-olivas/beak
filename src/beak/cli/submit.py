@@ -10,14 +10,32 @@ from ._common import (
 
 
 def _machine_options(f):
-    """Attach the shared agent-facing flags (--json / --wait / --interval)."""
+    """Attach the shared agent-facing flags (--dry-run / --json / --wait / --interval)."""
     f = click.option('--json', 'json_local', is_flag=True,
                      help='Emit the job as JSON on stdout.')(f)
     f = click.option('--wait', is_flag=True,
                      help='Block until the job reaches a terminal state.')(f)
     f = click.option('--interval', default=30, show_default=True,
                      help='Seconds between status checks when --wait is set.')(f)
+    f = click.option('--dry-run', is_flag=True,
+                     help='Validate inputs and print the submission plan '
+                          'without connecting to the remote or submitting.')(f)
     return f
+
+
+def _emit_plan(ctx, plan, json_local=False):
+    """Print what a submit *would* do, then return without submitting.
+
+    Local-only: never opens an SSH connection, so it works offline and
+    without a configured remote. JSON mode emits one object tagged
+    ``dry_run: true``; human mode prints a labelled key/value block.
+    """
+    if json_mode(ctx, json_local):
+        emit_json({'dry_run': True, **plan})
+        return
+    click.echo("DRY RUN — would submit (nothing sent to the remote):")
+    for key, value in plan.items():
+        click.echo(f"  {key}: {value}")
 
 
 def _finish_submit(ctx, mgr, job_id, job_type, job_name,
@@ -166,7 +184,7 @@ _EMBEDDING_SIZE_WARN_BYTES = 5 * 1024 ** 3  # 5 GB
 @_machine_options
 @click.pass_context
 def search(ctx, query, database, job_name, preset, uniprot,
-           json_local, wait, interval):
+           json_local, wait, interval, dry_run):
     """Submit an MMseqs2 search job.
 
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
@@ -180,6 +198,13 @@ def search(ctx, query, database, job_name, preset, uniprot,
         query_file = query
         if not Path(query_file).exists():
             raise click.BadParameter(f"File not found: {query_file}", param_hint="'QUERY'")
+
+    if dry_run:
+        _emit_plan(ctx, {
+            'job_type': 'search', 'query': query_file, 'database': database,
+            'preset': preset or 'default', 'name': job_name or '(auto)',
+        }, json_local)
+        return
 
     if job_name is None:
         job_name = auto_name_from_pfam(query_file, 'search')
@@ -204,7 +229,7 @@ def search(ctx, query, database, job_name, preset, uniprot,
 @_machine_options
 @click.pass_context
 def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
-             json_local, wait, interval):
+             json_local, wait, interval, dry_run):
     """Submit an MMseqs2 taxonomy job.
 
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
@@ -218,6 +243,13 @@ def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
         query_file = query
         if not Path(query_file).exists():
             raise click.BadParameter(f"File not found: {query_file}", param_hint="'QUERY'")
+
+    if dry_run:
+        _emit_plan(ctx, {
+            'job_type': 'taxonomy', 'query': query_file, 'database': database,
+            'tax_lineage': not no_lineage, 'name': job_name or '(auto)',
+        }, json_local)
+        return
 
     if job_name is None:
         job_name = auto_name_from_pfam(query_file, 'taxonomy')
@@ -241,8 +273,16 @@ def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
 @_machine_options
 @click.pass_context
 def align(ctx, input_file, job_name, algorithm, output_format,
-          json_local, wait, interval):
+          json_local, wait, interval, dry_run):
     """Submit a multiple sequence alignment job"""
+    if dry_run:
+        _emit_plan(ctx, {
+            'job_type': 'align', 'input': input_file, 'algorithm': algorithm,
+            'output_format': output_format or '(algorithm default)',
+            'name': job_name or '(auto)',
+        }, json_local)
+        return
+
     if job_name is None:
         job_name = auto_name_from_pfam(input_file, 'align')
 
@@ -280,7 +320,7 @@ def align(ctx, input_file, job_name, algorithm, output_format,
 @click.pass_context
 def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
                include_per_tok, no_mean, gpu_id, list_models,
-               json_local, wait, interval):
+               json_local, wait, interval, dry_run):
     """Submit an ESM embedding-generation job.
 
     INPUT_FILE is a local FASTA file. Alternatively, use --from-job to
@@ -341,6 +381,28 @@ def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
                 f"--gpu must be an integer or 'auto', got {gpu_id!r}",
                 param_hint="'--gpu'",
             )
+
+    if dry_run:
+        plan = {
+            'job_type': 'embeddings', 'model': model, 'layers': layers,
+            'include_mean': include_mean, 'include_per_tok': include_per_tok,
+            'gpu': gpu_id, 'name': job_name or '(auto)',
+        }
+        if source_job_id:
+            plan['from_job'] = source_job_id
+        else:
+            n_seqs, total_len, _max, _min = _fasta_stats(input_file)
+            plan['input'] = input_file
+            plan['n_sequences'] = n_seqs
+            est = _estimate_embedding_bytes(
+                n_seqs, total_len, model, len(layers),
+                include_mean, include_per_tok,
+            )
+            if est is not None:
+                plan['estimated_output_bytes'] = est
+                plan['estimated_output'] = _humanize_bytes(est)
+        _emit_plan(ctx, plan, json_local)
+        return
 
     mgr = get_manager(job_type='embeddings')
 

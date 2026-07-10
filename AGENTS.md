@@ -32,9 +32,10 @@ paths above are the supported entry points.
 ## The loop (machine mode)
 
 The submit commands accept `--json` (structured stdout), `--wait` (block until a
-terminal state), and `--interval` (poll seconds). `--json` works either
-per-command (`beak search … --json`) or before the subcommand
-(`beak --json search …`).
+terminal state), `--interval` (poll seconds), and `--dry-run` (validate inputs
+and print the submission plan without connecting or submitting — safe to run
+offline before committing remote compute). `--json` works either per-command
+(`beak search … --json`) or before the subcommand (`beak --json search …`).
 
 ```bash
 # 1. Preflight — confirm the remote is configured and reachable
@@ -147,7 +148,7 @@ Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|bro
             beak taxonomy <fa> --db <alias> [--name N]
             beak align <fa> [-a clustalo|mafft|muscle]
             beak embeddings <fa> [-m MODEL] [--layer N]
-            # all four also take: --json  --wait  --interval <sec>
+            # all four also take: --json  --wait  --interval <sec>  --dry-run
 
 Monitor     beak jobs --json           # JSON array of all jobs
             beak status <id> --json    # JSON status of one job

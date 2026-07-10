@@ -304,3 +304,38 @@ class TestErrorJson:
         with pytest.raises(SystemExit) as ei:
             cli_entry()
         assert ei.value.code == 0
+
+
+class TestDryRun:
+    """--dry-run previews the plan without connecting or submitting."""
+
+    def test_search_dry_run_json(self, runner, query_fasta, monkeypatch):
+        # If it tried to submit it would need get_manager (a remote); make
+        # that explode so the test proves dry-run never reaches it.
+        monkeypatch.setattr('beak.cli.submit.get_manager',
+                            lambda **k: (_ for _ in ()).throw(AssertionError("connected!")))
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--preset', 'broad', '--dry-run', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.output.strip())
+        assert obj['dry_run'] is True
+        assert obj['job_type'] == 'search'
+        assert obj['database'] == 'uniref90' and obj['preset'] == 'broad'
+
+    def test_embeddings_dry_run_reports_size_estimate(self, runner, query_fasta, monkeypatch):
+        monkeypatch.setattr('beak.cli.submit.get_manager',
+                            lambda **k: (_ for _ in ()).throw(AssertionError("connected!")))
+        res = runner.invoke(main, ['embeddings', query_fasta,
+                                   '-m', 'esm2_t33_650M_UR50D',
+                                   '--layer', '30,33', '--dry-run', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.output.strip())
+        assert obj['dry_run'] is True and obj['job_type'] == 'embeddings'
+        assert obj['layers'] == [30, 33]
+        assert obj['estimated_output_bytes'] > 0
+
+    def test_dry_run_human_form(self, runner, query_fasta):
+        res = runner.invoke(main, ['align', query_fasta, '--dry-run'])
+        assert res.exit_code == 0
+        assert 'DRY RUN' in res.output
+        assert 'algorithm: clustalo' in res.output
