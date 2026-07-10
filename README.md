@@ -51,12 +51,14 @@ Tools expected on the remote:
 | [Clustal Omega](http://www.clustal.org/omega/) / MAFFT / MUSCLE | multiple sequence alignment      |
 | [IQ-TREE](http://www.iqtree.org/)                       | phylogenetic trees                       |
 | [HMMER3](http://hmmer.org/)                             | Pfam domain scans (`beak pfam`)          |
+| [foldseek](https://github.com/steineggerlab/foldseek)   | structural search (`beak foldseek`)      |
 
-Two optional remote setups:
+Optional remote setups:
 
 ```bash
 beak setup pfam              # download + index Pfam-A HMM DB (~5 GB) for `beak pfam`
 beak setup pfam --system     # shared, world-readable install (needs sudo on the remote)
+beak setup foldseek --db pdb # download a foldseek structure DB on the remote for `beak foldseek`
 ```
 
 ESM embeddings run in a Docker container on the remote. Each user deploys their own by default; to share one service across a lab, point everyone at a common directory with `beak config set docker.service_dir /srv/beak_docker` (users must be in the `docker` group).
@@ -68,7 +70,7 @@ src/beak/
 ├── cli/            # Click + Rich CLI, one module per command group
 ├── project/        # BeakProject: the on-disk, target-centric analysis hub
 ├── remote/         # Fabric SSH job managers (search, align, embeddings,
-│                   #   taxonomy, hmmer, pipeline) + BeakSession
+│                   #   taxonomy, hmmer, foldseek, pipeline) + BeakSession
 ├── api/            # REST clients (UniProt, PDBe SIFTS, AlphaFold)
 ├── alignments/     # alignment cache (FASTA→npz), conservation, PSSM formatting
 ├── analysis/       # comparative PSSMs (group / differential)
@@ -114,9 +116,14 @@ hits = bk.search.get_results(job)                  # pandas DataFrame
 # Pfam domain scan (synchronous)
 for hit in bk.hmmer.scan("query.fasta"):
     print(hit["pfam_id"], hit["pfam_name"], hit["i_evalue"])
+
+# Foldseek structural search (query is a structure, db lives on the remote)
+fs_job = bk.foldseek.submit("model.cif", database="pdb", s=9.5)
+bk.foldseek.wait(fs_job)
+structural_hits = bk.foldseek.get_results(fs_job)   # pandas DataFrame (TM-score, LDDT, …)
 ```
 
-Individual managers (`MMseqsSearch`, `MMseqsTaxonomy`, `ClustalAlign`, `ESMEmbeddings`, `HmmerScan`, `Pipeline`) are also importable directly from `beak.remote`.
+Individual managers (`MMseqsSearch`, `MMseqsTaxonomy`, `ClustalAlign`, `ESMEmbeddings`, `HmmerScan`, `RemoteFoldseek`, `Pipeline`) are also importable directly from `beak.remote`.
 
 ### Pipelines
 
@@ -159,6 +166,8 @@ beak results <job_id> --parse                           # pull results as a Data
 beak pfam query.fasta --uniprot --taxonomy              # scan domains, fetch UniProt hits
 beak structures P00533 --source alphafold               # download structures
 beak features model.cif --format parquet                # per-residue structural features
+beak foldseek model.cif --db pdb --wait                 # remote structural search
+beak foldseek P00533 --uniprot --db pdb                 # …or by accession (fetches AF model)
 ```
 
 ## Citation

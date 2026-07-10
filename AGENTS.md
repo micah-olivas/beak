@@ -174,13 +174,16 @@ Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|bro
             beak taxonomy <fa> --db <alias> [--name N]
             beak align <fa> [-a clustalo|mafft|muscle]
             beak embeddings <fa> [-m MODEL] [--layer N]
-            # all four also take: --json  --wait  --interval <sec>  --dry-run  --reuse
+            beak foldseek <cif> --db <alias> [--uniprot] [-s S] [-e E] [--max-seqs N]
+            # all five also take: --json  --wait  --interval <sec>  --dry-run  --reuse
 
 Monitor     beak jobs --json           # JSON array of all jobs
             beak status <id> --json    # JSON status of one job
             beak log <id> --json       # {job_id, lines, log} envelope (text stays text)
 
 Fetch       beak results <id> --json   # JSON of downloaded result paths
+
+Setup       beak setup foldseek --db <alias>    # download a foldseek db on the remote
 
 Projects    beak project init <name> (--uniprot <id> | --sequence <fa>) --json
             beak project list --json   # array of project summaries
@@ -189,12 +192,34 @@ Projects    beak project init <name> (--uniprot <id> | --sequence <fa>) --json
 Avoid       beak ui, --watch, --follow, beak config init   # interactive / never-return
 ```
 
+## Structural search (foldseek)
+
+`beak foldseek` submits a **remote** structural-homology search — the same
+submit → poll → pull lifecycle as `beak search`, just with a structure query
+and a foldseek database on the remote. The query is a structure file
+(mmCIF/PDB) or, with `--uniprot`, an accession whose AlphaFold model is fetched
+automatically.
+
+```bash
+beak setup foldseek --db pdb                        # one-time: download db on remote
+beak foldseek model.cif --db pdb --json --wait      # submit + block; -> {job_id, status}
+beak foldseek P0DTC2 --uniprot --db pdb --json      # query by accession (fetch AF model)
+beak results <job_id> --json                        # pull hits: {results_path, ...}
+```
+
+It takes the same machine flags as the other submit commands (`--json`,
+`--wait`, `--interval`, `--dry-run`, `--reuse`) plus foldseek knobs `-s`
+(sensitivity), `-e` (e-value), and `--max-seqs`. `--db` accepts an alias
+(`pdb`, `afdb_swissprot`, `afdb50`, …) or a remote prefix, and defaults to the
+`foldseek.db_path` set by `beak setup foldseek`. `beak databases --type
+foldseek` lists which databases exist on the remote.
+
 ## Offline vs. remote
 
-Only search, taxonomy, alignment, embeddings, and HMMER need the remote. Project
-management, structure feature extraction, conservation, comparative analysis,
-and export all run locally with no SSH. An agent doing purely local analysis
-does not need `beak config` / `beak doctor` to succeed.
+Only search, taxonomy, alignment, embeddings, HMMER, and foldseek need the
+remote. Project management, structure feature extraction, conservation,
+comparative analysis, and export all run locally with no SSH. An agent doing
+purely local analysis does not need `beak config` / `beak doctor` to succeed.
 
 ## Exit codes
 
@@ -215,10 +240,11 @@ sees the failure. Commands that already emitted a result object (`status
 
 ## Machine-output coverage
 
-Every agent-relevant command now takes `--json`: `doctor` (preflight), the four
-submit commands (with `--wait` / `--dry-run` / `--reuse`), `status`, `jobs`,
-`log`, `results`, and `project init/list/status`. Errors surface as
-`{"error", "exit_code"}` on stdout in `--json` mode.
+Every agent-relevant command now takes `--json`: `doctor` (preflight), the five
+submit commands (`search`, `taxonomy`, `align`, `embeddings`, `foldseek` — with
+`--wait` / `--dry-run` / `--reuse`), `status`, `jobs`, `log`, `results`, and
+`project init/list/status`. Errors surface as `{"error", "exit_code"}` on
+stdout in `--json` mode.
 
 Two things are intentionally *not* built (neither is a CLI-JSON gap): an MCP
 server, and typed Python-API return values. Client-side concurrency enforcement

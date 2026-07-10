@@ -99,6 +99,26 @@ def get_database_config() -> Dict:
     }
 
 
+def get_foldseek_config() -> Dict:
+    """Get foldseek database configuration from config.
+
+    Foldseek runs on the remote server (like MMseqs2), so ``db_path`` is a
+    *remote* target-database prefix — the default used by ``beak foldseek``
+    when ``--db`` is omitted. Written by ``beak setup foldseek``, mirroring
+    how ``databases.pfam_path`` records the remote Pfam location.
+
+    Returns:
+        Dict with keys: db_path (remote database prefix), db_name (which
+        database db_path holds, for display). Either may be None.
+    """
+    config = load_config()
+    fs = config.get('foldseek', {})
+    return {
+        'db_path': fs.get('db_path'),
+        'db_name': fs.get('db_name'),
+    }
+
+
 def get_docker_config() -> Dict:
     """Get Docker service configuration from config.
 

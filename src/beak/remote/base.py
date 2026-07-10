@@ -216,6 +216,7 @@ class RemoteJobManager:
         'seqkit':   {'needed_by': 'sequence filtering (optional)', 'install': 'https://bioinf.shenwei.me/seqkit/'},
         'hmmscan':  {'needed_by': 'pfam (domain search)', 'install': 'http://hmmer.org/'},
         'hmmpress': {'needed_by': 'pfam (database setup)', 'install': 'http://hmmer.org/'},
+        'foldseek': {'needed_by': 'foldseek (structural search)', 'install': 'https://github.com/steineggerlab/foldseek'},
     }
 
     # Per-tool version probes: (shell command, regex with one capture group).
@@ -236,6 +237,7 @@ class RemoteJobManager:
         'seqkit':   ('seqkit version 2>&1',                          r'v?(\d[\w.]*)'),
         'hmmscan':  ("hmmscan -h 2>&1 | grep -m1 '^# HMMER'",        r'HMMER\s+(\S+)'),
         'hmmpress': ("hmmpress -h 2>&1 | grep -m1 '^# HMMER'",       r'HMMER\s+(\S+)'),
+        'foldseek': ('foldseek version 2>&1 | head -1',             r'(\S+)'),
     }
 
     def _probe_tool_version(self, tool: str) -> Optional[str]:

@@ -70,6 +70,7 @@ class BeakSession:
         self._embeddings = None
         self._pipeline = None
         self._hmmer = None
+        self._foldseek = None
 
     @property
     def search(self):
@@ -123,3 +124,12 @@ class BeakSession:
             from .hmmer import HmmerScan
             self._hmmer = HmmerScan(connection=self._conn)
         return self._hmmer
+
+    @property
+    def foldseek(self):
+        """Foldseek structural-search manager"""
+        if self._foldseek is None:
+            from .foldseek import RemoteFoldseek
+            self._foldseek = RemoteFoldseek(connection=self._conn,
+                                            remote_job_dir=self._remote_job_dir)
+        return self._foldseek
