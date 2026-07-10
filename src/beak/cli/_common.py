@@ -30,6 +30,66 @@ def emit_json(payload):
     click.echo(json.dumps(payload))
 
 
+# Statuses worth reusing: a matching job that is pending, running, or already
+# done. FAILED/CANCELLED jobs are intentionally not reused — resubmit those.
+_REUSABLE_STATES = {'SUBMITTED', 'QUEUED', 'RUNNING', 'COMPLETED'}
+
+
+def job_fingerprint(job_type, input_path, params):
+    """Stable content-based identity for a submission.
+
+    Hashes the job type, the input file's *contents* (not its path, so an
+    identical query under a different name still matches), and the salient
+    parameters. ``input_path`` may be None (e.g. embeddings --from-job),
+    in which case identity rests on ``params`` alone.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(job_type.encode())
+    if input_path:
+        try:
+            with open(input_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(65536), b''):
+                    h.update(chunk)
+        except OSError:
+            h.update(str(input_path).encode())
+    h.update(json.dumps(params, sort_keys=True, default=str).encode())
+    return h.hexdigest()[:16]
+
+
+def find_reusable_job(fingerprint):
+    """Return the newest non-failed job matching ``fingerprint``, or None.
+
+    Reads ``~/.beak/jobs.json`` directly (no SSH). Used to avoid
+    resubmitting an expensive job an agent already launched.
+    """
+    db_path = Path.home() / ".beak" / "jobs.json"
+    if not db_path.exists():
+        return None
+    try:
+        with open(db_path) as f:
+            db = json.load(f)
+    except (OSError, ValueError):
+        return None
+
+    matches = [
+        {
+            'job_id': jid,
+            'job_type': info.get('job_type'),
+            'name': info.get('name'),
+            'status': info.get('status'),
+            'submitted_at': info.get('submitted_at', ''),
+        }
+        for jid, info in db.items()
+        if info.get('fingerprint') == fingerprint
+        and info.get('status') in _REUSABLE_STATES
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda m: m['submitted_at'])
+
+
 def get_manager(job_id=None, job_type=None):
     """Create the appropriate manager for a job_id or job_type.
 

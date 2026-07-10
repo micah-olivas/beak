@@ -6,11 +6,12 @@ from pathlib import Path
 from .main import main
 from ._common import (
     get_manager, auto_name_from_pfam, json_mode, emit_json, JobFailed,
+    job_fingerprint, find_reusable_job,
 )
 
 
 def _machine_options(f):
-    """Attach the shared agent-facing flags (--dry-run / --json / --wait / --interval)."""
+    """Attach the shared agent-facing flags (--dry-run / --reuse / --json / --wait / --interval)."""
     f = click.option('--json', 'json_local', is_flag=True,
                      help='Emit the job as JSON on stdout.')(f)
     f = click.option('--wait', is_flag=True,
@@ -20,7 +21,33 @@ def _machine_options(f):
     f = click.option('--dry-run', is_flag=True,
                      help='Validate inputs and print the submission plan '
                           'without connecting to the remote or submitting.')(f)
+    f = click.option('--reuse', is_flag=True,
+                     help='If a non-failed job with identical inputs already '
+                          'exists, return it instead of submitting a new one.')(f)
     return f
+
+
+def _emit_reuse(ctx, existing, json_local=False):
+    """Report a reused job (found by --reuse) and skip submission."""
+    if json_mode(ctx, json_local):
+        emit_json({'reused': True, **existing})
+        return
+    click.echo(
+        f"Reusing existing job {existing['job_id']} ({existing['status']}) "
+        f"— identical inputs. Omit --reuse to force a new submission."
+    )
+
+
+def _record_fingerprint(mgr, job_id, fingerprint):
+    """Persist a submission's fingerprint on its job record (best-effort)."""
+    if not fingerprint:
+        return
+    try:
+        with mgr._mutate_job_db() as db:
+            if job_id in db:
+                db[job_id]['fingerprint'] = fingerprint
+    except Exception:  # noqa: BLE001 — dedup metadata is non-critical
+        pass
 
 
 def _emit_plan(ctx, plan, json_local=False):
@@ -39,7 +66,7 @@ def _emit_plan(ctx, plan, json_local=False):
 
 
 def _finish_submit(ctx, mgr, job_id, job_type, job_name,
-                   json_local=False, wait=False, interval=30):
+                   json_local=False, wait=False, interval=30, fingerprint=None):
     """Shared post-submit flow: optional blocking wait, JSON emission, exit code.
 
     In human mode the manager already printed its own confirmation and
@@ -49,6 +76,7 @@ def _finish_submit(ctx, mgr, job_id, job_type, job_name,
     (exit 1) so an agent never reads a failed/cancelled job as success.
     """
     use_json = json_mode(ctx, json_local)
+    _record_fingerprint(mgr, job_id, fingerprint)
     status = 'SUBMITTED'
     if wait:
         status = mgr.wait(job_id, check_interval=interval, verbose=not use_json)
@@ -184,7 +212,7 @@ _EMBEDDING_SIZE_WARN_BYTES = 5 * 1024 ** 3  # 5 GB
 @_machine_options
 @click.pass_context
 def search(ctx, query, database, job_name, preset, uniprot,
-           json_local, wait, interval, dry_run):
+           json_local, wait, interval, dry_run, reuse):
     """Submit an MMseqs2 search job.
 
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
@@ -206,6 +234,14 @@ def search(ctx, query, database, job_name, preset, uniprot,
         }, json_local)
         return
 
+    fp = job_fingerprint('search', query_file,
+                         {'database': database, 'preset': preset or 'default'})
+    if reuse:
+        existing = find_reusable_job(fp)
+        if existing:
+            _emit_reuse(ctx, existing, json_local)
+            return
+
     if job_name is None:
         job_name = auto_name_from_pfam(query_file, 'search')
 
@@ -216,7 +252,8 @@ def search(ctx, query, database, job_name, preset, uniprot,
     job_id = mgr.submit(query_file, database=database, job_name=job_name,
                         quiet=json_mode(ctx, json_local), **kwargs)
     _finish_submit(ctx, mgr, job_id, 'search', job_name,
-                   json_local=json_local, wait=wait, interval=interval)
+                   json_local=json_local, wait=wait, interval=interval,
+                   fingerprint=fp)
 
 
 @main.command()
@@ -229,7 +266,7 @@ def search(ctx, query, database, job_name, preset, uniprot,
 @_machine_options
 @click.pass_context
 def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
-             json_local, wait, interval, dry_run):
+             json_local, wait, interval, dry_run, reuse):
     """Submit an MMseqs2 taxonomy job.
 
     QUERY is a path to a FASTA file, or a UniProt accession if --uniprot is set.
@@ -251,6 +288,14 @@ def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
         }, json_local)
         return
 
+    fp = job_fingerprint('taxonomy', query_file,
+                         {'database': database, 'tax_lineage': not no_lineage})
+    if reuse:
+        existing = find_reusable_job(fp)
+        if existing:
+            _emit_reuse(ctx, existing, json_local)
+            return
+
     if job_name is None:
         job_name = auto_name_from_pfam(query_file, 'taxonomy')
 
@@ -259,7 +304,8 @@ def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
                         tax_lineage=not no_lineage,
                         quiet=json_mode(ctx, json_local))
     _finish_submit(ctx, mgr, job_id, 'taxonomy', job_name,
-                   json_local=json_local, wait=wait, interval=interval)
+                   json_local=json_local, wait=wait, interval=interval,
+                   fingerprint=fp)
 
 
 @main.command()
@@ -273,7 +319,7 @@ def taxonomy(ctx, query, database, job_name, no_lineage, uniprot,
 @_machine_options
 @click.pass_context
 def align(ctx, input_file, job_name, algorithm, output_format,
-          json_local, wait, interval, dry_run):
+          json_local, wait, interval, dry_run, reuse):
     """Submit a multiple sequence alignment job"""
     if dry_run:
         _emit_plan(ctx, {
@@ -282,6 +328,15 @@ def align(ctx, input_file, job_name, algorithm, output_format,
             'name': job_name or '(auto)',
         }, json_local)
         return
+
+    fp = job_fingerprint('align', input_file,
+                         {'algorithm': algorithm,
+                          'output_format': output_format or ''})
+    if reuse:
+        existing = find_reusable_job(fp)
+        if existing:
+            _emit_reuse(ctx, existing, json_local)
+            return
 
     if job_name is None:
         job_name = auto_name_from_pfam(input_file, 'align')
@@ -293,7 +348,8 @@ def align(ctx, input_file, job_name, algorithm, output_format,
     job_id = mgr.submit(input_file, job_name=job_name,
                         quiet=json_mode(ctx, json_local), **kwargs)
     _finish_submit(ctx, mgr, job_id, 'align', job_name,
-                   json_local=json_local, wait=wait, interval=interval)
+                   json_local=json_local, wait=wait, interval=interval,
+                   fingerprint=fp)
 
 
 @main.command()
@@ -320,7 +376,7 @@ def align(ctx, input_file, job_name, algorithm, output_format,
 @click.pass_context
 def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
                include_per_tok, no_mean, gpu_id, list_models,
-               json_local, wait, interval, dry_run):
+               json_local, wait, interval, dry_run, reuse):
     """Submit an ESM embedding-generation job.
 
     INPUT_FILE is a local FASTA file. Alternatively, use --from-job to
@@ -404,6 +460,20 @@ def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
         _emit_plan(ctx, plan, json_local)
         return
 
+    fp_params = {
+        'model': model, 'layers': repr_layers,
+        'include_mean': include_mean, 'include_per_tok': include_per_tok,
+    }
+    if source_job_id:
+        fp_params['source_job_id'] = source_job_id
+    fp = job_fingerprint('embeddings',
+                         None if source_job_id else input_file, fp_params)
+    if reuse:
+        existing = find_reusable_job(fp)
+        if existing:
+            _emit_reuse(ctx, existing, json_local)
+            return
+
     mgr = get_manager(job_type='embeddings')
 
     if source_job_id:
@@ -422,7 +492,8 @@ def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
             quiet=use_json,
         )
         _finish_submit(ctx, mgr, job_id, 'embeddings', job_name,
-                       json_local=json_local, wait=wait, interval=interval)
+                       json_local=json_local, wait=wait, interval=interval,
+                       fingerprint=fp)
         return
 
     # Local-FASTA path: validate structure and show a size estimate so
@@ -481,7 +552,8 @@ def embeddings(ctx, input_file, source_job_id, model, job_name, repr_layers,
         quiet=use_json,
     )
     _finish_submit(ctx, mgr, job_id, 'embeddings', job_name,
-                   json_local=json_local, wait=wait, interval=interval)
+                   json_local=json_local, wait=wait, interval=interval,
+                   fingerprint=fp)
 
 
 def _resolve_source_job_fasta(job_id: str) -> str:

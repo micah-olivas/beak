@@ -157,6 +157,12 @@ The remote is shared. Be a considerate neighbor:
   plenty, one is safest on a busy box.
 - **Preview first.** `--dry-run` prints a job's plan (and, for embeddings, its
   output size) without submitting — sanity-check before committing compute.
+- **Retry without duplicating.** Pass `--reuse` on submit: if a job with
+  identical inputs (same file contents + parameters) is still SUBMITTED/RUNNING
+  or already COMPLETED, beak returns it (`{"reused": true, "job_id": ...}`)
+  instead of launching a second copy. FAILED/CANCELLED jobs are not reused, so a
+  genuine retry after failure still runs. Use it on every retry so a timed-out
+  or re-driven agent step never fans out a duplicate expensive search.
 
 ## Command reference (agent-relevant subset)
 
@@ -168,7 +174,7 @@ Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|bro
             beak taxonomy <fa> --db <alias> [--name N]
             beak align <fa> [-a clustalo|mafft|muscle]
             beak embeddings <fa> [-m MODEL] [--layer N]
-            # all four also take: --json  --wait  --interval <sec>  --dry-run
+            # all four also take: --json  --wait  --interval <sec>  --dry-run  --reuse
 
 Monitor     beak jobs --json           # JSON array of all jobs
             beak status <id> --json    # JSON status of one job

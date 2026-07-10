@@ -407,3 +407,64 @@ class TestDoctorJson:
         res = _split_runner().invoke(main, ['doctor', '--json'])
         assert res.exit_code == 1
         assert json.loads(res.stdout.strip())['ok'] is False
+
+
+def _no_submit(**k):
+    raise AssertionError("submitted despite an available reuse match")
+
+
+class TestReuse:
+    """--reuse returns an existing non-failed job instead of resubmitting."""
+
+    def test_fingerprint_stable_and_param_sensitive(self, query_fasta):
+        from beak.cli._common import job_fingerprint
+        a = job_fingerprint('search', query_fasta, {'database': 'uniref90', 'preset': 'default'})
+        b = job_fingerprint('search', query_fasta, {'database': 'uniref90', 'preset': 'default'})
+        c = job_fingerprint('search', query_fasta, {'database': 'uniref50', 'preset': 'default'})
+        assert a == b                       # same inputs -> same fingerprint
+        assert a != c                       # a changed param -> different
+        assert len(a) == 16
+
+    def _seed(self, tmp_path, query_fasta, status):
+        from beak.cli._common import job_fingerprint
+        fp = job_fingerprint('search', query_fasta,
+                             {'database': 'uniref90', 'preset': 'default'})
+        beak_dir = tmp_path / '.beak'
+        beak_dir.mkdir()
+        (beak_dir / 'jobs.json').write_text(json.dumps({
+            'aaaa1111': {'job_type': 'search', 'name': 'prev', 'status': status,
+                         'submitted_at': '2026-07-09T09:00:00', 'fingerprint': fp},
+        }))
+
+    def test_reuse_hit_returns_existing(self, runner, query_fasta, tmp_path, monkeypatch):
+        self._seed(tmp_path, query_fasta, 'RUNNING')
+        monkeypatch.setattr(Path, 'home', staticmethod(lambda: tmp_path))
+        monkeypatch.setattr('beak.cli.submit.get_manager', _no_submit)
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'x', '--reuse', '--json'])
+        assert res.exit_code == 0
+        obj = json.loads(res.output.strip())
+        assert obj['reused'] is True
+        assert obj['job_id'] == 'aaaa1111' and obj['status'] == 'RUNNING'
+
+    def test_failed_job_is_not_reused(self, runner, query_fasta, tmp_path, monkeypatch):
+        self._seed(tmp_path, query_fasta, 'FAILED')
+        monkeypatch.setattr(Path, 'home', staticmethod(lambda: tmp_path))
+        # A FAILED match must NOT be reused, so it proceeds to submit -> our
+        # stub raises, proving no reuse happened.
+        monkeypatch.setattr('beak.cli.submit.get_manager',
+                            lambda **k: (_ for _ in ()).throw(RuntimeError("would submit")))
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'x', '--reuse', '--json'])
+        assert res.exit_code != 0
+        assert 'reused' not in (res.output or '')
+
+    def test_no_reuse_flag_ignores_match(self, runner, query_fasta, tmp_path, monkeypatch):
+        self._seed(tmp_path, query_fasta, 'RUNNING')
+        monkeypatch.setattr(Path, 'home', staticmethod(lambda: tmp_path))
+        # Without --reuse, an existing match is ignored and it submits.
+        monkeypatch.setattr('beak.cli.submit.get_manager',
+                            lambda **k: (_ for _ in ()).throw(RuntimeError("would submit")))
+        res = runner.invoke(main, ['search', query_fasta, '--db', 'uniref90',
+                                   '--name', 'x', '--json'])
+        assert res.exit_code != 0            # tried to submit, no reuse
