@@ -138,7 +138,8 @@ def project_status(ctx, name, json_local):
     target = m.get('target', {})
     proj_meta = m.get('project', {})
 
-    _LAYERS = ('target', 'homologs', 'domains', 'structures', 'experiments')
+    _LAYERS = ('target', 'homologs', 'domains', 'structures', 'structural',
+               'experiments')
 
     if json_mode(ctx, json_local):
         sizes = proj.disk_usage_by_layer()

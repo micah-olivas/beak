@@ -23,10 +23,28 @@ def doctor(ctx, json_local):
     from .theme import get_console, BEAK_BLUE
     from ._common import get_manager, get_remote_file_age, json_mode, emit_json
     from ..remote.hmmer import resolve_pfam_path, PFAM_HMM_FILE
+    from ..config import get_foldseek_config
+    from ..structures.foldseek import (
+        FoldseekError, foldseek_version, resolve_foldseek_binary,
+    )
     from rich.table import Table
 
     mgr = get_manager(job_type='search')
     results = mgr.verify_remote(verbose=False)
+
+    # foldseek is a *local* tool (not on the remote), reported separately.
+    try:
+        fs_binary = resolve_foldseek_binary()
+    except FoldseekError:
+        fs_binary = None
+    fs_cfg = get_foldseek_config()
+    foldseek_report = {
+        'installed': fs_binary is not None,
+        'binary': fs_binary,
+        'version': foldseek_version() if fs_binary else None,
+        'db_path': fs_cfg.get('db_path'),
+        'db_name': fs_cfg.get('db_name'),
+    }
 
     if json_mode(ctx, json_local):
         # Preflight payload: an agent gates submission on `ok` (and the
@@ -38,6 +56,7 @@ def doctor(ctx, json_local):
             'databases': results.get('databases', {}),
             'disk': results.get('disk', {}),
             'load': results.get('load', {}),
+            'foldseek': foldseek_report,
         }
         try:
             payload['pfam'] = {'installed': True,
@@ -112,6 +131,20 @@ def doctor(ctx, json_local):
         )
 
     console.print(db_table)
+
+    # Local structural search (foldseek) — not a remote tool.
+    if foldseek_report['installed']:
+        ver = foldseek_report['version'] or ''
+        db = foldseek_report['db_path'] or '[dim]no db configured[/dim]'
+        console.print(
+            f"\n[dim]foldseek (local)[/dim]  [green]OK[/green]  "
+            f"[dim]{ver}[/dim]  {db}"
+        )
+    else:
+        console.print(
+            "\n[dim]foldseek (local)[/dim]  [dim]--  not installed "
+            "(conda install -c bioconda foldseek)[/dim]"
+        )
 
     disk = results.get('disk', {})
     if disk:

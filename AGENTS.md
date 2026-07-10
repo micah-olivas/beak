@@ -40,7 +40,7 @@ offline before committing remote compute). `--json` works either per-command
 ```bash
 # 1. Preflight — confirm the remote is configured and reachable
 beak config show                 # is a host/user set?
-beak doctor --json               # {ok, tools, databases, disk, pfam}; exit 0 if ok, 1 if not
+beak doctor --json               # {ok, tools, databases, disk, pfam, foldseek}; exit 0 if ok, 1 if not
 # Gate the rest on `.ok` (or on `$? == 0`) before spending remote compute.
 
 # 2. Submit + block + parse — one call, one JSON object on stdout
@@ -168,7 +168,7 @@ The remote is shared. Be a considerate neighbor:
 
 ```
 Preflight   beak config show          # current config
-            beak doctor --json        # {ok, tools, databases, disk, pfam}; nonzero exit if not ok
+            beak doctor --json        # {ok, tools, databases, disk, pfam, foldseek}; nonzero exit if not ok
 
 Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|broad|twilight]
             beak taxonomy <fa> --db <alias> [--name N]
@@ -182,6 +182,10 @@ Monitor     beak jobs --json           # JSON array of all jobs
 
 Fetch       beak results <id> --json   # JSON of downloaded result paths
 
+Foldseek    beak foldseek setup --db <name>     # download a structure db (local)
+(local)     beak foldseek setup --db-path <prefix>   # or point at an existing db
+            beak foldseek search (--project <name> | --query <cif>) [--db <prefix>] --json
+
 Projects    beak project init <name> (--uniprot <id> | --sequence <fa>) --json
             beak project list --json   # array of project summaries
             beak project status <name> --json   # target + per-layer state + sizes
@@ -193,8 +197,25 @@ Avoid       beak ui, --watch, --follow, beak config init   # interactive / never
 
 Only search, taxonomy, alignment, embeddings, and HMMER need the remote. Project
 management, structure feature extraction, conservation, comparative analysis,
-and export all run locally with no SSH. An agent doing purely local analysis
-does not need `beak config` / `beak doctor` to succeed.
+export, and **foldseek structural search** all run locally with no SSH. An agent
+doing purely local analysis does not need `beak config` / `beak doctor` to
+succeed.
+
+`beak foldseek` is the one heavy-compute command that runs on the *local*
+machine rather than the remote: it shells out to a locally-installed `foldseek`
+binary against a locally-downloaded structure database, so it finishes
+synchronously (no job id, no polling). Install foldseek (`conda install -c
+conda-forge -c bioconda foldseek`), download a database once
+(`beak foldseek setup --db PDB`), then search:
+
+```bash
+beak foldseek setup --status                       # binary + db config
+beak foldseek search --project my_kinase --json    # search the target structure
+# -> {"query", "db", "n_hits", "hits_path", "raw_m8", "hits": [...]}
+```
+
+Project-mode search records a `structural` layer (hits.parquet + raw.m8) that
+surfaces in `beak project status`.
 
 ## Exit codes
 

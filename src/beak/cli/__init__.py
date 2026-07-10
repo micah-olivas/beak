@@ -6,6 +6,7 @@ from . import jobs
 from . import submit
 from . import pfam
 from . import structures
+from . import foldseek
 from . import setup
 from . import project
 from . import ui

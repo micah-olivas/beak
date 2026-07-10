@@ -239,6 +239,16 @@ class BeakProject:
     def target_sequence_path(self) -> Path:
         return self.path / "target" / "sequence.fasta"
 
+    @property
+    def structures_dir(self) -> Path:
+        """Directory holding cached structure cifs (AlphaFold / PDB)."""
+        return self.path / "structures"
+
+    @property
+    def structural_dir(self) -> Path:
+        """Directory for local foldseek structural-search artefacts."""
+        return self.path / "structural"
+
     def manifest(self) -> Dict[str, Any]:
         return read_manifest(self.manifest_path)
 
@@ -1138,6 +1148,7 @@ class BeakProject:
             "homologs": bool(m.get("homologs")),
             "domains": bool(m.get("domains")),
             "structures": bool(m.get("structures")),
+            "structural": bool(m.get("structural")),
             "experiments": bool(m.get("experiments")),
         }
         return {
