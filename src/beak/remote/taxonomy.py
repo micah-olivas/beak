@@ -70,7 +70,9 @@ def parse_lineage_df(df: pd.DataFrame, lineage_col: str = 'lineage') -> pd.DataF
 
     Adds (or overwrites) the columns 'domain', 'kingdom', 'phylum',
     'class', 'order', 'family', 'genus', 'species'. Missing ranks are
-    None. Input is modified in place and also returned for chaining.
+    NaN (pandas' str-dtype missing-value sentinel; check with pd.isna,
+    not ``is None``). Input is modified in place and also returned for
+    chaining.
     """
     if lineage_col not in df.columns:
         raise KeyError(f"{lineage_col!r} column not in DataFrame")
