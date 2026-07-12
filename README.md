@@ -52,6 +52,27 @@ Tools expected on the remote:
 | [IQ-TREE](http://www.iqtree.org/)                       | phylogenetic trees                       |
 | [HMMER3](http://hmmer.org/)                             | Pfam domain scans (`beak pfam`)          |
 
+### Search databases
+
+MMseqs2 searches (`beak search --db <alias>`) resolve a short alias to a database on the remote. Which of these are actually present depends on the server — `beak doctor` reports availability and disk usage, and `MMseqsSearch(...).list_databases()` lists them programmatically.
+
+| Alias         | Database        | Contents                                             | Taxonomy |
+| ------------- | --------------- | ---------------------------------------------------- | -------- |
+| `uniref90`    | UniRef90        | UniProt clustered at 90% identity (default choice)   | ✓        |
+| `uniref50`    | UniRef50        | UniProt clustered at 50% identity (broader, smaller) | ✓        |
+| `uniref100`   | UniRef100       | UniProt clustered at 100% identity                   | ✓        |
+| `uniprotkb`   | UniProtKB       | Full UniProt (Swiss-Prot + TrEMBL)                   | ✓        |
+| `swissprot`   | Swiss-Prot      | Reviewed, manually curated proteins                  | ✓        |
+| `trembl`      | TrEMBL          | Unreviewed, automatically annotated proteins         | ✓        |
+| `bfd`         | BFD             | Big Fantastic Database — metagenomic, remote homologs | —        |
+| `gtdb`        | GTDB            | Genome Taxonomy Database — bacterial/archaeal genomes | —        |
+| `pdb_seqres`  | PDB seqres      | Sequences of PDB structure entries                   | —        |
+| `nt_rna`      | nt (RNA)        | NCBI nucleotide, RNA subset                          | —        |
+| `rfam`        | Rfam            | RNA family reference sequences                       | —        |
+| `rnacentral`  | RNAcentral      | Non-coding RNA sequences                             | —        |
+
+The **Taxonomy** column marks databases usable with `beak taxonomy --db <alias>` for MMseqs2 LCA assignment — only the UniProt-derived protein databases carry the taxonomy annotations LCA needs. Any alias can also be a full remote path to a database BEAK doesn't know about.
+
 Two optional remote setups:
 
 ```bash
