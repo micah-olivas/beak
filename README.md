@@ -18,17 +18,43 @@ BEAK assembles a target-centric view of one protein: biochemical measurements (a
 
 The expensive parts (MMseqs2 searches, Clustal Omega alignments, HMMER scans, ESM embeddings) run remotely over SSH. BEAK submits those jobs, tracks them locally, and pulls results back into the interpretation layer. That remote compute is infrastructure; the product is the joined data at a single protein's residues.
 
+Those steps run through one canonical path. Each uses a fixed tool and a small set of named, benchmarked presets rather than hand-tuned flags, so analyses come out standardized, reproducible, and comparable by default. The parameters that produced each layer are recorded in the project manifest. See [Standardization and reproducibility](#standardization-and-reproducibility).
+
+## Standardization and reproducibility
+
+BEAK turns the routine, easy-to-get-wrong steps of a homology workflow into fixed, inspectable operations.
+
+- **Fixed tool per step.** Search uses MMseqs2, alignment uses Clustal Omega, MAFFT, or MUSCLE, domain scans use HMMER, and embeddings use ESM. Each step has one canonical tool rather than a per-analysis choice.
+- **Named presets.** `beak search --preset {default,close,broad,twilight}` selects a benchmarked bundle of sensitivity, E-value, coverage, and iteration count. ROC1 estimates and literature citations are recorded in the code, so `broad` produces the same search every time.
+- **Single config.** Host, user, key, remote job dir, thread cap, and shared Docker service read from `~/.beak/config.toml`. A lab points every user at one server and every job inherits the same defaults.
+- **Manifest provenance.** `beak.project.toml` records the remote `job_id` and `last_updated` for every layer, so each derived artefact traces back to the search, alignment, or embedding that produced it.
+- **Reuse and dry-run.** `--reuse` returns an existing job when its inputs (file contents and parameters) match, instead of launching a duplicate. `--dry-run` prints the submission plan without spending compute.
+- **Target-centric coordinates.** Every layer keys to the target's native residue numbering, so conservation, structure, and comparative scores from independently built sets line up directly.
+
+Together these make an analysis reproducible from its recorded inputs, self-documenting through the manifest, and comparable across proteins, collaborators, and time.
+
 ## Installation
+
+BEAK develops with [uv](https://docs.astral.sh/uv/), which provisions Python 3.11, manages the project venv, and installs from a committed lockfile for reproducible environments:
 
 ```bash
 git clone https://github.com/micah-olivas/beak.git
 cd beak
+uv sync --extra dev         # creates .venv/ and installs beak editable; drop --extra dev for runtime-only
+uv run beak --help          # run any command; uv resolves the project venv automatically
+```
+
+`uv run <cmd>` needs no activation. If you prefer, `source .venv/bin/activate` once and then call `beak` directly.
+
+Or install with pip into an environment you manage yourself:
+
+```bash
 pip install -e ".[dev]"     # drop [dev] for a runtime-only install
 ```
 
 ### Requirements
 
-- Python 3.8+
+- Python 3.8+ (uv installs and pins 3.11 automatically; pip users supply their own interpreter)
 - SSH access to a remote server with bioinformatics tools installed (for remote steps only; analysis, import, and export work offline)
 - Core dependencies (`pandas`, `biopython`, `fabric`, `click`, `rich`, `textual`, `torch`, ...) install automatically
 
@@ -160,6 +186,21 @@ beak pfam query.fasta --uniprot --taxonomy              # scan domains, fetch Un
 beak structures P00533 --source alphafold               # download structures
 beak features model.cif --format parquet                # per-residue structural features
 ```
+
+## Agentic workflows
+
+These properties carry over when an agent drives BEAK rather than a person. An LLM agent operating on a BEAK project reads the same `~/.beak/config.toml` and the same project manifest a human does. Agent-launched jobs inherit the same server, tools, thread caps, and presets, so work stays consistent across sessions and between agents and people rather than each run reinventing parameters.
+
+Every agent-relevant command speaks JSON and blocks cleanly:
+
+```bash
+beak doctor --json                                   # {ok, tools, databases, disk, load}; gate on .ok
+beak search query.fasta --db uniref90 --preset broad --json --wait --reuse
+# -> {"job_id": "a1b2c3d4", "status": "COMPLETED"}   # exit 0 if COMPLETED, nonzero on failure
+beak results a1b2c3d4 --json                         # {results_path: ...}
+```
+
+`--wait` blocks to a terminal state and sets the exit code, so an agent branches on `$?` instead of scraping tables. `--reuse` keeps a retried step from launching a duplicate of an expensive search. `--dry-run` previews a plan offline. `beak doctor --json` reports server load so an agent throttles itself on shared compute. The full contract, covering the machine-mode loop, job-state surfaces, exit codes, and shared-server etiquette, is in [AGENTS.md](AGENTS.md).
 
 ## Citation
 
