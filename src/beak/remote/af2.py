@@ -29,7 +29,8 @@ Parsing is split into a pure ``_parse_af2_probe`` so it is unit-testable
 without SSH, matching ``_parse_load_probe`` in ``base.py``.
 """
 
-from typing import Dict, Optional
+import base64
+from typing import Callable, Dict, List, Optional
 
 from fabric import Connection
 
@@ -143,6 +144,19 @@ def _build_probe_script(af2_home: str, cudnn_dir: str, deep: bool) -> str:
     if deep:
         script = script + _PROBE_DEEP
     return script.replace('@AF2_HOME@', af2_home).replace('@CUDNN_DIR@', cudnn_dir)
+
+
+def _parse_kv(stdout: str) -> Dict[str, str]:
+    """Collect ``key<TAB>value`` lines. Malformed lines are skipped."""
+    out = {}
+    for line in (stdout or '').splitlines():
+        if '\t' not in line:
+            continue
+        key, _, value = line.partition('\t')
+        key, value = key.strip(), value.strip()
+        if key:
+            out[key] = value
+    return out
 
 
 def _parse_af2_probe(stdout: str) -> Dict:
@@ -288,6 +302,182 @@ def _parse_af2_probe(stdout: str) -> Dict:
     return report
 
 
+# ── Standardized setup ────────────────────────────────────────────
+#
+# The point of `beak setup af2` is that a second user on the same box does
+# not repeat the archaeology the first one did. Two things make that work:
+# discovery (find what already exists rather than assuming one layout) and
+# reuse (a 700 MB cuDNN override copied per-user is pure waste on a shared
+# filesystem — ten users is 7 GB of identical bytes).
+
+# Searched in order; first hit wins. A site can prepend its own via the
+# [af2] section of ~/.beak/config.toml.
+AF2_HOME_CANDIDATES = [
+    "$HOME/localcolabfold",
+    "/srv/localcolabfold",
+    "/opt/localcolabfold",
+]
+CUDNN_DIR_CANDIDATES = [
+    "$HOME/cudnn89/nvidia/cudnn/lib",
+    "/srv/beak/cudnn89/nvidia/cudnn/lib",
+    "/opt/beak/cudnn89/nvidia/cudnn/lib",
+]
+
+# Pinned: jaxlib 0.4.23 is built against cuDNN 8.6, and cuDNN 9 ships
+# libcudnn.so.9 while jaxlib links libcudnn.so.8 — so "latest" is actively
+# wrong here. 8.9.6.50 is the newest 8.x for CUDA 11.
+CUDNN_PACKAGE = "nvidia-cudnn-cu11==8.9.6.50"
+
+# Bumped when the wrapper's content changes, so setup can tell an outdated
+# wrapper from a current one instead of silently leaving a stale file.
+WRAPPER_VERSION = 1
+WRAPPER_ENTRY_POINTS = ["colabfold_batch", "colabfold_search"]
+
+_WRAPPER_TEMPLATE = r'''#!/usr/bin/env bash
+# beak-af2-wrapper v@VERSION@ — managed by `beak setup af2`, do not hand-edit.
+#
+# LD_PRELOAD rather than LD_LIBRARY_PATH: the conda python and jaxlib's
+# xla_extension.so both carry a DT_RPATH, which glibc searches *before*
+# LD_LIBRARY_PATH, so the stale in-env cuDNN would win otherwise. All seven
+# libraries are preloaded because the main one dlopens its siblings by
+# soname at runtime.
+L="@CUDNN_DIR@"
+if [ -d "$L" ]; then
+  export LD_PRELOAD="$(ls "$L"/libcudnn*.so.8 2>/dev/null | tr '\n' ':' | sed 's/:$//')"
+fi
+# A conda prefix does not isolate ~/.local, so a stray user-level numpy
+# silently overrides the env's pinned one and breaks the ABI ml_dtypes was
+# compiled against.
+export PYTHONNOUSERSITE=1
+# Never reserve ~75% of a shared card just by starting up.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+exec "@AF2_HOME@/colabfold-conda/bin/@ENTRY@" "$@"
+'''
+
+
+def render_wrapper(af2_home: str, cudnn_dir: str, entry: str) -> str:
+    """Render the wrapper script for one ColabFold entry point.
+
+    Pure, so the generated script is unit-testable without SSH.
+    """
+    return (_WRAPPER_TEMPLATE
+            .replace('@VERSION@', str(WRAPPER_VERSION))
+            .replace('@CUDNN_DIR@', cudnn_dir)
+            .replace('@AF2_HOME@', af2_home)
+            .replace('@ENTRY@', entry))
+
+
+def _build_discovery_script(af2_candidates, cudnn_candidates,
+                            wrapper_dir: str) -> str:
+    """Render the discovery probe: what already exists on this machine?"""
+    af2_list = ' '.join(f'"{p}"' for p in af2_candidates)
+    cudnn_list = ' '.join(f'"{p}"' for p in cudnn_candidates)
+    return f'''
+for p in {af2_list}; do
+  if [ -x "$p/colabfold-conda/bin/colabfold_batch" ]; then
+    printf 'af2_home\\t%s\\n' "$p"; break
+  fi
+done
+# A candidate only counts with the complete set; a partial directory would
+# resolve some sonames through RPATH to the stale copy and mix versions.
+for p in {cudnn_list}; do
+  n=$(ls "$p"/libcudnn*.so.8 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$n" -eq {EXPECTED_CUDNN_LIBS} ]; then
+    printf 'cudnn_dir\\t%s\\n' "$p"; break
+  fi
+done
+printf 'wrapper_version\\t%s\\n' "$(grep -m1 -o 'beak-af2-wrapper v[0-9]*' \
+    "{wrapper_dir}/colabfold_batch" 2>/dev/null | grep -o '[0-9]*$' || echo -)"
+printf 'writable_home\\t%s\\n' "$([ -w "$HOME" ] && echo yes || echo no)"
+'''
+
+
+def discover_af2(conn: Connection,
+                 af2_home: Optional[str] = None,
+                 cudnn_dir: Optional[str] = None,
+                 wrapper_dir: str = "$HOME/bin") -> Dict:
+    """Find an existing AF2 install and cuDNN override on the remote.
+
+    Configured paths are tried first, then the shared candidates. Returns
+    ``{af2_home, cudnn_dir, wrapper_version, writable_home}`` with None for
+    anything not found.
+    """
+    af2_candidates = ([af2_home] if af2_home else []) + AF2_HOME_CANDIDATES
+    cudnn_candidates = ([cudnn_dir] if cudnn_dir else []) + CUDNN_DIR_CANDIDATES
+    script = _build_discovery_script(af2_candidates, cudnn_candidates,
+                                     wrapper_dir)
+    try:
+        result = conn.run(script, hide=True, warn=True, timeout=30)
+        raw = _parse_kv(result.stdout or '')
+    except Exception:
+        raw = {}
+
+    def _val(key):
+        v = raw.get(key)
+        return None if v in (None, '', '-') else v
+
+    version = _val('wrapper_version')
+    return {
+        'af2_home': _val('af2_home'),
+        'cudnn_dir': _val('cudnn_dir'),
+        'wrapper_version': int(version) if (version or '').isdigit() else None,
+        'writable_home': raw.get('writable_home') == 'yes',
+    }
+
+
+def plan_af2_setup(discovery: Dict, wrapper_dir: str = "$HOME/bin",
+                   cudnn_target: str = "$HOME/cudnn89") -> Dict:
+    """Decide what `beak setup af2` needs to do. Pure, so it is testable.
+
+    Returns ``{steps, blocked, af2_home, cudnn_dir}``. Each step is
+    ``{action, detail}``; ``blocked`` carries a reason when setup cannot
+    proceed at all.
+    """
+    steps = []
+    af2_home = discovery.get('af2_home')
+    cudnn_dir = discovery.get('cudnn_dir')
+
+    if not af2_home:
+        return {
+            'steps': [],
+            'blocked': ('No localcolabfold install found. Install one, or '
+                        'point beak at an existing one with '
+                        '`beak setup af2 --home <path>`.'),
+            'af2_home': None,
+            'cudnn_dir': cudnn_dir,
+        }
+
+    if cudnn_dir:
+        # The whole point of discovery: a shared copy means this user does
+        # not download 700 MB of bytes that already exist on the filesystem.
+        steps.append({'action': 'reuse_cudnn',
+                      'detail': f'reuse existing cuDNN override at {cudnn_dir}'})
+    else:
+        if not discovery.get('writable_home'):
+            return {'steps': [], 'blocked': 'Home directory is not writable.',
+                    'af2_home': af2_home, 'cudnn_dir': None}
+        cudnn_dir = f'{cudnn_target}/nvidia/cudnn/lib'
+        steps.append({
+            'action': 'install_cudnn',
+            'detail': (f'download {CUDNN_PACKAGE} (~700 MB) to {cudnn_target} '
+                       '— no shared copy found'),
+        })
+
+    current = discovery.get('wrapper_version')
+    if current is None:
+        steps.append({'action': 'write_wrapper',
+                      'detail': f'create wrappers in {wrapper_dir}'})
+    elif current < WRAPPER_VERSION:
+        steps.append({
+            'action': 'write_wrapper',
+            'detail': (f'update wrappers in {wrapper_dir} '
+                       f'(v{current} -> v{WRAPPER_VERSION})'),
+        })
+
+    return {'steps': steps, 'blocked': None,
+            'af2_home': af2_home, 'cudnn_dir': cudnn_dir}
+
+
 def probe_af2(conn: Connection,
               af2_home: Optional[str] = None,
               cudnn_dir: Optional[str] = None,
@@ -325,3 +515,81 @@ def probe_af2(conn: Connection,
     except Exception:
         stdout = ''
     return _parse_af2_probe(stdout)
+
+
+def _write_remote_file(conn: Connection, path: str, content: str,
+                       executable: bool = False):
+    """Write a file remotely without quoting hazards.
+
+    The content is base64'd rather than heredoc'd: the wrapper contains
+    single quotes, backslashes and `$@`, all of which are painful to pass
+    through a shell safely. Base64's alphabet is inert inside single quotes.
+    """
+    payload = base64.b64encode(content.encode()).decode()
+    cmd = f"printf '%s' '{payload}' | base64 -d > {path}"
+    if executable:
+        cmd += f" && chmod +x {path}"
+    result = conn.run(cmd, hide=True, warn=True, timeout=60)
+    if not result.ok:
+        raise RuntimeError(f"could not write {path}: "
+                           f"{(result.stderr or '').strip()[:200]}")
+
+
+def apply_af2_setup(conn: Connection, plan: Dict,
+                    wrapper_dir: str = "$HOME/bin",
+                    cudnn_target: str = "$HOME/cudnn89",
+                    on_step: Optional[Callable[[str], None]] = None
+                    ) -> List[Dict]:
+    """Execute a plan from plan_af2_setup. Returns one result per step.
+
+    Every action is additive and confined to the user's home: nothing is
+    deleted, no system path is touched, and sudo is never used. Failures are
+    reported per step rather than raised, so a partial setup still explains
+    what landed.
+    """
+    results = []
+
+    def note(message: str):
+        if on_step:
+            on_step(message)
+
+    for step in plan.get('steps', []):
+        action = step['action']
+        try:
+            if action == 'reuse_cudnn':
+                note(step['detail'])
+                results.append({**step, 'ok': True, 'message': 'reused'})
+
+            elif action == 'install_cudnn':
+                note(step['detail'])
+                py = f"{plan['af2_home']}/colabfold-conda/bin/python3.10"
+                # --no-deps: the env already carries cuBLAS/cuFFT/cuSOLVER
+                # for CUDA 11; only cuDNN is the wrong version.
+                cmd = (f'PYTHONNOUSERSITE=1 "{py}" -m pip install '
+                       f'--no-cache-dir --no-deps --target {cudnn_target} '
+                       f'{CUDNN_PACKAGE}')
+                result = conn.run(cmd, hide=True, warn=True, timeout=1800)
+                results.append({**step, 'ok': result.ok,
+                                'message': 'installed' if result.ok
+                                else (result.stderr or '').strip()[:200]})
+
+            elif action == 'write_wrapper':
+                note(step['detail'])
+                conn.run(f'mkdir -p {wrapper_dir}', hide=True, warn=True,
+                         timeout=30)
+                written = []
+                for entry in WRAPPER_ENTRY_POINTS:
+                    script = render_wrapper(plan['af2_home'],
+                                            plan['cudnn_dir'], entry)
+                    _write_remote_file(conn, f'{wrapper_dir}/{entry}', script,
+                                       executable=True)
+                    written.append(entry)
+                results.append({**step, 'ok': True,
+                                'message': f"wrote {', '.join(written)}"})
+            else:
+                results.append({**step, 'ok': False,
+                                'message': f'unknown action {action}'})
+        except Exception as exc:
+            results.append({**step, 'ok': False, 'message': str(exc)[:200]})
+
+    return results

@@ -170,6 +170,7 @@ The remote is shared. Be a considerate neighbor:
 Preflight   beak config show          # current config
             beak doctor --json        # {ok, tools, databases, disk, pfam}; nonzero exit if not ok
             beak doctor --af2 --json  # adds {af2}; slow (imports JAX), own af2.ok
+            beak setup af2 [--status|--dry-run] [--home P] [--cudnn-dir P]
 
 Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|broad|twilight]
             beak taxonomy <fa> --db <alias> [--name N]
@@ -223,6 +224,18 @@ JAX cannot load a new enough cuDNN it warns once and runs every prediction on
 CPU. The probe reports `af2.ok` separately and never changes the top-level
 `ok`, so existing preflight gating is unaffected. Each reported issue carries
 its own remedy.
+
+`beak setup af2` makes that install reproducible for a second user. It
+discovers an existing localcolabfold and cuDNN override rather than assuming
+one layout, and **reuses a shared cuDNN copy when it finds one** — the
+override is ~700 MB, so a per-user copy on a ten-user box is 7 GB of
+identical bytes. It then writes per-user wrapper scripts carrying the three
+environment fixes AF2 needs. Everything it does is additive, confined to
+`$HOME`, and never uses sudo. `--status` and `--dry-run` inspect without
+changing anything; re-running is a no-op once wrappers are current.
+
+Point several users at one copy by setting `[af2] cudnn_dir` in
+`~/.beak/config.toml`, or by passing `--cudnn-dir`.
 
 Every agent-relevant command now takes `--json`: `doctor` (preflight), the four
 submit commands (with `--wait` / `--dry-run` / `--reuse`), `status`, `jobs`,
