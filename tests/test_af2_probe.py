@@ -7,8 +7,10 @@ tests in test_cli.py.
 import pytest
 
 from beak.remote.af2 import (
+    _PRESENCE,
     _build_discovery_script,
     _build_probe_script,
+    _parse_af2_presence,
     _parse_af2_probe,
     plan_af2_setup,
     render_wrapper,
@@ -228,6 +230,38 @@ class TestShrZionRegression:
         report = _parse_af2_probe(probe_output(**repaired))
         assert report['ok'] is True
         assert report['issues'] == []
+
+
+class TestPresenceProbe:
+    """The cheap probe behind the doctor tools table."""
+
+    def test_reports_found_with_version(self):
+        report = _parse_af2_presence(probe_output(
+            binary='/home/u/bin/colabfold_batch', version='1.5.5'))
+        assert report['found'] is True
+        assert report['version'] == '1.5.5'
+        assert report['binary'] == '/home/u/bin/colabfold_batch'
+
+    def test_absent_install_reports_not_found(self):
+        report = _parse_af2_presence(probe_output(binary='-', version='-'))
+        assert report['found'] is False
+        assert report['version'] is None
+
+    def test_missing_version_still_counts_as_found(self):
+        """A binary with unreadable dist-info is installed, just unlabelled."""
+        report = _parse_af2_presence(probe_output(
+            binary='/opt/cf/bin/colabfold_batch', version='-'))
+        assert report['found'] is True
+        assert report['version'] is None
+
+    def test_failed_probe_degrades_to_not_found(self):
+        assert _parse_af2_presence('')['found'] is False
+
+    def test_presence_probe_never_starts_the_interpreter(self):
+        """It must stay cheap: importing JAX would tax every doctor run."""
+        assert '--help' not in _PRESENCE
+        assert 'import jax' not in _PRESENCE
+        assert 'python' not in _PRESENCE.replace('python3.*', '')
 
 
 class TestParsingRobustness:
