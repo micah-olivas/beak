@@ -162,10 +162,16 @@ def doctor(ctx, json_local, check_af2):
                     _mark(af2['cudnn_libs'] == EXPECTED_CUDNN_LIBS,
                           warn_only=True),
                     f"{af2['cudnn_libs']}/{EXPECTED_CUDNN_LIBS} libraries")
+                # VRAM is the binding constraint on what will fit, so show
+                # it: ColabFold oversubscribes ~4x into host RAM, which
+                # stretches a small card but does not remove the limit.
+                gpu_detail = f"{af2['gpu_free']} free of {af2['gpu_total']}"
+                if af2['gpu_mem_mb']:
+                    gb = af2['gpu_mem_mb'] / 1024
+                    gpu_detail += (f" · {gb:.0f} GB VRAM "
+                                   f"(~{gb * 4:.0f} GB with unified memory)")
                 af2_table.add_row("GPUs", _mark(af2['gpu_free'] > 0,
-                                                warn_only=True),
-                                  f"{af2['gpu_free']} free of "
-                                  f"{af2['gpu_total']}")
+                                                warn_only=True), gpu_detail)
                 # Both readings matter: `bare` is what an unconfigured caller
                 # gets, `override` is the ceiling. Equal and gpu = healthy.
                 bare = af2['backend_bare'] or 'unknown'

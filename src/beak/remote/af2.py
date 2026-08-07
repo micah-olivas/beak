@@ -106,8 +106,11 @@ fi
 if command -v nvidia-smi >/dev/null 2>&1; then
   printf 'gpu_total\t%s\n' "$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
   printf 'gpu_free\t%s\n' "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '$1 < 500' | wc -l | tr -d ' ')"
+  # Smallest card, not the largest: VRAM is the binding constraint on what
+  # will fit, and a job can land on any of them.
+  printf 'gpu_mem_mb\t%s\n' "$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | sort -n | head -1 | tr -d ' ')"
 else
-  printf 'gpu_total\t0\ngpu_free\t0\n'
+  printf 'gpu_total\t0\ngpu_free\t0\ngpu_mem_mb\t0\n'
 fi
 '''
 
@@ -202,6 +205,7 @@ def _parse_af2_probe(stdout: str) -> Dict:
         'cudnn_libs': _int('cudnn_libs'),
         'gpu_total': _int('gpu_total'),
         'gpu_free': _int('gpu_free'),
+        'gpu_mem_mb': _int('gpu_mem_mb'),
         'backend_bare': _str('backend_bare'),
         'backend_override': _str('backend_override'),
         'issues': [],
@@ -330,7 +334,9 @@ CUDNN_PACKAGE = "nvidia-cudnn-cu11==8.9.6.50"
 
 # Bumped when the wrapper's content changes, so setup can tell an outdated
 # wrapper from a current one instead of silently leaving a stale file.
-WRAPPER_VERSION = 1
+# v2: stopped forcing XLA_PYTHON_CLIENT_PREALLOCATE=false, which fought
+#     ColabFold's unified-memory oversubscription (see the template).
+WRAPPER_VERSION = 2
 WRAPPER_ENTRY_POINTS = ["colabfold_batch", "colabfold_search"]
 
 _WRAPPER_TEMPLATE = r'''#!/usr/bin/env bash
@@ -349,8 +355,13 @@ fi
 # silently overrides the env's pinned one and breaks the ABI ml_dtypes was
 # compiled against.
 export PYTHONNOUSERSITE=1
-# Never reserve ~75% of a shared card just by starting up.
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# Deliberately NOT setting XLA_PYTHON_CLIENT_PREALLOCATE here. ColabFold
+# sets TF_FORCE_UNIFIED_MEMORY=1 and XLA_PYTHON_CLIENT_MEM_FRACTION=4.0
+# itself, asking JAX for ~4x the card's memory and spilling the excess into
+# host RAM. That oversubscription is what lets a long sequence run at all on
+# a small GPU, and disabling preallocation undercuts it. Being a polite
+# neighbour is the health probe's job, not a real prediction's.
+# Pass --disable-unified-memory to colabfold_batch if JAX errors instead.
 exec "@AF2_HOME@/colabfold-conda/bin/@ENTRY@" "$@"
 '''
 

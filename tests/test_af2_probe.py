@@ -38,6 +38,7 @@ HEALTHY = dict(
     cudnn_libs=EXPECTED_CUDNN_LIBS,
     gpu_total=2,
     gpu_free=2,
+    gpu_mem_mb=11264,
     backend_bare='gpu',
     backend_override='gpu',
 )
@@ -277,11 +278,23 @@ class TestProbeScript:
 
 
 class TestWrapperRendering:
-    def test_wrapper_exports_all_three_fixes(self):
+    def test_wrapper_exports_the_two_required_fixes(self):
         script = render_wrapper('/opt/cf', '/opt/cudnn', 'colabfold_batch')
         assert 'PYTHONNOUSERSITE=1' in script
         assert 'LD_PRELOAD' in script
-        assert 'XLA_PYTHON_CLIENT_PREALLOCATE=false' in script
+
+    def test_wrapper_does_not_disable_preallocation(self):
+        """ColabFold oversubscribes GPU memory on purpose; don't undercut it.
+
+        batch.py sets TF_FORCE_UNIFIED_MEMORY=1 and MEM_FRACTION=4.0, asking
+        JAX for ~4x the card and spilling into host RAM. That is what lets a
+        long sequence run on a small GPU, so forcing PREALLOCATE=false in the
+        wrapper would cap maximum sequence length. The health probe still
+        sets it — a diagnostic must stay polite; a real prediction must not
+        be crippled.
+        """
+        script = render_wrapper('/opt/cf', '/opt/cudnn', 'colabfold_batch')
+        assert 'export XLA_PYTHON_CLIENT_PREALLOCATE' not in script
 
     def test_wrapper_uses_preload_not_library_path(self):
         """LD_LIBRARY_PATH cannot work here: RPATH is searched first."""
