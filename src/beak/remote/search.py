@@ -41,6 +41,11 @@ class MMseqsSearch(RemoteJobManager):
         'rnacentral': 'rnacentral_active_seq_id_90_cov_80_linclust.fasta',
     }
 
+    # Nucleotide rather than protein sequences. Split out so `doctor` can
+    # group them separately — searching a protein target against these
+    # needs translated search, not the usual protein-vs-protein path.
+    NUCLEOTIDE_DBS = frozenset({'nt_rna', 'rfam', 'rnacentral'})
+
     # Each preset targets a specific homolog-set use case for BEAK's
     # downstream alignment + conservation chain. Sensitivity floors and
     # iteration counts are chosen against the SCOPe ROC1 benchmark in

@@ -20,7 +20,8 @@ def main(ctx, json_mode):
 @click.pass_context
 def doctor(ctx, json_local):
     """Check remote server for required tools and databases"""
-    from .theme import get_console, BEAK_BLUE
+    from .theme import (get_console, BEAK_BLUE, CATEGORY_STYLES,
+                        CATEGORY_LABELS)
     from ._common import get_manager, get_remote_file_age, json_mode, emit_json
     from ..remote.hmmer import resolve_pfam_path, PFAM_HMM_FILE
     from rich.table import Table
@@ -55,63 +56,102 @@ def doctor(ctx, json_local):
     console.print(f"\n[brand]BEAK Doctor[/brand]")
     console.print(f"[dim]Remote: {mgr.conn.host}[/dim]\n")
 
+    def section_row(table, category):
+        """Category heading row. Rich has no colspan, so the label sits in
+        the first column and the rest of the row stays empty."""
+        label = CATEGORY_LABELS.get(category, category.title())
+        table.add_section()
+        table.add_row(f"[cat.{category}]{label}[/cat.{category}]",
+                      *[""] * (len(table.columns) - 1))
+
+    def grouped(items, category_of):
+        """Yield (category, items) in CATEGORY_STYLES order, skipping empty
+        groups and appending any category the palette doesn't know about."""
+        buckets = {}
+        for key, info in items:
+            buckets.setdefault(category_of(info), []).append((key, info))
+        ordered = [c for c in CATEGORY_STYLES if c in buckets]
+        ordered += [c for c in buckets if c not in CATEGORY_STYLES]
+        return [(c, buckets[c]) for c in ordered]
+
     tools_table = Table(title="Tools", border_style=BEAK_BLUE, show_lines=False)
     tools_table.add_column("Tool", style="bold")
     tools_table.add_column("Status")
     tools_table.add_column("Version", style="dim")
     tools_table.add_column("Needed By", style="dim")
 
-    for tool, info in results['tools'].items():
-        if info['found']:
-            status = "[green]OK[/green]"
-            version = info.get('version', '') or ''
-        elif info['required']:
-            status = "[red]MISSING[/red]"
-            version = info.get('install', '')
-        else:
-            status = "[dim]--[/dim]"
-            version = ''
-        tools_table.add_row(tool, status, version[:50], info['needed_by'])
+    for category, tools in grouped(results['tools'].items(),
+                                   lambda i: i.get('category', 'other')):
+        section_row(tools_table, category)
+        for tool, info in tools:
+            if info['found']:
+                status = "[green]OK[/green]"
+                version = info.get('version', '') or ''
+            elif info['required']:
+                status = "[red]MISSING[/red]"
+                version = info.get('install', '')
+            else:
+                status = "[dim]--[/dim]"
+                version = ''
+            tools_table.add_row(f"  {tool}", status, version[:50],
+                                info['needed_by'])
 
     console.print(tools_table)
     console.print()
 
+    db_info = results.get('databases', {})
+    entries = db_info.get('entries', {})
+
     db_table = Table(title="Databases", border_style=BEAK_BLUE, show_lines=False)
     db_table.add_column("Database", style="bold")
     db_table.add_column("Status")
-    db_table.add_column("Age")
-    db_table.add_column("Path", style="dim")
+    db_table.add_column("Notes", style="dim")
+    db_table.add_column("File", style="dim")
 
-    db_info = results.get('databases', {})
-    if db_info.get('exists'):
-        db_count = db_info.get('count', 0)
-        db_table.add_row(
-            f"MMseqs2 ({db_count} dbs)",
-            "[green]OK[/green]",
-            "[dim]--[/dim]",
-            db_info['path'],
-        )
-    else:
-        db_table.add_row(
-            "MMseqs2",
-            "[red]MISSING[/red]",
-            "[dim]--[/dim]",
-            "[dim]directory not found[/dim]",
-        )
+    # Sequence databases, grouped by molecule type. An absent database is
+    # rendered dim rather than red — most sites install a subset, so missing
+    # is normal here and does not flip the overall `ok`.
+    for category, group in grouped(
+            sorted(entries.items()),
+            lambda i: f"sequence.{i.get('molecule', 'protein')}"):
+        section_row(db_table, category)
+        for alias, info in group:
+            db_table.add_row(
+                f"  {alias}",
+                "[green]OK[/green]" if info['found'] else "[dim]--[/dim]",
+                "taxonomy" if info.get('has_taxonomy') else "",
+                info['name'],
+            )
 
+    if not entries and not db_info.get('exists'):
+        section_row(db_table, "sequence.protein")
+        db_table.add_row("  MMseqs2", "[red]MISSING[/red]", "",
+                         "[dim]directory not found[/dim]")
+
+    section_row(db_table, "profile")
     try:
         pfam_path = resolve_pfam_path(mgr.conn)
         age_str = get_remote_file_age(mgr.conn, f"{pfam_path}/{PFAM_HMM_FILE}")
-        db_table.add_row("Pfam-A", "[green]OK[/green]", age_str, pfam_path)
+        db_table.add_row("  Pfam-A", "[green]OK[/green]", age_str, pfam_path)
     except FileNotFoundError:
         db_table.add_row(
-            "Pfam-A",
+            "  Pfam-A",
             "[dim]--[/dim]",
-            "[dim]--[/dim]",
+            "",
             "[dim]not installed (beak setup pfam)[/dim]",
         )
 
     console.print(db_table)
+    if entries:
+        n_found = sum(1 for e in entries.values() if e['found'])
+        # highlight=False: the default highlighter would repaint the counts
+        # and the path, which fights the dim-footnote role of this line.
+        console.print(
+            f"[dim]{n_found} of {len(entries)} known sequence databases "
+            f"under {db_info.get('path', '?')} · "
+            f"`beak databases` for sizes[/dim]",
+            highlight=False,
+        )
 
     disk = results.get('disk', {})
     if disk:

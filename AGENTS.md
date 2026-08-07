@@ -11,23 +11,23 @@ supported path until it lands.
 
 ## Environment
 
-BEAK runs from a project-local virtualenv at `.venv/`. There is no activation
-step for an agent — invoke the interpreter and CLI by path so every call uses
-the right environment regardless of shell state:
+BEAK develops with [uv](https://docs.astral.sh/uv/), which manages a
+project-local virtualenv at `.venv/` (Python 3.11, pinned in `.python-version`).
+There is no activation step for an agent — prefix commands with `uv run` so every
+call uses the project venv regardless of shell state:
 
 ```bash
-# One-time setup (Python >= 3.8; 3.11 recommended)
-python3.11 -m venv .venv
-./.venv/bin/pip install -e ".[dev]"
+# One-time setup — creates .venv/ and installs beak editable + dev deps
+uv sync --extra dev
 
-# Thereafter, always invoke by path — never bare `python`/`beak`, which may
+# Thereafter, prefix with `uv run` — never bare `python`/`beak`, which may
 # resolve to an unrelated system or conda interpreter:
-./.venv/bin/beak doctor
-./.venv/bin/python -m pytest tests/ -q
+uv run beak doctor
+uv run pytest tests/ -q
 ```
 
-Do not rely on `conda activate` or a globally-installed `beak`; the `.venv`
-paths above are the supported entry points.
+Do not rely on `conda activate` or a globally-installed `beak`. `uv run` (or the
+`./.venv/bin/beak` path it manages) is the supported entry point.
 
 ## The loop (machine mode)
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from beak.cli import main, cli_entry
-from beak.remote.base import _parse_load_probe
+from beak.remote.base import _parse_load_probe, _parse_db_probe
 
 
 @pytest.fixture
@@ -371,23 +371,172 @@ class TestLoadProbeParsing:
         assert _parse_load_probe("not a number", "abc", "x y", "bad,csv") == {}
 
 
+class TestParseDbProbe:
+    """probe_databases()'s pure parsing half."""
+
+    def test_parses_flags(self):
+        out = _parse_db_probe("uniref90\t1\t1\nbfd\t1\t0\nrfam\t0\t0\n")
+        assert out['uniref90'] == {'found': True, 'has_taxonomy': True}
+        assert out['bfd'] == {'found': True, 'has_taxonomy': False}
+        assert out['rfam'] == {'found': False, 'has_taxonomy': False}
+
+    def test_malformed_rows_are_skipped_not_guessed(self):
+        # A truncated row must not read as "found" — silence is not presence.
+        out = _parse_db_probe("uniref90\t1\nbfd\t1\t0\n\n\t1\t1\ngarbage\n")
+        assert set(out) == {'bfd'}
+
+    def test_empty_output(self):
+        assert _parse_db_probe("") == {} and _parse_db_probe(None) == {}
+
+
+class _ProbeConn:
+    """Records commands so we can assert the probe is one round trip."""
+
+    host = 'srv.example'
+
+    def __init__(self, stdout='', ok=True):
+        self.stdout = stdout
+        self.ok = ok
+        self.commands = []
+
+    def run(self, cmd, **kwargs):
+        self.commands.append(cmd)
+        return self
+
+
+class TestProbeDatabases:
+    def _mgr(self, conn):
+        from beak.remote.search import MMseqsSearch
+        mgr = MMseqsSearch(connection=conn)
+        # The constructor resolves $HOME and mkdirs the job dir; drop those so
+        # `commands` contains only what probe_databases() issues.
+        conn.commands.clear()
+        return mgr
+
+    def test_single_round_trip_for_all_aliases(self):
+        conn = _ProbeConn("uniref90\t1\t1\n")
+        entries = self._mgr(conn).probe_databases()
+        assert len(conn.commands) == 1                 # not one SSH call per db
+        assert len(entries) == 12                      # every alias reported
+        assert entries['uniref90']['found'] is True
+        assert entries['uniref90']['has_taxonomy'] is True
+
+    def test_unprobed_aliases_default_to_absent(self):
+        entries = self._mgr(_ProbeConn("uniref90\t1\t1\n")).probe_databases()
+        assert entries['bfd']['found'] is False
+
+    def test_failed_probe_reports_nothing_as_found(self):
+        entries = self._mgr(_ProbeConn("uniref90\t1\t1\n", ok=False)).probe_databases()
+        assert not any(e['found'] for e in entries.values())
+
+    def test_molecule_classification(self):
+        entries = self._mgr(_ProbeConn()).probe_databases()
+        assert entries['uniref90']['molecule'] == 'protein'
+        assert entries['rfam']['molecule'] == 'nucleotide'
+        assert entries['rnacentral']['molecule'] == 'nucleotide'
+
+    def test_no_du_in_probe(self):
+        # Sizing walks multi-terabyte db dirs; `beak databases` owns that cost.
+        conn = _ProbeConn()
+        self._mgr(conn).probe_databases()
+        assert 'du ' not in conn.commands[0]
+
+
 class _DoctorConn:
     host = 'srv.example'
 
 
+def _db_entries():
+    return {
+        'uniref90': {'name': 'UniRef90', 'path': '/srv/db/UniRef90',
+                     'found': True, 'has_taxonomy': True, 'molecule': 'protein'},
+        'bfd': {'name': 'bfd.fasta', 'path': '/srv/db/bfd.fasta',
+                'found': False, 'has_taxonomy': False, 'molecule': 'protein'},
+        'rfam': {'name': 'rfam.fasta', 'path': '/srv/db/rfam.fasta',
+                 'found': True, 'has_taxonomy': False, 'molecule': 'nucleotide'},
+    }
+
+
 class _DoctorMgr:
-    def __init__(self, ok=True):
+    def __init__(self, ok=True, databases=None, tools=None):
         self._ok = ok
+        self._databases = databases if databases is not None else {}
+        self._tools = tools if tools is not None else {}
         self.conn = _DoctorConn()
 
     def verify_remote(self, verbose=False):
-        return {'ok': self._ok, 'tools': {}, 'databases': {}, 'disk': {},
+        return {'ok': self._ok, 'tools': self._tools,
+                'databases': self._databases,
+                'disk': {},
                 'load': {'load_1m': 0.8, 'n_cpus': 8, 'load_per_cpu': 0.1,
                          'mem_total_mb': 16000, 'mem_available_mb': 4000}}
 
 
 def _no_pfam(conn):
     raise FileNotFoundError()
+
+
+class TestDoctorDatabaseTable:
+    """`doctor` lists sequence databases, grouped and labelled by category."""
+
+    def _run(self, monkeypatch, databases):
+        monkeypatch.setattr('beak.cli._common.get_manager',
+                            lambda **k: _DoctorMgr(True, databases))
+        monkeypatch.setattr('beak.remote.hmmer.resolve_pfam_path', _no_pfam)
+        return _split_runner().invoke(main, ['doctor'])
+
+    def test_lists_each_database_under_its_category(self, monkeypatch):
+        db = {'path': '/srv/db', 'exists': True, 'count': 9, 'names': [],
+              'entries': _db_entries(), 'known_found': 2}
+        res = self._run(monkeypatch, db)
+        assert res.exit_code == 0
+        out = res.output
+        # Every alias is named, not collapsed into an "(N dbs)" summary.
+        for alias in ('uniref90', 'bfd', 'rfam'):
+            assert alias in out
+        assert 'Sequence · protein' in out
+        assert 'Sequence · nucleotide' in out
+        assert 'Profile · HMM' in out
+        # Nucleotide dbs group after the protein ones, not interleaved.
+        assert out.index('uniref90') < out.index('Sequence · nucleotide')
+        assert out.index('Sequence · nucleotide') < out.index('rfam')
+
+    def test_taxonomy_capability_is_marked(self, monkeypatch):
+        db = {'path': '/srv/db', 'exists': True, 'entries': _db_entries()}
+        assert 'taxonomy' in self._run(monkeypatch, db).output
+
+    def test_footer_counts_present_databases(self, monkeypatch):
+        db = {'path': '/srv/db', 'exists': True, 'entries': _db_entries()}
+        assert '2 of 3 known sequence databases' in self._run(monkeypatch, db).output
+
+    def test_missing_directory_still_reports(self, monkeypatch):
+        res = self._run(monkeypatch, {'path': '/srv/db', 'exists': False,
+                                      'entries': {}})
+        assert res.exit_code == 0
+        assert 'MISSING' in res.output
+
+    def test_tools_are_grouped_by_category(self, monkeypatch):
+        tools = {
+            'mmseqs': {'found': True, 'required': True, 'version': '15',
+                       'needed_by': 'search', 'install': '', 'category': 'search'},
+            'mafft': {'found': True, 'required': False, 'version': '7.5',
+                      'needed_by': 'align', 'install': '', 'category': 'align'},
+        }
+        monkeypatch.setattr('beak.cli._common.get_manager',
+                            lambda **k: _DoctorMgr(True, {}, tools))
+        monkeypatch.setattr('beak.remote.hmmer.resolve_pfam_path', _no_pfam)
+        out = _split_runner().invoke(main, ['doctor']).output
+        assert 'Search' in out and 'Alignment' in out
+        assert out.index('mmseqs') < out.index('Alignment')
+
+    def test_uncategorized_tool_is_not_dropped(self, monkeypatch):
+        tools = {'weirdtool': {'found': True, 'required': False, 'version': '1',
+                               'needed_by': 'mystery', 'install': ''}}
+        monkeypatch.setattr('beak.cli._common.get_manager',
+                            lambda **k: _DoctorMgr(True, {}, tools))
+        monkeypatch.setattr('beak.remote.hmmer.resolve_pfam_path', _no_pfam)
+        out = _split_runner().invoke(main, ['doctor']).output
+        assert 'weirdtool' in out and 'Other' in out
 
 
 class TestDoctorJson:
@@ -400,6 +549,20 @@ class TestDoctorJson:
         assert obj['ok'] is True
         assert obj['load']['load_per_cpu'] == 0.1
         assert obj['pfam'] == {'installed': False, 'path': None}
+
+    def test_exposes_per_database_entries(self, monkeypatch):
+        db = {'path': '/srv/db', 'exists': True, 'entries': _db_entries(),
+              'known_found': 2}
+        monkeypatch.setattr('beak.cli._common.get_manager',
+                            lambda **k: _DoctorMgr(True, db))
+        monkeypatch.setattr('beak.remote.hmmer.resolve_pfam_path', _no_pfam)
+        obj = json.loads(_split_runner().invoke(
+            main, ['doctor', '--json']).stdout.strip())
+        entries = obj['databases']['entries']
+        assert entries['uniref90']['found'] is True
+        assert entries['uniref90']['has_taxonomy'] is True
+        assert entries['bfd']['found'] is False
+        assert entries['rfam']['molecule'] == 'nucleotide'
 
     def test_exit_nonzero_when_not_ok(self, monkeypatch):
         monkeypatch.setattr('beak.cli._common.get_manager', lambda **k: _DoctorMgr(False))

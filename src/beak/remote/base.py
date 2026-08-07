@@ -89,6 +89,26 @@ def _parse_load_probe(loadavg_out, nproc_out, mem_out, gpu_out):
     return load
 
 
+def _parse_db_probe(stdout: str) -> Dict[str, Dict]:
+    """Parse the tab-separated database probe emitted by probe_databases().
+
+    Expects one `<alias>\\t<found>\\t<has_taxonomy>` row per alias, where the
+    two flags are "1"/"0". Pure (no I/O) so it is unit-testable. A malformed
+    row is skipped rather than guessed at — a missing alias reads as "not
+    probed" downstream, which is safer than reporting a database as present.
+    """
+    entries = {}
+    for line in (stdout or '').splitlines():
+        fields = line.strip().split('\t')
+        if len(fields) != 3:
+            continue
+        alias, found, has_tax = fields
+        if not alias:
+            continue
+        entries[alias] = {'found': found == '1', 'has_taxonomy': has_tax == '1'}
+    return entries
+
+
 class RemoteJobManager:
     """Base class for remote job management.
 
@@ -97,6 +117,8 @@ class RemoteJobManager:
         LOG_FILE: str - name of the log file (e.g., 'mmseqs.log')
         LOG_OPERATIONS: list - keyword/label pairs for progress parsing
         AVAILABLE_DBS: dict - database alias -> filename mapping (optional)
+        NUCLEOTIDE_DBS: frozenset - aliases in AVAILABLE_DBS holding
+            nucleotide rather than protein sequences (optional)
     """
 
     # Subclass overrides
@@ -104,6 +126,7 @@ class RemoteJobManager:
     LOG_FILE = 'job.log'
     LOG_OPERATIONS = []
     AVAILABLE_DBS = {}
+    NUCLEOTIDE_DBS = frozenset()
 
     LOCAL_PROJECTS_DIR = Path.home() / "beak_projects"
     DB_BASE_PATH = "/srv/protein_sequence_databases"
@@ -218,6 +241,24 @@ class RemoteJobManager:
         'hmmpress': {'needed_by': 'pfam (database setup)', 'install': 'http://hmmer.org/'},
     }
 
+    # Tool → functional category, used to group the `doctor` table. Lives next
+    # to the tool tables so a new tool gets categorized at the same time it
+    # gets a version probe. Anything unlisted falls back to 'other' rather
+    # than being dropped from the report.
+    TOOL_CATEGORIES = {
+        'mmseqs':   'search',
+        'clustalo': 'align',
+        'mafft':    'align',
+        'muscle':   'align',
+        'iqtree2':  'tree',
+        'iqtree':   'tree',
+        'hmmscan':  'profile',
+        'hmmpress': 'profile',
+        'docker':   'embeddings',
+        'python3':  'utility',
+        'seqkit':   'utility',
+    }
+
     # Per-tool version probes: (shell command, regex with one capture group).
     # Several of these tools either don't accept `--version` (muscle, hmmscan,
     # hmmpress) or print a banner instead of a clean version string (mmseqs,
@@ -284,6 +325,63 @@ class RemoteJobManager:
             version = version[:7]
         return version
 
+    def _db_entry_skeleton(self) -> Dict[str, Dict]:
+        """Every known database alias, resolved to a path, assumed absent.
+
+        The pessimistic default matters: callers that can't probe (no
+        database directory at all) still get a complete, correctly
+        categorized listing instead of an empty one.
+        """
+        return {
+            alias: {
+                'name': name,
+                'path': f"{self.DB_BASE_PATH}/{name}",
+                'found': False,
+                'has_taxonomy': False,
+                # MMseqs2 taxonomy needs a `<db>_taxonomy` sidecar, so
+                # taxonomy-capability is a property of the sequence db
+                # rather than a separate category of database.
+                'molecule': ('nucleotide' if alias in self.NUCLEOTIDE_DBS
+                             else 'protein'),
+            }
+            for alias, name in self.AVAILABLE_DBS.items()
+        }
+
+    def probe_databases(self) -> Dict[str, Dict]:
+        """Resolve every alias in AVAILABLE_DBS against the remote filesystem.
+
+        One SSH round trip for the whole alias list, and deliberately no
+        `du -sh`: sizing a multi-terabyte MMseqs2 database directory means
+        walking it, which is why `beak databases` (which does pay that cost)
+        is a separate command and `doctor` stays fast.
+
+        Returns {alias: {name, path, found, has_taxonomy, molecule}}. Every
+        alias is present in the result; `found` is False for both "absent"
+        and "probe failed", so a caller never mistakes silence for presence.
+        """
+        import shlex
+
+        entries = self._db_entry_skeleton()
+        if not entries:
+            return entries
+
+        probes = []
+        for alias, info in entries.items():
+            db = shlex.quote(info['path'])
+            tax = shlex.quote(f"{info['path']}_taxonomy")
+            probes.append(
+                f"printf '%s\\t%s\\t%s\\n' {shlex.quote(alias)} "
+                f'"$([ -e {db} ] && echo 1 || echo 0)" '
+                f'"$([ -e {tax} ] && echo 1 || echo 0)"'
+            )
+
+        result = self.conn.run('; '.join(probes), hide=True, warn=True)
+        for alias, probed in _parse_db_probe(
+                result.stdout if result.ok else '').items():
+            if alias in entries:
+                entries[alias].update(probed)
+        return entries
+
     def verify_remote(self, verbose: bool = True) -> Dict:
         """
         Check which tools and databases are available on the remote server.
@@ -314,6 +412,7 @@ class RemoteJobManager:
                 'version': version or None,
                 'needed_by': info['needed_by'],
                 'install': info['install'],
+                'category': self.TOOL_CATEGORIES.get(tool, 'other'),
             }
 
             if verbose:
@@ -345,20 +444,33 @@ class RemoteJobManager:
                 hide=True, warn=True
             )
             db_names = [d for d in ls_result.stdout.strip().split('\n') if d]
+            entries = self.probe_databases()
             results['databases'] = {
                 'path': self.DB_BASE_PATH,
                 'exists': True,
+                # `count`/`names` are raw directory entries, truncated by the
+                # `head` above — an MMseqs2 db contributes several files
+                # (`.index`, `.dbtype`, `_h`, …), so this is NOT a count of
+                # usable databases. Use `entries` for that.
                 'count': len(db_names),
                 'names': db_names,
+                'entries': entries,
+                'known_found': sum(1 for e in entries.values() if e['found']),
             }
             if verbose:
-                print(f"  ✓ Database directory: {self.DB_BASE_PATH} ({len(db_names)} databases)")
+                print(f"  ✓ Database directory: {self.DB_BASE_PATH} "
+                      f"({results['databases']['known_found']} of "
+                      f"{len(entries)} known databases)")
         else:
             results['databases'] = {
                 'path': self.DB_BASE_PATH,
                 'exists': False,
                 'count': 0,
                 'names': [],
+                # No directory to probe — list the aliases as absent rather
+                # than reporting nothing at all.
+                'entries': self._db_entry_skeleton(),
+                'known_found': 0,
             }
             results['ok'] = False
             if verbose:
