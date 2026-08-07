@@ -28,6 +28,8 @@ HEALTHY = dict(
     stack_default='ok',
     stack_isolated='ok',
     binary_runs='ok',
+    wrapper_preload='yes',
+    wrapper_nousersite='yes',
     cudnn_libs=EXPECTED_CUDNN_LIBS,
     gpu_total=2,
     gpu_free=2,
@@ -64,8 +66,16 @@ class TestHealthyInstall:
             **{**HEALTHY, 'stack_default': 'fail',
                'numpy_default': '2.2.6', 'binary_runs': 'ok'}))
         assert report['ok'] is True
+        assert report['issues'] == []
+
+    def test_shadowing_warns_when_the_entry_point_does_not_isolate(self):
+        """Same state, but nothing guarantees it keeps working."""
+        report = _parse_af2_probe(probe_output(
+            **{**HEALTHY, 'stack_default': 'fail', 'numpy_default': '2.2.6',
+               'wrapper_nousersite': 'no'}))
+        assert report['ok'] is True
         assert levels(report) == {'warn'}
-        assert 'bare interpreter' in messages(report)
+        assert 'does not do it itself' in messages(report)
 
 
 class TestMissingInstall:
@@ -111,7 +121,8 @@ class TestEnvironmentHealth:
 
     def test_bare_conda_entry_point_warns_but_stays_ok(self):
         report = _parse_af2_probe(probe_output(
-            **{**HEALTHY, 'binary_source': 'install'}))
+            **{**HEALTHY, 'binary_source': 'install',
+               'wrapper_preload': 'no', 'wrapper_nousersite': 'no'}))
         assert report['ok'] is True
         assert levels(report) == {'warn'}
         assert 'bare conda entry point' in messages(report)
@@ -127,10 +138,23 @@ class TestGpuHealth:
     def test_gpu_only_via_override_warns_about_the_silent_fallback(self):
         """The exact silent-regression case: works, but only if configured."""
         report = _parse_af2_probe(probe_output(
-            **{**HEALTHY, 'backend_bare': 'cpu', 'backend_override': 'gpu'}))
+            **{**HEALTHY, 'backend_bare': 'cpu', 'backend_override': 'gpu',
+               'wrapper_preload': 'no'}))
         assert report['ok'] is True
         assert levels(report) == {'warn'}
         assert 'LD_PRELOAD' in messages(report) or 'override' in messages(report)
+
+    def test_that_warning_clears_once_the_wrapper_exports_the_override(self):
+        """A warning that can never be cleared is noise, not signal.
+
+        With the entry point exporting LD_PRELOAD itself, GPU-only-via-override
+        is a settled configuration rather than an outstanding problem.
+        """
+        report = _parse_af2_probe(probe_output(
+            **{**HEALTHY, 'backend_bare': 'cpu', 'backend_override': 'gpu',
+               'wrapper_preload': 'yes'}))
+        assert report['ok'] is True
+        assert report['issues'] == []
 
     def test_cpu_fallback_with_no_override_installed_is_an_error(self):
         # No override libraries at all, so the probe emits no
@@ -183,14 +207,21 @@ class TestShrZionRegression:
         assert 'no cuDNN override' in text       # silent CPU fallback
         assert '2.2.6' in text and '1.26.4' in text
 
-    def test_the_repaired_state_is_clean(self):
-        """Same box after the wrapper + cuDNN override: warnings only."""
+    def test_the_repaired_state_is_completely_clean(self):
+        """After the wrapper + cuDNN override, every issue must clear.
+
+        The bare interpreter is still shadowed and bare JAX still lands on
+        CPU — permanently. If those kept warning, the probe could never
+        reach a clean state on this machine and would train the reader to
+        ignore it.
+        """
         repaired = {**self.BROKEN, 'binary_source': 'wrapper',
                     'binary_runs': 'ok', 'cudnn_libs': EXPECTED_CUDNN_LIBS,
-                    'backend_bare': 'cpu', 'backend_override': 'gpu'}
+                    'backend_bare': 'cpu', 'backend_override': 'gpu',
+                    'wrapper_preload': 'yes', 'wrapper_nousersite': 'yes'}
         report = _parse_af2_probe(probe_output(**repaired))
         assert report['ok'] is True
-        assert levels(report) == {'warn'}
+        assert report['issues'] == []
 
 
 class TestParsingRobustness:

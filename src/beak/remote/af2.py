@@ -92,6 +92,16 @@ else
   printf 'binary_runs\t-\n'
 fi
 
+# Does the resolved entry point carry the environment fixes itself? A
+# wrapper that exports these makes the bare interpreter's state irrelevant,
+# which is what lets the corresponding warnings actually clear instead of
+# nagging forever on a correctly configured install.
+if [ -n "$BIN" ] && [ -f "$BIN" ]; then
+  HEAD=$(head -c 65536 "$BIN" 2>/dev/null)
+  printf 'wrapper_preload\t%s\n' "$(printf '%s' "$HEAD" | grep -q 'LD_PRELOAD' && echo yes || echo no)"
+  printf 'wrapper_nousersite\t%s\n' "$(printf '%s' "$HEAD" | grep -q 'PYTHONNOUSERSITE' && echo yes || echo no)"
+fi
+
 if command -v nvidia-smi >/dev/null 2>&1; then
   printf 'gpu_total\t%s\n' "$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
   printf 'gpu_free\t%s\n' "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '$1 < 500' | wc -l | tr -d ' ')"
@@ -173,6 +183,8 @@ def _parse_af2_probe(stdout: str) -> Dict:
         'stack_default': _str('stack_default'),
         'stack_isolated': _str('stack_isolated'),
         'binary_runs': _str('binary_runs'),
+        'wrapper_preload': _str('wrapper_preload'),
+        'wrapper_nousersite': _str('wrapper_nousersite'),
         'cudnn_libs': _int('cudnn_libs'),
         'gpu_total': _int('gpu_total'),
         'gpu_free': _int('gpu_free'),
@@ -218,14 +230,17 @@ def _parse_af2_probe(stdout: str) -> Dict:
               f'colabfold_batch fails to start{detail}',
               'Set PYTHONNOUSERSITE=1 — a ~/bin/colabfold_batch wrapper is '
               'the durable fix')
-    elif report['stack_default'] == 'fail':
-        # Runs, but only because the caller repairs the environment. Worth
-        # surfacing: anything invoking the bare interpreter still breaks.
+    elif (report['stack_default'] == 'fail'
+            and report['wrapper_nousersite'] != 'yes'):
+        # Runs today, but nothing in the entry point guarantees it keeps
+        # working — the caller happened to isolate user site-packages. Once
+        # the wrapper exports PYTHONNOUSERSITE itself this is settled, so the
+        # warning clears rather than nagging forever. The shadowed numpy
+        # versions stay visible as table detail either way.
         issue('warn',
               'runs only because the caller isolates user site-packages; the '
-              'bare interpreter is still shadowed',
-              'Keep invoking through the wrapper, or clear the offending '
-              '~/.local packages')
+              'entry point does not do it itself',
+              'Export PYTHONNOUSERSITE=1 from a ~/bin/colabfold_batch wrapper')
 
     # GPU health, only meaningful where a GPU actually exists and only
     # assessable when the deep probe ran.
@@ -244,15 +259,17 @@ def _parse_af2_probe(stdout: str) -> Dict:
                   "will be far slower",
                   'Check that the override libraries match what jaxlib was '
                   'built against')
-        elif override == 'gpu' and bare and bare != 'gpu':
+        elif (override == 'gpu' and bare and bare != 'gpu'
+                and report['wrapper_preload'] != 'yes'):
             # The silent-regression case: usable, but only if every caller
-            # remembers the override.
+            # remembers the override. An entry point that exports LD_PRELOAD
+            # itself has settled this, so the warning clears.
             issue('warn',
-                  'GPU works only with the cuDNN LD_PRELOAD override; without '
-                  f'it JAX falls back to {bare}',
-                  'Ensure the wrapper exports LD_PRELOAD with all 7 '
-                  'libcudnn*.so.8 (LD_LIBRARY_PATH cannot work: RPATH is '
-                  'searched first)')
+                  'GPU works only with the cuDNN LD_PRELOAD override, and the '
+                  f'entry point does not set it; bare JAX falls back to {bare}',
+                  'Export LD_PRELOAD with all 7 libcudnn*.so.8 from a '
+                  '~/bin/colabfold_batch wrapper (LD_LIBRARY_PATH cannot '
+                  'work: RPATH is searched first)')
         elif bare and bare != 'gpu' and not override:
             issue('error',
                   f"{report['gpu_total']} GPU present but JAX resolves to "
