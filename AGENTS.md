@@ -169,6 +169,7 @@ The remote is shared. Be a considerate neighbor:
 ```
 Preflight   beak config show          # current config
             beak doctor --json        # {ok, tools, databases, disk, pfam}; nonzero exit if not ok
+            beak doctor --af2 --json  # adds {af2}; slow (imports JAX), own af2.ok
 
 Submit      beak search <fa> --db <alias> [--name N] [--preset default|close|broad|twilight]
             beak taxonomy <fa> --db <alias> [--name N]
@@ -214,6 +215,14 @@ sees the failure. Commands that already emitted a result object (`status
 --json`, a failed `--wait`) just set the exit code and print nothing further.
 
 ## Machine-output coverage
+
+`beak doctor --af2` probes a remote AlphaFold2 / localcolabfold install. It is
+opt-in because it imports JAX (seconds, not milliseconds) to resolve the real
+backend — worth paying, because AF2's characteristic failure is silent: when
+JAX cannot load a new enough cuDNN it warns once and runs every prediction on
+CPU. The probe reports `af2.ok` separately and never changes the top-level
+`ok`, so existing preflight gating is unaffected. Each reported issue carries
+its own remedy.
 
 Every agent-relevant command now takes `--json`: `doctor` (preflight), the four
 submit commands (with `--wait` / `--dry-run` / `--reuse`), `status`, `jobs`,
