@@ -429,6 +429,29 @@ class RemoteJobManager:
             if required and not found:
                 results['ok'] = False
 
+        # ColabFold is probed separately: localcolabfold installs outside
+        # PATH, so the `command -v` probe every other tool uses would report a
+        # working install as missing. Presence and version only — the checks
+        # that need to run the binary (does it start, does JAX see the GPU)
+        # import JAX and cost seconds, so they stay behind `doctor --af2`.
+        from .af2 import probe_af2_presence
+        af2_presence = probe_af2_presence(self.conn)
+        results['tools']['colabfold'] = {
+            'found': af2_presence['found'],
+            'required': False,
+            'version': af2_presence['version'],
+            'needed_by': 'structure prediction (beak doctor --af2)',
+            'install': 'https://github.com/YoshitakaMo/localcolabfold',
+            'category': 'structure',
+        }
+        if verbose:
+            if af2_presence['found']:
+                ver = af2_presence['version'] or ''
+                print(f"  ✓ colabfold{f' ({ver})' if ver else ''}")
+            else:
+                print("  ○ colabfold — not found [optional, "
+                      "structure prediction]")
+
         # Check database directory
         if verbose:
             print()

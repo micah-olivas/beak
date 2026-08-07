@@ -528,6 +528,65 @@ def probe_af2(conn: Connection,
     return _parse_af2_probe(stdout)
 
 
+# Presence probe for the `doctor` tools table. Deliberately does NOT run the
+# binary: `colabfold_batch --help` imports JAX, which costs seconds that every
+# `beak doctor` run would pay. The version comes from the dist-info directory
+# name — one `ls`, no interpreter start. Everything that requires actually
+# executing something stays behind `doctor --af2`.
+_PRESENCE = r'''
+AF2_HOME="@AF2_HOME@"
+BIN=""
+if command -v colabfold_batch >/dev/null 2>&1; then
+  BIN=$(command -v colabfold_batch)
+elif [ -x "$HOME/bin/colabfold_batch" ]; then
+  BIN="$HOME/bin/colabfold_batch"
+elif [ -x "$AF2_HOME/colabfold-conda/bin/colabfold_batch" ]; then
+  BIN="$AF2_HOME/colabfold-conda/bin/colabfold_batch"
+fi
+printf 'binary\t%s\n' "${BIN:--}"
+V=$(ls -d "$AF2_HOME"/colabfold-conda/lib/python3.*/site-packages/colabfold-*.dist-info 2>/dev/null | head -1)
+V="${V##*/colabfold-}"; V="${V%.dist-info}"
+printf 'version\t%s\n' "${V:--}"
+'''
+
+
+def _parse_af2_presence(stdout: str) -> Dict:
+    """Pure parse of the presence probe: {found, binary, version}."""
+    raw = _parse_kv(stdout)
+
+    def _val(key):
+        v = raw.get(key)
+        return None if v in (None, '', '-') else v
+
+    binary = _val('binary')
+    return {'found': binary is not None, 'binary': binary,
+            'version': _val('version')}
+
+
+def probe_af2_presence(conn: Connection,
+                       af2_home: Optional[str] = None) -> Dict:
+    """Cheap existence + version check, safe to run on every `doctor` call.
+
+    ColabFold cannot use the standard `command -v` probe that every other
+    tool uses, because localcolabfold installs outside PATH — so a stock
+    probe reports a healthy install as missing.
+    """
+    if af2_home is None:
+        try:
+            from ..config import load_config
+            af2_home = load_config().get('af2', {}).get('home')
+        except Exception:
+            af2_home = None
+    af2_home = af2_home or DEFAULT_AF2_HOME
+
+    try:
+        result = conn.run(_PRESENCE.replace('@AF2_HOME@', af2_home),
+                          hide=True, warn=True, timeout=20)
+        return _parse_af2_presence(result.stdout or '')
+    except Exception:
+        return _parse_af2_presence('')
+
+
 def _write_remote_file(conn: Connection, path: str, content: str,
                        executable: bool = False):
     """Write a file remotely without quoting hazards.
