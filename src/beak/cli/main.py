@@ -17,17 +17,25 @@ def main(ctx, json_mode):
 @main.command()
 @click.option('--json', 'json_local', is_flag=True,
               help='Emit the environment report as a JSON object on stdout.')
+@click.option('--af2', 'check_af2', is_flag=True,
+              help='Also probe the AlphaFold2/ColabFold install. Slower '
+                   '(imports JAX to resolve the real backend). Reported '
+                   'under its own af2.ok; does not affect the top-level ok.')
 @click.pass_context
-def doctor(ctx, json_local):
+def doctor(ctx, json_local, check_af2):
     """Check remote server for required tools and databases"""
     from .theme import (get_console, BEAK_BLUE, CATEGORY_STYLES,
                         CATEGORY_LABELS)
     from ._common import get_manager, get_remote_file_age, json_mode, emit_json
     from ..remote.hmmer import resolve_pfam_path, PFAM_HMM_FILE
+    from ..remote.af2 import (probe_af2, EXPECTED_CUDNN_LIBS,
+                              MIN_WEIGHT_FILES)
     from rich.table import Table
 
     mgr = get_manager(job_type='search')
     results = mgr.verify_remote(verbose=False)
+
+    af2 = probe_af2(mgr.conn, deep=True) if check_af2 else None
 
     if json_mode(ctx, json_local):
         # Preflight payload: an agent gates submission on `ok` (and the
@@ -45,6 +53,8 @@ def doctor(ctx, json_local):
                                'path': resolve_pfam_path(mgr.conn)}
         except FileNotFoundError:
             payload['pfam'] = {'installed': False, 'path': None}
+        if af2 is not None:
+            payload['af2'] = af2
         emit_json(payload)
         # Bare exit code (not ctx.exit / ClickException) so behavior is
         # identical under CliRunner and the real console-script wrapper.
@@ -152,6 +162,78 @@ def doctor(ctx, json_local):
             f"`beak databases` for sizes[/dim]",
             highlight=False,
         )
+
+    if af2 is not None:
+        def _mark(good: bool, warn_only: bool = False) -> str:
+            if good:
+                return "[green]OK[/green]"
+            return "[yellow]WARN[/yellow]" if warn_only else "[red]FAIL[/red]"
+
+        af2_table = Table(title="AlphaFold2 / ColabFold",
+                          border_style=BEAK_BLUE, show_lines=False)
+        af2_table.add_column("Check", style="bold")
+        af2_table.add_column("Status")
+        af2_table.add_column("Detail", style="dim")
+
+        if not af2['installed']:
+            af2_table.add_row("colabfold_batch", "[dim]--[/dim]",
+                              "not found (see beak doctor --af2 help)")
+        else:
+            af2_table.add_row("colabfold_batch", _mark(True),
+                              f"{af2['binary']} [{af2['binary_source']}]")
+            af2_table.add_row("Weights",
+                              _mark(af2['weights'] >= MIN_WEIGHT_FILES),
+                              f"{af2['weights']} params files")
+
+            if not af2['numpy_isolated']:
+                np_detail = "could not import numpy"
+            elif (af2['numpy_default']
+                    and af2['numpy_default'] != af2['numpy_isolated']):
+                np_detail = (f"env numpy {af2['numpy_isolated']} shadowed by "
+                             f"user-site {af2['numpy_default']}")
+            else:
+                np_detail = f"numpy {af2['numpy_isolated']}"
+            af2_table.add_row("Starts up",
+                              _mark(af2['binary_runs'] == 'ok'), np_detail)
+
+            if af2['gpu_total']:
+                af2_table.add_row(
+                    "cuDNN override",
+                    _mark(af2['cudnn_libs'] == EXPECTED_CUDNN_LIBS,
+                          warn_only=True),
+                    f"{af2['cudnn_libs']}/{EXPECTED_CUDNN_LIBS} libraries")
+                # VRAM is the binding constraint on what will fit, so show
+                # it: ColabFold oversubscribes ~4x into host RAM, which
+                # stretches a small card but does not remove the limit.
+                gpu_detail = f"{af2['gpu_free']} free of {af2['gpu_total']}"
+                if af2['gpu_mem_mb']:
+                    gb = af2['gpu_mem_mb'] / 1024
+                    gpu_detail += (f" · {gb:.0f} GB VRAM "
+                                   f"(~{gb * 4:.0f} GB with unified memory)")
+                af2_table.add_row("GPUs", _mark(af2['gpu_free'] > 0,
+                                                warn_only=True), gpu_detail)
+                # Both readings matter: `bare` is what an unconfigured caller
+                # gets, `override` is the ceiling. Equal and gpu = healthy.
+                bare = af2['backend_bare'] or 'unknown'
+                override = af2['backend_override']
+                backend_detail = (f"{bare} bare, {override} with override"
+                                  if override and override != bare else bare)
+                af2_table.add_row(
+                    "JAX backend",
+                    _mark((af2['backend_override'] or af2['backend_bare'])
+                          == 'gpu'),
+                    backend_detail)
+
+        console.print()
+        console.print(af2_table)
+
+        # Issues carry their own remedy — the whole point of the probe is
+        # that these failures are otherwise silent.
+        for problem in af2['issues']:
+            color = 'red' if problem['level'] == 'error' else 'yellow'
+            console.print(f"  [{color}]{problem['level']}[/{color}]  "
+                          f"{problem['message']}")
+            console.print(f"        [dim]fix: {problem['fix']}[/dim]")
 
     disk = results.get('disk', {})
     if disk:
