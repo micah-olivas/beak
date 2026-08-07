@@ -240,7 +240,7 @@ def setup_af2(af2_home, cudnn_dir, show_status, dry_run):
 
     console.print(f"\n[green]Done.[/green] Wrappers: "
                   f"{', '.join(WRAPPER_ENTRY_POINTS)} in ~/bin")
-    console.print("[dim]Verify with: beak doctor --af2[/dim]\n")
+    console.print("[dim]Verify with: uv run beak doctor --af2[/dim]\n")
 
 
 @main.command()
