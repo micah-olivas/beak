@@ -107,10 +107,12 @@ class StructureView(Vertical):
         self._conservation = None
         self._sasa = None
         self._differential = None  # signed JSD per target residue
+        self._taxonomic = None  # unsigned clade-bias per target residue [0,1]
         # Target-indexed copies (for chimerax export); see `_load`.
         self._conservation_target = None
         self._sasa_target = None
         self._differential_target = None
+        self._taxonomic_target = None
         self._cif_seq: str = ""
         self._target_seq: str = ""
         # Per-residue Pfam index (-1 = outside any domain). Populated
@@ -180,6 +182,10 @@ class StructureView(Vertical):
         if mode == "differential":
             self._reload_differential()
             if self._differential is None:
+                return False
+        if mode == "taxonomic":
+            self._reload_taxonomic()
+            if self._taxonomic is None:
                 return False
         if mode == "pfam":
             self._reload_pfam()
@@ -267,6 +273,58 @@ class StructureView(Vertical):
             self._reload_differential()
         return self._differential is not None or self._differential_target is not None
 
+    def _reload_taxonomic(self) -> None:
+        """Pull active taxonomic-clustering scores; normalise to [0, 1].
+
+        Mirrors `_reload_differential`, with one wrinkle: the score is
+        either an uncertainty coefficient (already [0, 1]) or a
+        permutation z-score (unbounded, possibly negative). For the ribbon
+        we clip negatives and scale the z-scores to their own max so the
+        gradient reads as relative clade-structure strength; the raw
+        values still live in the cache for anyone who wants absolutes.
+        """
+        from ..structure import project_target_to_cif
+        import numpy as np
+
+        try:
+            from ..comparative import load_active_taxonomic_scores
+            raw = load_active_taxonomic_scores(self._project)
+        except Exception:
+            self._taxonomic = None
+            self._taxonomic_target = None
+            return
+        if raw is None:
+            self._taxonomic = None
+            self._taxonomic_target = None
+            return
+
+        kind = (self._project.manifest().get("taxonomic") or {}).get(
+            "active_score_kind"
+        )
+        disp = np.asarray(raw, dtype=float)
+        if kind == "permutation_zscore":
+            pos = np.clip(disp, 0.0, None)
+            m = float(pos.max()) if pos.size else 0.0
+            disp = pos / m if m > 0 else pos
+        else:
+            disp = np.clip(disp, 0.0, 1.0)
+
+        self._taxonomic_target = disp
+        if self._coords is None or not self._target_seq or not self._cif_seq:
+            self._taxonomic = disp  # AF case: cif and target align
+            return
+        projected = project_target_to_cif(
+            disp, self._target_seq, self._cif_seq, sentinel=0.0,
+        )
+        self._taxonomic = (
+            projected if len(projected) == len(self._coords) else None
+        )
+
+    def has_taxonomic(self) -> bool:
+        if self._taxonomic is None and self._taxonomic_target is None:
+            self._reload_taxonomic()
+        return self._taxonomic is not None or self._taxonomic_target is not None
+
     def reload_set_data(self) -> None:
         """Recompute set-scoped scalars (conservation/SASA/differential).
 
@@ -294,6 +352,7 @@ class StructureView(Vertical):
             self._conservation = None
             self._conservation_target = None
         self._reload_differential()
+        self._reload_taxonomic()
         self._refresh_canvas()
 
     def export_current_to_chimerax(self, out_dir: Path, name: str) -> Optional[Tuple[Path, Path, int]]:
@@ -373,6 +432,11 @@ class StructureView(Vertical):
                 self._reload_differential()
             if self._differential is not None:
                 return self._differential
+        if self._color_mode == "taxonomic":
+            if self._taxonomic is None:
+                self._reload_taxonomic()
+            if self._taxonomic is not None:
+                return self._taxonomic
         if self._color_mode == "pfam":
             if self._pfam_idx is None:
                 self._reload_pfam()
@@ -401,6 +465,10 @@ class StructureView(Vertical):
             if self._differential_target is None:
                 self._reload_differential()
             return self._differential_target
+        if self._color_mode == "taxonomic":
+            if self._taxonomic_target is None:
+                self._reload_taxonomic()
+            return self._taxonomic_target
         if self._color_mode == "pfam":
             # Pfam idx is built per cif residue; we need target-indexed
             # for export. Read straight from manifest hits, which carry
@@ -495,6 +563,9 @@ class StructureView(Vertical):
         bar_cells = 10
         if eff_mode == "bfactor":
             bar_lo, bar_hi, hi_label = 0.0, 50.0, "50 Å²"
+        elif eff_mode == "taxonomic":
+            # Taxonomic scalars are normalised to [0, 1] by the view.
+            bar_lo, bar_hi, hi_label = 0.0, 1.0, "max"
         else:
             bar_lo, bar_hi, hi_label = 0.0, 100.0, "100"
         cells = []
@@ -510,6 +581,7 @@ class StructureView(Vertical):
             "conservation": "cons",
             "sasa": "SASA",
             "differential": "diff",
+            "taxonomic": "tax",
         }.get(eff_mode, eff_mode)
 
         if eff_mode == "conservation":
@@ -524,6 +596,13 @@ class StructureView(Vertical):
             try:
                 from ..comparative import differential_is_stale
                 if differential_is_stale(self._project):
+                    head = f"[yellow]{label} · stale[/yellow]"
+            except Exception:
+                pass
+        if eff_mode == "taxonomic":
+            try:
+                from ..comparative import taxonomic_is_stale
+                if taxonomic_is_stale(self._project):
                     head = f"[yellow]{label} · stale[/yellow]"
             except Exception:
                 pass
@@ -844,6 +923,11 @@ class StructureView(Vertical):
             return (
                 self._differential is not None
                 or self._differential_target is not None
+            )
+        if mode == "taxonomic":
+            return (
+                self._taxonomic is not None
+                or self._taxonomic_target is not None
             )
         if mode == "pfam":
             domains = (
