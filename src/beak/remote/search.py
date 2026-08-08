@@ -245,6 +245,7 @@ set -e
 
 # Job metadata
 echo "Job started: $(date)" > {remote_job_path}/status.txt
+echo "STARTED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
 echo 'RUNNING' >> {remote_job_path}/status.txt
 
 # Create query database
@@ -283,9 +284,11 @@ mmseqs convertalis \\
 
 if [ $? -eq 0 ]; then
     echo "Job completed: $(date)" >> {remote_job_path}/status.txt
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "COMPLETED" >> {remote_job_path}/status.txt
 else
     echo "Job failed: $(date)" >> {remote_job_path}/status.txt
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
 fi
 

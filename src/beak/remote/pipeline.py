@@ -304,6 +304,7 @@ class Pipeline(RemoteJobManager):
             "",
             "# Pipeline execution script",
             f"echo \"Pipeline started: $(date)\" > {remote_path}/status.txt",
+            f"echo \"STARTED_EPOCH=$(date +%s)\" >> {remote_path}/status.txt",
             f"echo 'RUNNING' >> {remote_path}/status.txt",
             "",
             "# Initialize context",
@@ -384,6 +385,7 @@ class Pipeline(RemoteJobManager):
         script_parts.extend([
             "# Pipeline completed",
             f"echo \"Pipeline completed: $(date)\" >> {remote_path}/status.txt",
+            f"echo \"ENDED_EPOCH=$(date +%s)\" >> {remote_path}/status.txt",
             f"echo 'COMPLETED' >> {remote_path}/status.txt"
         ])
         

@@ -248,6 +248,7 @@ class Align(RemoteJobManager):
 set -e
 
 echo "Job started: $(date)" > {remote_job_path}/status.txt
+echo "STARTED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
 echo 'RUNNING' >> {remote_job_path}/status.txt
 
 # Filter empty sequences
@@ -258,6 +259,7 @@ SEQ_COUNT=$(grep -c '^>' {filtered_input} || echo 0)
 
 if [ "$SEQ_COUNT" -eq 0 ]; then
     echo "Error: No valid sequences found" | tee -a {log_path}
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
     exit 1
 fi
@@ -266,8 +268,10 @@ fi
 {align_cmd}
 
 if [ $? -eq 0 ]; then
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "COMPLETED" >> {remote_job_path}/status.txt
 else
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
 fi
 """

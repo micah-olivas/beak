@@ -634,6 +634,7 @@ class ESMEmbeddings(RemoteJobManager):
 set -eo pipefail
 
 echo "Job started: $(date)" > {remote_job_path}/status.txt
+echo "STARTED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
 echo 'RUNNING' >> {remote_job_path}/status.txt
 
 mkdir -p {output_dir}
@@ -654,6 +655,7 @@ if [ "$READY" != "true" ]; then
     echo "Container 'embeddings' was not ready for exec after 60s" \\
         | tee -a {remote_job_path}/esm.log
     echo "Job failed: $(date)" >> {remote_job_path}/status.txt
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
     exit 1
 fi
@@ -673,9 +675,11 @@ set -e
 
 if [ "$EXIT_CODE" -eq 0 ]; then
     echo "Job completed: $(date)" >> {remote_job_path}/status.txt
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "COMPLETED" >> {remote_job_path}/status.txt
 else
     echo "Job failed: $(date) (exit $EXIT_CODE)" >> {remote_job_path}/status.txt
+    echo "ENDED_EPOCH=$(date +%s)" >> {remote_job_path}/status.txt
     echo "FAILED" >> {remote_job_path}/status.txt
     exit $EXIT_CODE
 fi
